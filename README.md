@@ -56,6 +56,10 @@ model-mirror verify --all --max-age 7d
 local `.verification` and `.checksums` files. `--max-age` is useful for periodic
 jobs that should skip recently verified clean mirrors.
 
+If one repo is already locked, a single-repo `verify` exits non-zero. With
+`verify --all`, locked repos are reported as skipped, remaining repos are still
+checked, and the final exit status is non-zero.
+
 Verification records missing or corrupt files as repair paths in
 `.verification`. Repairs redownload only those paths:
 

@@ -404,6 +404,27 @@ def test_verify_all_returns_failure_when_any_model_fails(tmp_path, capsys):
     assert "verification failed: bad/model" in output
 
 
+def test_verify_all_skips_busy_model_and_continues(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    busy_archive = tmp_path / "models" / "busy" / "model"
+    busy_archive.mkdir(parents=True)
+    ok_archive = tmp_path / "models" / "ok" / "model"
+    ok_archive.mkdir(parents=True)
+    (ok_archive / "config.json").write_text("{}", encoding="utf-8")
+    (ok_archive / "file.bin").write_bytes(b"abc")
+    hub = FakeHub([FakeFile("file.bin", 3)])
+
+    with ModelLock(busy_archive, "mirror", "busy/model"):
+        rc = main(["--config", str(config_path), "verify", "--quick", "--all"], hub=hub)
+
+    output = capsys.readouterr().out
+    assert rc == 1
+    assert "skipped busy: busy/model" in output
+    assert "command=mirror" in output
+    assert "verified (quick): ok/model" in output
+
+
 def test_verify_requires_model_without_all(tmp_path):
     config_path = tmp_path / "config.yaml"
 

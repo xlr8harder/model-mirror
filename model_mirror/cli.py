@@ -321,7 +321,13 @@ def handle_verify(args, config: Config, *, hub=None) -> int:
             if args.max_age and should_skip_recent_clean(config, repo_id, args.repo_type, args.max_age):
                 print(f"skipped recent clean verification: {repo_id}")
                 continue
-            if verify_one(config, repo_id, args, hub=hub) != 0:
+            try:
+                rc = verify_one(config, repo_id, args, hub=hub)
+            except ModelBusyError as exc:
+                print(f"skipped busy: {repo_id} -> {exc.root} ({lock_label(exc.info)})")
+                failures += 1
+                continue
+            if rc != 0:
                 failures += 1
         return 1 if failures else 0
 
