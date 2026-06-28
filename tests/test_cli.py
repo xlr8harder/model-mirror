@@ -257,6 +257,37 @@ def test_command_help_documents_exit_status_and_risky_options(command, expected,
     assert expected in normalized_output
 
 
+def test_main_without_command_prints_full_help(capsys):
+    assert main([]) == 0
+
+    output = capsys.readouterr().out
+    assert "usage: model-mirror" in output
+    assert "mirror" in output
+    assert "verify" in output
+    assert "help" in output
+
+
+def test_help_command_prints_full_help(capsys):
+    assert main(["help"]) == 0
+
+    output = capsys.readouterr().out
+    assert "usage: model-mirror" in output
+    assert "show help" in output
+
+
+def test_help_command_prints_subcommand_help(capsys):
+    assert main(["help", "list"]) == 0
+
+    output = capsys.readouterr().out
+    assert "usage: model-mirror list" in output
+    assert "Show mirrored models and verification age." in output
+
+
+def test_help_command_rejects_unknown_topic():
+    with pytest.raises(SystemExit):
+        main(["help", "unknown"])
+
+
 def test_config_without_subcommand_defaults_to_options(tmp_path, capsys):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
@@ -308,12 +339,17 @@ def test_handle_config_returns_error_for_unknown_config_command(tmp_path):
     assert cli_module.handle_config(args, Config(directory=tmp_path), None) == 2
 
 
-def test_list_command_is_empty_when_directory_missing(tmp_path, capsys):
+def test_list_command_prints_summary_when_directory_missing(tmp_path, capsys):
     config_path = tmp_path / "config.yaml"
-    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path / "missing")}), encoding="utf-8")
+    archive = tmp_path / "missing"
+    config_path.write_text(yaml.safe_dump({"directory": str(archive)}), encoding="utf-8")
 
     assert main(["--config", str(config_path), "list"]) == 0
-    assert capsys.readouterr().out == ""
+    output = capsys.readouterr().out
+    assert f"archive root: {archive}" in output
+    assert f"models root: {archive / 'models'}" in output
+    assert "mirrors: 0" in output
+    assert "payload_files" not in output
 
 
 def test_verify_cached_command_succeeds_with_injected_hub(tmp_path, capsys):
@@ -616,10 +652,15 @@ def test_list_command_prints_verification_status_and_age(tmp_path, capsys):
 
     assert rc == 0
     output = capsys.readouterr().out
-    assert "org/model" in output
-    assert "verification=clean" in output
-    assert "state=[clean]" in output
-    assert "age=3h" in output
+    assert "models/org/model" in output
+    assert f"archive root: {tmp_path}" in output
+    assert f"models root: {tmp_path / 'models'}" in output
+    assert "mirrors: 1" in output
+    assert "size=2 B" in output
+    assert "state=clean" in output
+    assert "last_check=3h" in output
+    assert "verification=" not in output
+    assert "payload_files" not in output
 
 
 def test_list_command_prints_busy_lock(tmp_path, capsys):
@@ -634,10 +675,11 @@ def test_list_command_prints_busy_lock(tmp_path, capsys):
 
     assert rc == 0
     output = capsys.readouterr().out
-    assert "org/model" in output
-    assert "state=[busy]" in output
-    assert "busy=" in output
+    assert "models/org/model" in output
+    assert "state=clean,busy" in output
+    assert "  lock:" in output
     assert "command=mirror" in output
+    assert "started_at_utc=" in output
 
 
 def test_list_state_tags_cover_multi_tag_states():
@@ -659,10 +701,32 @@ def test_list_state_tags_cover_multi_tag_states():
         VerificationState(status="incomplete", repo_id="org/model"),
         None,
     )
+    manifest_incomplete_tags = cli_module.list_state_tags(
+        VerificationState(status="incomplete", repo_id="org/model", issues=["cached_hash_missing: file.bin"]),
+        None,
+    )
 
-    assert tags == ["offline", "needs-repair", "upstream-changed", "busy"]
+    assert tags == ["needs-repair", "offline", "upstream-changed", "busy"]
     assert unavailable_tags == ["upstream-unavailable"]
     assert incomplete_tags == ["incomplete"]
+    assert manifest_incomplete_tags == ["manifest-incomplete"]
+
+
+def test_list_format_helpers_cover_display_branches():
+    assert cli_module.format_bytes(0) == "0 B"
+    assert cli_module.format_bytes(1536) == "1.5 KiB"
+    assert cli_module.format_bytes(1024**5 * 2) == "2.0 PiB"
+
+    assert cli_module.format_lock_detail(None) == "lock held"
+    assert cli_module.format_lock_detail({"command": "", "pid": None}) == "lock held"
+    assert cli_module.format_lock_detail({"command": "verify", "pid": 123}) == "command=verify pid=123"
+
+    assert cli_module.primary_state_tag(
+        VerificationState(status="dirty", repo_id="org/model", issues=["verification skipped"])
+    ) == "unverified"
+    assert cli_module.primary_state_tag(VerificationState(status="dirty", repo_id="org/model")) == "dirty"
+    assert cli_module.primary_state_tag(VerificationState(status="in_progress", repo_id="org/model")) == "in-progress"
+    assert cli_module.primary_state_tag(VerificationState(status="", repo_id="org/model")) == "unknown"
 
 
 def test_verify_writes_dirty_verification_state(tmp_path, capsys):
@@ -1123,7 +1187,7 @@ def test_offline_and_online_commands_toggle_state_and_list_tags(tmp_path, capsys
     assert main(["--config", str(config_path), "list"]) == 0
     list_output = capsys.readouterr().out
     assert "offline-only enabled: org/model" in list_output
-    assert "state=[offline,needs-repair]" in list_output
+    assert "state=needs-repair,offline" in list_output
 
     assert main(["--config", str(config_path), "online", "org/model"]) == 0
     assert read_verification_state(archive).offline_only is False
@@ -1160,7 +1224,7 @@ def test_verify_unavailable_upstream_suggests_offline_and_preserves_clean_state(
     assert "run: model-mirror offline org/model" in output
 
     assert main(["--config", str(config_path), "list"]) == 0
-    assert "state=[upstream-unavailable]" in capsys.readouterr().out
+    assert "state=clean,upstream-unavailable" in capsys.readouterr().out
 
     assert main(["--config", str(config_path), "offline", "org/model"]) == 0
     state = read_verification_state(archive)

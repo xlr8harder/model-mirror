@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .audit import audit_model
-from .checksums import MANIFEST, write_checksums, verify_checksums
+from .checksums import MANIFEST, iter_payload_files, write_checksums, verify_checksums
 from .config import Config, archive_path, load_config, save_config, parse_bool, parse_positive_int
 from .hub import HuggingFaceHub, get_snapshot
 from .lock import ModelBusyError, ModelLock, lock_label, read_active_lock
@@ -70,9 +70,15 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="Run 'model-mirror COMMAND --help' for command-specific options.",
     )
     parser.add_argument("--config", help="path to config file; defaults to ~/.model-mirror.yaml")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(dest="command")
+    command_parsers: dict[str, argparse.ArgumentParser] = {}
 
-    mirror_parser = subparsers.add_parser(
+    def add_command_parser(name: str, **kwargs) -> argparse.ArgumentParser:
+        command_parser = subparsers.add_parser(name, **kwargs)
+        command_parsers[name] = command_parser
+        return command_parser
+
+    mirror_parser = add_command_parser(
         "mirror",
         help="mirror a Hugging Face repo",
         description="Download a repo at a resolved Hub commit and verify it unless --no-verify is used.",
@@ -84,7 +90,7 @@ def build_parser() -> argparse.ArgumentParser:
     mirror_parser.add_argument("--force", action="store_true", help="download even if the local copy looks complete")
     mirror_parser.add_argument("--no-verify", action="store_true", help="skip verification after download")
 
-    verify_parser = subparsers.add_parser(
+    verify_parser = add_command_parser(
         "verify",
         help="verify mirrored archives",
         description="Check local files against Hub metadata, local checksums, and model metadata.",
@@ -105,7 +111,7 @@ def build_parser() -> argparse.ArgumentParser:
     verify_parser.add_argument("--max-age", help="with --all, skip clean archives verified within this age, e.g. 7d")
     verify_parser.add_argument("--offline", action="store_true", help="verify only against local checksum state")
 
-    repair_parser = subparsers.add_parser(
+    repair_parser = add_command_parser(
         "repair",
         help="repair a mirrored archive",
         description=(
@@ -137,7 +143,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--repo-type", choices=["model", "dataset", "space"], default="model", help="repo kind to repair"
     )
 
-    offline_parser = subparsers.add_parser(
+    offline_parser = add_command_parser(
         "offline",
         help="mark a mirror offline-only",
         description=(
@@ -151,7 +157,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--repo-type", choices=["model", "dataset", "space"], default="model", help="repo kind to update"
     )
 
-    online_parser = subparsers.add_parser(
+    online_parser = add_command_parser(
         "online",
         help="re-enable Hub checks for a mirror",
         description="Clear offline-only mode so verify and repair contact the Hub again.",
@@ -162,9 +168,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--repo-type", choices=["model", "dataset", "space"], default="model", help="repo kind to update"
     )
 
-    subparsers.add_parser("list", help="list mirrored models", description="Show mirrored models and verification age.")
+    add_command_parser("list", help="list mirrored models", description="Show mirrored models and verification age.")
 
-    config_parser = subparsers.add_parser(
+    config_parser = add_command_parser(
         "config",
         help="show or change configuration",
         description="Print configuration, describe supported keys, or persist configuration changes.",
@@ -177,6 +183,14 @@ def build_parser() -> argparse.ArgumentParser:
     set_parser = config_subparsers.add_parser("set", help="set a supported configuration key")
     set_parser.add_argument("key", help="configuration key; see 'model-mirror config options'")
     set_parser.add_argument("value", help="new value")
+
+    help_parser = add_command_parser(
+        "help",
+        help="show help",
+        description="Show full help or command-specific help.",
+    )
+    help_parser.add_argument("topic", nargs="?", help="optional command to show help for")
+    parser.command_parsers = command_parsers
 
     return parser
 
@@ -194,6 +208,11 @@ def selected_revision_arg(args) -> str | None:
 def main(argv: list[str] | None = None, *, hub=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command is None:
+        parser.print_help()
+        return 0
+    if args.command == "help":
+        return handle_help(parser, args.topic)
     config_path = Path(args.config).expanduser() if args.config else None
     config = load_config(config_path)
 
@@ -229,6 +248,17 @@ def main(argv: list[str] | None = None, *, hub=None) -> int:
 
     parser.error(f"Unhandled command: {args.command}")
     return 2
+
+
+def handle_help(parser: argparse.ArgumentParser, topic: str | None) -> int:
+    if topic is None:
+        parser.print_help()
+        return 0
+    command_parser = parser.command_parsers.get(topic)
+    if command_parser is None:
+        parser.error(f"Unknown help topic: {topic}")
+    command_parser.print_help()
+    return 0
 
 
 def mirror_exit_code(status: str) -> int:
@@ -327,41 +357,112 @@ def set_config_value(config: Config, key: str, value: str) -> None:
 
 
 def handle_list(config: Config) -> int:
-    models_root = Path(config.directory) / "models"
+    archive_root = Path(config.directory)
+    models_root = archive_root / "models"
+    print(f"archive root: {archive_root}")
+    print(f"models root: {models_root}")
     if not models_root.exists():
+        print("mirrors: 0  total_size=0 B")
         return 0
+
+    entries = []
     for owner in sorted(path for path in models_root.iterdir() if path.is_dir()):
         for model in sorted(path for path in owner.iterdir() if path.is_dir()):
             state = read_verification_state(model)
             active_lock = read_active_lock(model)
-            suffix = ""
-            if state is not None:
-                suffix = (
-                    f"  verification={state.status}"
-                    f" state=[{','.join(list_state_tags(state, active_lock))}]"
-                    f" age={verification_age_label(state.checked_at_utc)}"
-                )
-            if active_lock is not None:
-                suffix += f"  busy=({lock_label(active_lock)})"
-            print(f"{owner.name}/{model.name}{suffix}")
+            total_size = mirror_payload_size(model)
+            entries.append((model, state, active_lock, total_size))
+
+    total_size = sum(entry[3] for entry in entries)
+    print(f"mirrors: {len(entries)}  total_size={format_bytes(total_size)}")
+
+    for model, state, active_lock, total_size in entries:
+        rel_path = model.relative_to(archive_root).as_posix()
+        fields = [
+            rel_path,
+            f"size={format_bytes(total_size)}",
+        ]
+        if state is not None:
+            fields.extend(
+                [
+                    f"state={','.join(list_state_tags(state, active_lock))}",
+                    f"last_check={verification_age_label(state.checked_at_utc)}",
+                ]
+            )
+        else:
+            fields.extend(["state=unverified", "last_check=unknown"])
+        print("  ".join(fields))
+        if active_lock is not None:
+            print(f"  lock: {format_lock_detail(active_lock)}")
     return 0
 
 
+def mirror_payload_size(root: Path) -> int:
+    total_size = 0
+    for path in iter_payload_files(root):
+        total_size += path.stat().st_size
+    return total_size
+
+
+def format_bytes(size: int) -> str:
+    value = float(size)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB", "PiB"):  # pragma: no branch
+        if abs(value) < 1024 or unit == "PiB":
+            if unit == "B":
+                return f"{int(value)} B"
+            return f"{value:.1f} {unit}"
+        value /= 1024
+
+
+def format_lock_detail(info: dict | None) -> str:
+    if not info:
+        return "lock held"
+    parts = []
+    for key in ("command", "pid", "host", "started_at_utc"):
+        value = info.get(key)
+        if value:
+            parts.append(f"{key}={value}")
+    return " ".join(parts) if parts else "lock held"
+
+
 def list_state_tags(state, active_lock: dict | None) -> list[str]:
-    tags = []
+    tags = [primary_state_tag(state)]
     if state.offline_only:
-        tags.append("offline")
-    if state.repair_paths:
-        tags.append("needs-repair")
-    if state.status == "incomplete":
-        tags.append("incomplete")
+        append_unique(tags, "offline")
     if state.upstream_status == "changed":
-        tags.append("upstream-changed")
+        append_unique(tags, "upstream-changed")
     if state_has_upstream_unavailable(state):
-        tags.append("upstream-unavailable")
+        append_unique(tags, "upstream-unavailable")
     if active_lock is not None:
-        tags.append("busy")
-    return tags or ["clean" if state.clean else state.status]
+        append_unique(tags, "busy")
+    return tags
+
+
+def primary_state_tag(state) -> str:
+    if state.status == "unavailable":
+        return "upstream-unavailable"
+    if state.status == "incomplete":
+        if state_has_manifest_incomplete(state):
+            return "manifest-incomplete"
+        return "incomplete"
+    if state.status == "dirty":
+        if state.repair_paths:
+            return "needs-repair"
+        if any(str(issue) == "verification skipped" for issue in state.issues):
+            return "unverified"
+        return "dirty"
+    if state.status == "in_progress":
+        return "in-progress"
+    return state.status or "unknown"
+
+
+def append_unique(values: list[str], value: str) -> None:
+    if value not in values:
+        values.append(value)
+
+
+def state_has_manifest_incomplete(state) -> bool:
+    return state_has_cached_hash_missing(state) or any(".manifest missing" in str(issue) for issue in state.issues)
 
 
 def handle_verify(args, config: Config, *, hub=None) -> int:
