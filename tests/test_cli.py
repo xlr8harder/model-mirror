@@ -206,6 +206,7 @@ def test_config_options_describes_supported_keys(tmp_path, capsys):
     assert "Archive root" in output
     assert "checksum_workers:" in output
     assert "MODEL_MIRROR_CHECKSUM_WORKERS" in output
+    assert "64 GB RAM" in output
     assert "hf_xet_reconstruct_write_sequentially:" in output
     assert "HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY" in output
 

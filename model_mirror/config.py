@@ -193,9 +193,15 @@ def apply_hf_environment(config: Config, environ: Mapping[str, str] | None = Non
 
     if config.hf_xet_high_performance:
         env["HF_XET_HIGH_PERFORMANCE"] = "1"
+    else:
+        env.pop("HF_XET_HIGH_PERFORMANCE", None)
     if config.hf_xet_reconstruct_write_sequentially:
         env["HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY"] = "1"
+    else:
+        env.pop("HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY", None)
     if config.hf_xet_num_concurrent_range_gets is not None:
         env["HF_XET_NUM_CONCURRENT_RANGE_GETS"] = str(config.hf_xet_num_concurrent_range_gets)
+    else:
+        env.pop("HF_XET_NUM_CONCURRENT_RANGE_GETS", None)
 
     return env

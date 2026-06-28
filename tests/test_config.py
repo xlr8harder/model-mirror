@@ -203,6 +203,9 @@ def test_apply_hf_environment_overrides_inherited_cache_paths(tmp_path):
         "HF_HUB_CACHE": "/small/cache/hub",
         "HF_ASSETS_CACHE": "/small/cache/assets",
         "HF_XET_CACHE": "/small/cache/xet",
+        "HF_XET_HIGH_PERFORMANCE": "1",
+        "HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY": "1",
+        "HF_XET_NUM_CONCURRENT_RANGE_GETS": "64",
         "TRANSFORMERS_CACHE": "/small/cache/transformers",
         "XDG_CACHE_HOME": "/small/cache/xdg",
         "TMPDIR": "/small/tmp",
@@ -219,6 +222,9 @@ def test_apply_hf_environment_overrides_inherited_cache_paths(tmp_path):
     assert env["XDG_CACHE_HOME"] == str(tmp_path / ".cache" / "xdg")
     assert env["TMPDIR"] == str(tmp_path / "tmp")
     assert env["HF_TOKEN"] == "hf_secret"
+    assert "HF_XET_HIGH_PERFORMANCE" not in env
+    assert "HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY" not in env
+    assert "HF_XET_NUM_CONCURRENT_RANGE_GETS" not in env
 
 
 def test_apply_hf_environment_uses_legacy_token_path_when_present(tmp_path, monkeypatch):

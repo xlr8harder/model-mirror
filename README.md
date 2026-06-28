@@ -1,92 +1,132 @@
 # model-mirror
 
-Mirror and validate large Hugging Face model archives into bulk storage.
+Mirror Hugging Face repositories into local bulk storage and verify that the
+files remain complete.
 
-The CLI is designed to avoid the default Hugging Face cache for model payloads.
-It stores downloaded files under a configured archive directory and writes
-per-model hidden verification state:
+`model-mirror` is meant for model archives that are too large for the default
+Hugging Face cache. It downloads into one archive directory, records the exact
+Hub commit mirrored, writes local SHA-256 checksums, and keeps verification
+state beside each model.
 
-- `.verification` for status, timestamp, issues, and repair paths
-- `.checksums` for SHA-256 hashes
-- `.manifest` for local sizes and mtimes
+## Quick Start
 
 ```bash
+python -m pip install -e .
+
 model-mirror config directory /mnt/big-drive/huggingface
-model-mirror config
-model-mirror config options
-model-mirror config set hf-xet-high-performance true
-model-mirror config set hf-xet-reconstruct-write-sequentially true
+model-mirror config set hf-xet-reconstruct-write-sequentially true  # useful for HDDs
+
 model-mirror mirror org/model
-model-mirror mirror --commit abc123 org/model
-model-mirror verify org/model
-model-mirror verify --quick org/model
-model-mirror verify --all
-model-mirror verify --all --max-age 7d
-model-mirror verify --repair org/model
-model-mirror repair org/model
-model-mirror update org/model
 model-mirror list
+model-mirror verify org/model
 ```
 
-Local configuration is written to `~/.model-mirror.yaml`.
-
-## Download Backend
-
-`model-mirror` uses `huggingface_hub` snapshot downloads, so Hugging Face Xet
-remains the primary backend when available. Useful Xet-related config:
-
-- `hf_xet_high_performance`: sets `HF_XET_HIGH_PERFORMANCE=1`
-- `hf_xet_reconstruct_write_sequentially`: sets `HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY=1`
-- `hf_xet_num_concurrent_range_gets`: sets `HF_XET_NUM_CONCURRENT_RANGE_GETS`
-
-Sequential reconstruction writes are useful for HDD-backed archives. Xet still
-owns the transfer/reconstruction stream, so `model-mirror` does not currently
-compute SHA-256 while bytes are being written by Xet.
-
-## Revision Handling
-
-`model-mirror` resolves the requested revision, usually `main`, to a concrete
-Hub commit before downloading. The download is then performed against that
-commit SHA, avoiding races if the branch moves during a mirror.
-
-Use `--revision` for a branch or tag and `--commit` for an exact commit SHA.
-Both options produce a commit-pinned local mirror.
-
-Verification checks the stored commit. When online, it also checks whether the
-requested upstream revision now points at a different commit and records that in
-`.verification` as `upstream_status: changed`. It does not overwrite a clean
-local mirror just because upstream moved; use `model-mirror update MODEL` to do
-that explicitly.
-
-## Verification State
-
-Each mirrored model directory owns its state:
+Mirrors are stored by repo type:
 
 ```text
-models/org/model/.verification
-models/org/model/.checksums
-models/org/model/.manifest
+/mnt/big-drive/huggingface/models/org/model/
+/mnt/big-drive/huggingface/datasets/org/data/
+/mnt/big-drive/huggingface/spaces/org/space/
 ```
 
-Deleting a model directory deletes its verification state with it. `.verification`
-is small and human-readable; `.checksums` and `.manifest` are mechanical local
-integrity data.
+Run `model-mirror --help` or `model-mirror COMMAND --help` for the full CLI
+reference. Run `model-mirror config options` for every supported config key.
 
-Checksum generation is resumable. `.checksums` and `.manifest` are updated after
-each file hash completes, and later runs skip unchanged files using the recorded
-size and mtime. `checksum_workers` controls checksum hashing concurrency and
-defaults to `1`, which is conservative for HDDs.
+## Verification
 
-## Completion And Locking
+`mirror` verifies by default. A clean mirror has:
 
-`.verification` is the durable completion marker. A mirror is trusted only when
-that file says `status: clean` for the resolved Hub commit. Missing
-`.verification`, `status: in_progress`, or `status: dirty` means the local copy
-is not trusted yet.
+- all expected Hub files present
+- expected file sizes
+- local SHA-256 checksums in `.checksums`
+- local file metadata in `.manifest`
+- `.verification` with `status: clean`
 
-Operations that mutate or verify a model take an advisory lock on
-`.verification.lock`. The first mirror operation in a new model directory writes
-`.verification` with `status: in_progress` before downloading. If another
-operation tries to mirror, verify, repair, or update the same model while the
-lock is held, it fails fast with lock details. `model-mirror list` does not
-block; it shows busy lock details when present.
+Useful verification commands:
+
+```bash
+model-mirror verify org/model
+model-mirror verify --quick org/model
+model-mirror verify --offline org/model
+model-mirror verify --all
+model-mirror verify --all --max-age 7d
+```
+
+`--quick` checks presence and sizes without rehashing. `--offline` uses only the
+local `.verification` and `.checksums` files. `--max-age` is useful for periodic
+jobs that should skip recently verified clean mirrors.
+
+If verification finds missing or corrupt files, repair can redownload only the
+paths listed in `.verification`:
+
+```bash
+model-mirror verify --repair org/model
+model-mirror repair org/model
+```
+
+## Upstream Updates
+
+Every online operation resolves the requested revision, usually `main`, to a
+specific Hub commit. The local mirror is tied to that commit.
+
+If `verify` sees that upstream `main` now points at a different commit, it marks
+the mirror with `upstream_status: changed` but does not overwrite local files.
+Updating is explicit:
+
+```bash
+model-mirror update org/model
+model-mirror mirror --commit abc123 org/model
+```
+
+Use `--commit` when you want a reproducible archive of an exact Hub revision.
+
+## Common Commands
+
+```bash
+model-mirror mirror org/model              # download and verify
+model-mirror mirror --no-verify org/model  # download without final verification
+model-mirror verify org/model              # full verification
+model-mirror verify --quick org/model      # no SHA-256 pass
+model-mirror repair org/model              # redownload known bad/missing paths
+model-mirror update org/model              # move to latest requested revision
+model-mirror list                          # show mirrors and verification age
+```
+
+Datasets and Spaces are supported with `--repo-type dataset` or
+`--repo-type space`.
+
+## Key Configuration
+
+```bash
+model-mirror config show
+model-mirror config options
+model-mirror config directory /mnt/big-drive/huggingface
+model-mirror config set checksum-workers 1
+model-mirror config set hf-xet-reconstruct-write-sequentially true
+```
+
+Important switches:
+
+- `directory`: archive root
+- `repo_type`: default repo type, usually `model`
+- `revision`: default branch, tag, or commit, usually `main`
+- `checksum`: whether mirror/repair writes local SHA-256 records
+- `checksum_workers`: checksum hashing concurrency; `1` is HDD-friendly
+- `verify_after_mirror`: run verification after `mirror`
+- `token_path`: Hugging Face token file path; token contents are never printed
+- `hf_xet_reconstruct_write_sequentially`: sequential Xet writes for HDDs
+- `hf_xet_num_concurrent_range_gets`: Xet range-get concurrency; leave unset to
+  use Hugging Face's default of `16`
+- `hf_xet_high_performance`: enable Xet high-performance mode. This is off by
+  default; use only on high-bandwidth machines with fast disks and ample memory,
+  typically 64 GB RAM or more.
+
+## Notes
+
+`model-mirror` uses `huggingface_hub` snapshot downloads, so Hugging Face Xet is
+used automatically when available. `model-mirror` keeps Hugging Face cache and
+temporary directories under the configured archive root so large downloads do
+not spill into your default home cache.
+
+See [CONTRIBUTORS.md](CONTRIBUTORS.md) for implementation details, testing, and
+future design notes.

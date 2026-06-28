@@ -30,7 +30,12 @@ CONFIG_OPTIONS = [
         "Number of files to hash concurrently. Use 1 for HDD-friendly sequential reads.",
     ),
     ("verify_after_mirror", None, "Whether mirror runs verification after download unless --no-verify is passed."),
-    ("hf_xet_high_performance", "MODEL_MIRROR_HF_XET_HIGH_PERFORMANCE", "Sets HF_XET_HIGH_PERFORMANCE=1."),
+    (
+        "hf_xet_high_performance",
+        "MODEL_MIRROR_HF_XET_HIGH_PERFORMANCE",
+        "Sets HF_XET_HIGH_PERFORMANCE=1. Off by default; use only on high-bandwidth machines "
+        "with fast disks and ample memory, typically 64 GB RAM or more.",
+    ),
     (
         "hf_xet_reconstruct_write_sequentially",
         "MODEL_MIRROR_HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY",
@@ -48,51 +53,79 @@ CONFIG_OPTIONS = [
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="model-mirror")
+    parser = argparse.ArgumentParser(
+        prog="model-mirror",
+        description="Mirror Hugging Face repositories into local bulk storage and verify their integrity.",
+        epilog="Run 'model-mirror COMMAND --help' for command-specific options.",
+    )
     parser.add_argument("--config", help="path to config file; defaults to ~/.model-mirror.yaml")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    mirror_parser = subparsers.add_parser("mirror", help="mirror a Hugging Face repo")
-    mirror_parser.add_argument("model")
-    mirror_parser.add_argument("--repo-type", choices=["model", "dataset", "space"])
+    mirror_parser = subparsers.add_parser(
+        "mirror",
+        help="mirror a Hugging Face repo",
+        description="Download a repo at a resolved Hub commit and verify it unless --no-verify is used.",
+    )
+    mirror_parser.add_argument("model", metavar="repo", help="Hugging Face repo id, e.g. org/model")
+    mirror_parser.add_argument("--repo-type", choices=["model", "dataset", "space"], help="repo kind to mirror")
     add_revision_options(mirror_parser)
-    mirror_parser.add_argument("--force", action="store_true")
+    mirror_parser.add_argument("--force", action="store_true", help="download even if the local copy looks complete")
     mirror_parser.add_argument("--no-verify", action="store_true", help="skip verification after download")
 
-    verify_parser = subparsers.add_parser("verify", help="verify mirrored archives")
-    verify_parser.add_argument("model", nargs="?")
+    verify_parser = subparsers.add_parser(
+        "verify",
+        help="verify mirrored archives",
+        description="Check local files against Hub metadata, local checksums, and model metadata.",
+    )
+    verify_parser.add_argument("model", metavar="repo", nargs="?", help="repo id to verify unless --all is used")
     verify_parser.add_argument("--quick", action="store_true", help="skip full SHA-256 checks")
     verify_parser.add_argument("--all", action="store_true", help="verify every mirrored model")
-    verify_parser.add_argument("--repo-type", choices=["model", "dataset", "space"], default="model")
+    verify_parser.add_argument(
+        "--repo-type", choices=["model", "dataset", "space"], default="model", help="repo kind to verify"
+    )
     add_revision_options(verify_parser)
-    verify_parser.add_argument("--strict", action="store_true")
+    verify_parser.add_argument("--strict", action="store_true", help="fail on extra local files")
     verify_parser.add_argument("--repair", action="store_true", help="repair dirty archives after verification")
     verify_parser.add_argument("--max-age", help="with --all, skip clean archives verified within this age, e.g. 7d")
     verify_parser.add_argument("--offline", action="store_true", help="verify only against local checksum state")
 
-    repair_parser = subparsers.add_parser("repair", help="repair a mirrored archive using its .verification state")
-    repair_parser.add_argument("model")
-    repair_parser.add_argument("--repo-type", choices=["model", "dataset", "space"], default="model")
+    repair_parser = subparsers.add_parser(
+        "repair",
+        help="repair a mirrored archive using its .verification state",
+        description="Redownload only files listed as repair paths, then run a final verification.",
+    )
+    repair_parser.add_argument("model", metavar="repo", help="repo id to repair")
+    repair_parser.add_argument(
+        "--repo-type", choices=["model", "dataset", "space"], default="model", help="repo kind to repair"
+    )
     add_revision_options(repair_parser)
     repair_parser.add_argument("--force-verify", action="store_true", help="ignore existing .verification and verify first")
 
-    update_parser = subparsers.add_parser("update", help="explicitly update a mirror to the latest requested revision")
-    update_parser.add_argument("model")
-    update_parser.add_argument("--repo-type", choices=["model", "dataset", "space"])
+    update_parser = subparsers.add_parser(
+        "update",
+        help="explicitly update a mirror to the latest requested revision",
+        description="Force a mirror refresh. This is the explicit path for moving to a newer upstream commit.",
+    )
+    update_parser.add_argument("model", metavar="repo", help="repo id to update")
+    update_parser.add_argument("--repo-type", choices=["model", "dataset", "space"], help="repo kind to update")
     add_revision_options(update_parser)
-    update_parser.add_argument("--no-verify", action="store_true")
+    update_parser.add_argument("--no-verify", action="store_true", help="skip verification after update")
 
-    subparsers.add_parser("list", help="list mirrored models")
+    subparsers.add_parser("list", help="list mirrored models", description="Show mirrored models and verification age.")
 
-    config_parser = subparsers.add_parser("config", help="show or change configuration")
+    config_parser = subparsers.add_parser(
+        "config",
+        help="show or change configuration",
+        description="Print configuration, describe supported keys, or persist configuration changes.",
+    )
     config_subparsers = config_parser.add_subparsers(dest="config_command")
     config_subparsers.add_parser("show", help="print the resolved configuration")
     config_subparsers.add_parser("options", help="print supported configuration keys with descriptions")
     directory_parser = config_subparsers.add_parser("directory", help="get or set archive directory")
-    directory_parser.add_argument("path", nargs="?")
+    directory_parser.add_argument("path", nargs="?", help="new archive directory; omit to print current value")
     set_parser = config_subparsers.add_parser("set", help="set a supported configuration key")
-    set_parser.add_argument("key")
-    set_parser.add_argument("value")
+    set_parser.add_argument("key", help="configuration key; see 'model-mirror config options'")
+    set_parser.add_argument("value", help="new value")
 
     return parser
 
