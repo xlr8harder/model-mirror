@@ -17,6 +17,9 @@ class RepairResult:
     status: str
     path: Path
     paths: list[str]
+    upstream_status: str = "unknown"
+    resolved_commit: str = ""
+    upstream_commit: str = ""
 
 
 def repair(
@@ -26,7 +29,6 @@ def repair(
     hub=None,
     repo_type: str | None = None,
     revision: str | None = None,
-    force_audit: bool = False,
 ) -> RepairResult:
     selected_type = repo_type or config.repo_type
     selected_revision = revision or config.revision
@@ -40,7 +42,6 @@ def repair(
             selected_type,
             selected_revision,
             root,
-            force_audit=force_audit,
         )
 
 
@@ -51,21 +52,19 @@ def repair_locked(
     selected_type: str,
     selected_revision: str,
     root: Path,
-    *,
-    force_audit: bool,
 ) -> RepairResult:
-    state = None if force_audit else read_audit_state(root)
-    if state is not None and state.clean:
-        return RepairResult("complete", root, [])
-
+    state = read_audit_state(root)
     if state is None:
-        state = derive_state(config, repo_id, selected_hub, selected_type, selected_revision, root)
+        return RepairResult("verify-required", root, [])
+    if state.clean:
+        return repair_result("complete", root, [], state)
 
     paths = sorted(set(state.repair_paths))
     if not paths:
-        return RepairResult("complete", root, [])
+        return repair_result("no-repair-paths", root, [], state)
 
-    target_revision = state.resolved_commit or selected_revision
+    requested_revision = state.requested_revision or selected_revision
+    target_revision = state.resolved_commit or requested_revision
     root.mkdir(parents=True, exist_ok=True)
     for rel in paths:
         target = root / rel
@@ -86,14 +85,31 @@ def repair_locked(
         repo_id,
         selected_hub,
         selected_type,
-        state.requested_revision or selected_revision,
+        state.requested_revision or requested_revision,
         root,
         resolved_commit=target_revision,
+        upstream_commit=state.upstream_commit,
         quick=False,
         from_checksums=checksums_available,
     )
     write_audit_state(root, final_state)
-    return RepairResult("repaired" if final_state.clean else "incomplete", root, paths)
+    return repair_result("repaired" if final_state.clean else "incomplete", root, paths, final_state)
+
+
+def repair_result(
+    status: str,
+    root: Path,
+    paths: list[str],
+    state: AuditState,
+) -> RepairResult:
+    return RepairResult(
+        status,
+        root,
+        paths,
+        state.upstream_status,
+        state.resolved_commit,
+        state.upstream_commit,
+    )
 
 
 def derive_state(

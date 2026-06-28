@@ -5,14 +5,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .audit import audit_model
-from .checksums import CHECKSUMS
+from .checksums import CHECKSUMS, write_checksums, verify_checksums
 from .config import Config, archive_path, load_config, save_config, parse_bool, parse_positive_int
 from .hub import HuggingFaceHub, get_snapshot
 from .lock import ModelBusyError, ModelLock, lock_label, read_active_lock
 from .mirror import mirror
 from .repair import repair
-from .state import read_verification_state, state_from_results, write_verification_state
-from .verify import verify_remote
+from .state import read_verification_state, state_from_results, verification_state_path, write_verification_state
+from .verify import merge_checksum_result, verify_remote
 
 
 CONFIG_OPTIONS = [
@@ -91,15 +91,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     repair_parser = subparsers.add_parser(
         "repair",
-        help="repair a mirrored archive using its .verification state",
-        description="Redownload only files listed as repair paths, then run a final verification.",
+        help="repair a mirrored archive",
+        description=(
+            "Redownload files listed in existing .verification repair paths, "
+            "then run a final verification. Run verify first or use verify --repair."
+        ),
     )
     repair_parser.add_argument("model", metavar="repo", help="repo id to repair")
     repair_parser.add_argument(
         "--repo-type", choices=["model", "dataset", "space"], default="model", help="repo kind to repair"
     )
-    add_revision_options(repair_parser)
-    repair_parser.add_argument("--force-verify", action="store_true", help="ignore existing .verification and verify first")
 
     update_parser = subparsers.add_parser(
         "update",
@@ -168,14 +169,16 @@ def main(argv: list[str] | None = None, *, hub=None) -> int:
             return handle_verify(args, config, hub=hub)
         if args.command == "repair":
             selected_hub = hub or HuggingFaceHub(config)
+            print_verification_age(config, args.model, args.repo_type)
             result = repair(
                 config,
                 args.model,
                 hub=selected_hub,
                 repo_type=args.repo_type,
-                revision=selected_revision_arg(args),
-                force_audit=args.force_verify,
             )
+            if result.status == "verify-required":
+                print(f"run verify first: model-mirror verify {args.model}")
+            print_repair_commit_notice(args.model, result)
             print(f"{result.status}: {args.model} -> {result.path}")
             return 0 if result.status in {"complete", "repaired"} else 1
         if args.command == "update":
@@ -340,6 +343,7 @@ def verify_one(config: Config, repo_id: str, args, *, hub=None) -> int:
             repo_type=args.repo_type,
             revision=requested_revision,
         )
+        print_repair_commit_notice(repo_id, repair_result)
         print(f"{repair_result.status}: {repo_id}")
         return 0 if repair_result.status in {"complete", "repaired"} else 1
     return rc
@@ -360,6 +364,14 @@ def verify_one_locked(config: Config, repo_id: str, args, selected_hub, root: Pa
         selected_hub, repo_id, args.repo_type, resolved_commit
     )
     metadata = snapshot.files
+    checksum_result = None
+    if not args.quick and config.checksum:
+        if (root / CHECKSUMS).exists():
+            checksum_result = verify_checksums(root, strict=args.strict)
+            if checksum_result.ok:
+                write_checksums(root, max_workers=config.checksum_workers)
+        else:
+            write_checksums(root, max_workers=config.checksum_workers)
     from_checksums = not args.quick and (root / CHECKSUMS).exists()
     result = verify_remote(
         root,
@@ -368,6 +380,8 @@ def verify_one_locked(config: Config, repo_id: str, args, selected_hub, root: Pa
         from_checksums=from_checksums,
         strict=args.strict,
     )
+    if checksum_result is not None:
+        merge_checksum_result(result, checksum_result)
     if args.repo_type == "model":
         audit = audit_model(root, skip_transformers=True)
     else:
@@ -387,15 +401,26 @@ def verify_one_locked(config: Config, repo_id: str, args, selected_hub, root: Pa
         return 0, True, requested_revision
 
     if audit is not None and not audit.ok:
-        print(f"verification failed: {repo_id}")
+        print(f"verification failed: {repo_id}{upstream_change_suffix(state)}")
         return 1, False, requested_revision
     if result.ok:
         mode = "quick" if args.quick else "full"
-        stale = " upstream=changed" if state.upstream_status == "changed" else ""
-        print(f"verified ({mode}): {repo_id}{stale}")
+        print(f"verified ({mode}): {repo_id}{upstream_change_suffix(state)}")
         return 0, False, requested_revision
-    print(f"verification failed: {repo_id}")
+    print(f"verification failed: {repo_id}{upstream_change_suffix(state)}")
     return 1, False, requested_revision
+
+
+def upstream_change_suffix(state) -> str:
+    return " upstream=changed" if state.upstream_status == "changed" else ""
+
+
+def print_repair_commit_notice(repo_id: str, result) -> None:
+    if result.upstream_status == "changed":
+        print(
+            f"upstream changed: {repo_id} local={result.resolved_commit} "
+            f"upstream={result.upstream_commit} not_applied"
+        )
 
 
 def verify_one_offline(root: Path, repo_id: str, args, existing_state) -> int:
@@ -451,6 +476,10 @@ def verification_age_seconds(checked_at_utc: str) -> int | None:
 
 def verification_age_label(checked_at_utc: str) -> str:
     seconds = verification_age_seconds(checked_at_utc)
+    return format_age_seconds(seconds)
+
+
+def format_age_seconds(seconds: int | None) -> str:
     if seconds is None:
         return "unknown"
     if seconds < 120:
@@ -462,6 +491,22 @@ def verification_age_label(checked_at_utc: str) -> str:
     if hours < 48:
         return f"{hours}h"
     return f"{hours // 24}d"
+
+
+def print_verification_age(config: Config, repo_id: str, repo_type: str) -> None:
+    root = archive_path(config, repo_id, repo_type)
+    state = read_verification_state(root)
+    if state is None:
+        print("verification age: unavailable")
+        return
+    age = verification_age_seconds(state.checked_at_utc)
+    if age is None:
+        path = verification_state_path(root)
+        modified = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+        age = max(0, int((datetime.now(timezone.utc) - modified).total_seconds()))
+    print(f"verification age: {format_age_seconds(age)}")
+    if age is not None and age > 24 * 60 * 60:
+        print("warning: verification is older than 24h; run verify again for fresh repair paths")
 
 
 def should_skip_recent_clean(config: Config, repo_id: str, repo_type: str, max_age: str) -> bool:

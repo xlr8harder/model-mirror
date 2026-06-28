@@ -107,3 +107,15 @@ def verify_remote(
         ]
 
     return result
+
+
+def merge_checksum_result(remote_result, checksum_result) -> None:
+    for attr, values in (
+        ("missing", checksum_result.missing),
+        ("hash_mismatches", checksum_result.failures),
+        ("extras", checksum_result.extras),
+    ):
+        existing = getattr(remote_result, attr)
+        for value in values:
+            if value not in existing:
+                existing.append(value)

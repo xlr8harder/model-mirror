@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "model-mirror"
 version = "0.1.0"
-description = "Mirror and validate large Hugging Face model archives without using the default cache."
+description = "Mirror and validate Hugging Face archives without leaving payloads in the default cache."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -13,8 +13,8 @@ dependencies = [
   "PyYAML>=6.0",
 ]
 
-[project.optional-dependencies]
-test = [
+[dependency-groups]
+dev = [
   "pytest>=8.0",
   "coverage>=7.0",
 ]

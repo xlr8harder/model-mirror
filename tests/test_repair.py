@@ -1,7 +1,5 @@
 from dataclasses import dataclass
 
-import yaml
-
 from model_mirror.config import Config
 from model_mirror.checksums import load_records, write_checksums
 from model_mirror.repair import repair
@@ -79,7 +77,7 @@ def test_repair_noops_when_verification_state_is_clean(tmp_path):
     assert read_verification_state(archive).status == "clean"
 
 
-def test_repair_noops_when_dirty_state_has_no_repair_paths(tmp_path):
+def test_repair_fails_when_dirty_state_has_no_repair_paths(tmp_path):
     archive = tmp_path / "models" / "org" / "model"
     archive.mkdir(parents=True)
     write_verification_state(archive, VerificationState(status="dirty", repo_id="org/model"))
@@ -87,7 +85,16 @@ def test_repair_noops_when_dirty_state_has_no_repair_paths(tmp_path):
 
     result = repair(Config(directory=tmp_path), "org/model", hub=hub)
 
-    assert result.status == "complete"
+    assert result.status == "no-repair-paths"
+    assert hub.downloads == []
+
+
+def test_repair_requires_verification_state(tmp_path):
+    hub = FakeHub([FakeFile("file.bin", 3)])
+
+    result = repair(Config(directory=tmp_path), "org/model", hub=hub)
+
+    assert result.status == "verify-required"
     assert hub.downloads == []
 
 
@@ -127,7 +134,7 @@ def test_repair_can_run_without_checksum_writes(tmp_path):
     assert not (archive / ".checksums").exists()
 
 
-def test_repair_without_state_derives_repair_paths_from_verification(tmp_path):
+def test_repair_does_not_discover_paths_without_verification_state(tmp_path):
     archive = tmp_path / "models" / "org" / "model"
     archive.mkdir(parents=True)
     (archive / "config.json").write_text("{}", encoding="utf-8")
@@ -136,6 +143,49 @@ def test_repair_without_state_derives_repair_paths_from_verification(tmp_path):
 
     result = repair(Config(directory=tmp_path), "org/model", hub=hub)
 
+    assert result.status == "verify-required"
+    assert hub.downloads == []
+
+
+def test_repair_does_not_discover_checksum_failures_without_verification_state(tmp_path):
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    (archive / "config.json").write_text("{}", encoding="utf-8")
+    (archive / "file.bin").write_bytes(b"abc")
+    write_checksums(archive)
+    (archive / "file.bin").write_bytes(b"abd")
+    hub = FakeHub([FakeFile("file.bin", 3)])
+
+    result = repair(Config(directory=tmp_path), "org/model", hub=hub)
+
+    assert result.status == "verify-required"
+    assert hub.downloads == []
+
+
+def test_repair_defaults_to_recorded_commit_when_upstream_changed(tmp_path):
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    (archive / "config.json").write_text("{}", encoding="utf-8")
+    write_verification_state(
+        archive,
+        VerificationState(
+            status="dirty",
+            repo_id="org/model",
+            requested_revision="main",
+            resolved_commit="oldcommit",
+            upstream_commit="newcommit",
+            upstream_status="changed",
+            repair_paths=["missing.bin"],
+        ),
+    )
+    hub = FakeHub([FakeFile("missing.bin", 3)])
+
+    result = repair(Config(directory=tmp_path), "org/model", hub=hub)
+
+    state = read_verification_state(archive)
     assert result.status == "repaired"
-    assert result.paths == ["missing.bin", "wrong-size.bin"]
-    assert hub.downloads[0][4] == ["missing.bin", "wrong-size.bin"]
+    assert result.upstream_status == "changed"
+    assert hub.downloads[0][2] == "oldcommit"
+    assert state.resolved_commit == "oldcommit"
+    assert state.upstream_commit == "newcommit"
+    assert state.upstream_status == "changed"

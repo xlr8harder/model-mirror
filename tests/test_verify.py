@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 
 from model_mirror.checksums import write_checksums
-from model_mirror.verify import metadata_lfs_sha256, metadata_path, verify_remote
+from model_mirror.verify import RemoteVerifyResult, merge_checksum_result, metadata_lfs_sha256, metadata_path, verify_remote
 
 
 @dataclass
@@ -81,3 +81,14 @@ def test_metadata_adapters_support_huggingface_sibling_shape():
 
     assert metadata_path(sibling) == "file.bin"
     assert metadata_lfs_sha256(sibling) == "abc"
+
+
+def test_merge_checksum_result_adds_only_new_paths():
+    remote = RemoteVerifyResult(missing=["a"], hash_mismatches=["b"], extras=["c"])
+    checksum = SimpleNamespace(missing=["a", "d"], failures=["b", "e"], extras=["c", "f"])
+
+    merge_checksum_result(remote, checksum)
+
+    assert remote.missing == ["a", "d"]
+    assert remote.hash_mismatches == ["b", "e"]
+    assert remote.extras == ["c", "f"]

@@ -6,9 +6,9 @@ usage belongs in `README.md`.
 ## Development
 
 ```bash
-python -m pip install -e ".[test]"
-coverage run -m pytest
-coverage report -m
+uv sync
+uv run coverage run -m pytest
+uv run coverage report -m
 ```
 
 The test suite is expected to hold 100% statement and branch coverage. The

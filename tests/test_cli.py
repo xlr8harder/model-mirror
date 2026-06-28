@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import hashlib
 import runpy
 import sys
 from types import SimpleNamespace
@@ -7,12 +8,15 @@ from types import SimpleNamespace
 import yaml
 import pytest
 
+import model_mirror.checksums as checksums_module
 import model_mirror.cli as cli_module
 from model_mirror.checksums import write_checksums
 from model_mirror.cli import (
+    format_age_seconds,
     main,
     list_model_ids,
     parse_age,
+    print_verification_age,
     should_skip_recent_clean,
     verification_age_label,
     verification_age_seconds,
@@ -53,7 +57,7 @@ class FakeHub:
 
 class MovingBranchHub(FakeHub):
     def snapshot(self, repo_id, repo_type, revision):
-        commit = {"main": "newcommit", "oldcommit": "oldcommit"}[revision]
+        commit = {"main": "newcommit", "oldcommit": "oldcommit", "newcommit": "newcommit"}[revision]
         return HubSnapshot(
             repo_id=repo_id,
             repo_type=repo_type,
@@ -313,6 +317,29 @@ def test_verify_uses_stored_commit_and_reports_changed_upstream(tmp_path, capsys
     assert state.upstream_commit == "newcommit"
 
 
+def test_verify_failure_reports_changed_upstream(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    (archive / "config.json").write_text("{}", encoding="utf-8")
+    write_verification_state(
+        archive,
+        VerificationState(
+            status="clean",
+            repo_id="org/model",
+            requested_revision="main",
+            resolved_commit="oldcommit",
+        ),
+    )
+    hub = MovingBranchHub([FakeFile("missing.bin", 3)])
+
+    rc = main(["--config", str(config_path), "verify", "--quick", "org/model"], hub=hub)
+
+    assert rc == 1
+    assert "verification failed: org/model upstream=changed" in capsys.readouterr().out
+
+
 def test_verify_command_reports_failure(tmp_path, capsys):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
@@ -401,6 +428,7 @@ def test_list_command_prints_verification_status_and_age(tmp_path, capsys):
     config_path = tmp_path / "config.yaml"
     archive = tmp_path / "models" / "org" / "model"
     archive.mkdir(parents=True)
+    (archive / "config.json").write_text("{}", encoding="utf-8")
     write_verification_state(
         archive,
         VerificationState(
@@ -465,7 +493,92 @@ def test_verify_repair_repairs_dirty_archive(tmp_path, capsys):
     assert read_verification_state(archive).status == "clean"
 
 
-def test_repair_command_uses_existing_verification_state(tmp_path, capsys):
+def test_full_verify_detects_tampering_when_checksums_already_exist(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    (archive / "config.json").write_text("{}", encoding="utf-8")
+    (archive / "file.bin").write_bytes(b"abc")
+    write_checksums(archive)
+    (archive / "file.bin").write_bytes(b"abd")
+    hub = FakeHub([FakeFile("file.bin", 3, lfs_sha256=hashlib.sha256(b"abc").hexdigest())])
+
+    rc = main(["--config", str(config_path), "verify", "org/model"], hub=hub)
+
+    assert rc == 1
+    assert "verification failed" in capsys.readouterr().out
+    state = read_verification_state(archive)
+    assert state.status == "dirty"
+    assert state.repair_paths == ["file.bin"]
+
+
+def test_full_verify_refreshes_when_existing_checksums_are_clean(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    (archive / "config.json").write_text("{}", encoding="utf-8")
+    payload = b"abc"
+    (archive / "file.bin").write_bytes(payload)
+    write_checksums(archive)
+    hub = FakeHub([FakeFile("file.bin", 3, lfs_sha256=hashlib.sha256(payload).hexdigest())])
+
+    rc = main(["--config", str(config_path), "verify", "org/model"], hub=hub)
+
+    assert rc == 0
+    assert "verified (full)" in capsys.readouterr().out
+
+
+def test_verify_repair_hashes_unchanged_files_once(tmp_path, monkeypatch, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    (archive / "config.json").write_text("{}", encoding="utf-8")
+    (archive / "good.bin").write_bytes(b"good")
+    (archive / "bad.bin").write_bytes(b"bad!")
+    hub = FakeHub(
+        [
+            FakeFile("config.json", 2),
+            FakeFile("good.bin", 4, lfs_sha256=hashlib.sha256(b"good").hexdigest()),
+            FakeFile("bad.bin", 4, lfs_sha256=hashlib.sha256(b"xxxx").hexdigest()),
+        ]
+    )
+    calls = []
+    real_sha = checksums_module.sha256_file
+
+    def tracking_sha(path):
+        calls.append(path.name)
+        return real_sha(path)
+
+    monkeypatch.setattr(checksums_module, "sha256_file", tracking_sha)
+
+    rc = main(["--config", str(config_path), "verify", "--repair", "org/model"], hub=hub)
+
+    assert rc == 0
+    assert "repaired: org/model" in capsys.readouterr().out
+    assert calls.count("good.bin") == 1
+    assert calls.count("bad.bin") == 2
+
+
+def test_full_verify_can_hash_directly_when_checksums_are_disabled(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path), "checksum": False}), encoding="utf-8")
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    (archive / "config.json").write_text("{}", encoding="utf-8")
+    (archive / "file.bin").write_bytes(b"abc")
+    hub = FakeHub([FakeFile("file.bin", 3, lfs_sha256=hashlib.sha256(b"abc").hexdigest())])
+
+    rc = main(["--config", str(config_path), "verify", "org/model"], hub=hub)
+
+    assert rc == 0
+    assert "verified (full)" in capsys.readouterr().out
+    assert not (archive / ".checksums").exists()
+
+
+def test_repair_command_uses_existing_verification_state_and_reports_age(tmp_path, capsys):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
     archive = tmp_path / "models" / "org" / "model"
@@ -473,15 +586,65 @@ def test_repair_command_uses_existing_verification_state(tmp_path, capsys):
     (archive / "config.json").write_text("{}", encoding="utf-8")
     write_verification_state(
         archive,
-        VerificationState(status="dirty", repo_id="org/model", repair_paths=["missing.bin"]),
+        VerificationState(
+            status="dirty",
+            repo_id="org/model",
+            repair_paths=["missing.bin"],
+            checked_at_utc=(datetime.now(timezone.utc) - timedelta(days=2)).isoformat(timespec="seconds"),
+        ),
     )
     hub = FakeHub([FakeFile("missing.bin", 3)])
 
     rc = main(["--config", str(config_path), "repair", "org/model"], hub=hub)
 
+    output = capsys.readouterr().out
     assert rc == 0
-    assert "repaired: org/model" in capsys.readouterr().out
+    assert "verification age: 2d" in output
+    assert "warning: verification is older than 24h" in output
+    assert "repaired: org/model" in output
     assert (archive / "missing.bin").exists()
+
+
+def test_repair_command_reports_missing_verification_state(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    hub = FakeHub([FakeFile("missing.bin", 3)])
+
+    rc = main(["--config", str(config_path), "repair", "org/model"], hub=hub)
+
+    output = capsys.readouterr().out
+    assert rc == 1
+    assert "verification age: unavailable" in output
+    assert "run verify first: model-mirror verify org/model" in output
+    assert "verify-required" in output
+
+
+def test_repair_command_reports_changed_upstream_from_verification_state(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    (archive / "config.json").write_text("{}", encoding="utf-8")
+    write_verification_state(
+        archive,
+        VerificationState(
+            status="dirty",
+            repo_id="org/model",
+            requested_revision="main",
+            resolved_commit="oldcommit",
+            upstream_commit="newcommit",
+            upstream_status="changed",
+            repair_paths=["missing.bin"],
+        ),
+    )
+    hub = MovingBranchHub([FakeFile("missing.bin", 3)])
+
+    rc = main(["--config", str(config_path), "repair", "org/model"], hub=hub)
+
+    output = capsys.readouterr().out
+    assert rc == 0
+    assert "upstream changed: org/model local=oldcommit upstream=newcommit not_applied" in output
+    assert hub.download_revisions == ["oldcommit"]
 
 
 def test_repair_command_returns_failure_when_repair_is_incomplete(tmp_path, capsys):
@@ -620,3 +783,17 @@ def test_age_helpers_cover_units_and_invalid_values():
     assert verification_age_label((datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()) == "30s"
     assert verification_age_label((datetime.now(timezone.utc) - timedelta(minutes=3)).isoformat()) == "3m"
     assert verification_age_label((datetime.now(timezone.utc) - timedelta(days=3)).isoformat()) == "3d"
+    assert format_age_seconds(None) == "unknown"
+
+
+def test_verification_age_falls_back_to_state_file_mtime(tmp_path, capsys):
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    (archive / ".verification").write_text(
+        yaml.safe_dump({"status": "dirty", "repo_id": "org/model", "checked_at_utc": "invalid"}),
+        encoding="utf-8",
+    )
+
+    print_verification_age(Config(directory=tmp_path), "org/model", "model")
+
+    assert "verification age: 0s" in capsys.readouterr().out

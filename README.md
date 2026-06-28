@@ -3,22 +3,22 @@
 Mirror Hugging Face repositories into local bulk storage and verify that the
 files remain complete.
 
-`model-mirror` is meant for model archives that are too large for the default
-Hugging Face cache. It downloads into one archive directory, records the exact
+`model-mirror` downloads directly into one archive directory, avoiding payload
+files being left behind in the default Hugging Face cache. It records the exact
 Hub commit mirrored, writes local SHA-256 checksums, and keeps verification
 state beside each model.
 
 ## Quick Start
 
 ```bash
-python -m pip install -e .
+uv sync
 
-model-mirror config directory /mnt/big-drive/huggingface
-model-mirror config set hf-xet-reconstruct-write-sequentially true  # useful for HDDs
+uv run model-mirror config directory /mnt/big-drive/huggingface
+uv run model-mirror config set hf-xet-reconstruct-write-sequentially true  # useful for HDDs
 
-model-mirror mirror org/model
-model-mirror list
-model-mirror verify org/model
+uv run model-mirror mirror org/model
+uv run model-mirror list
+uv run model-mirror verify org/model
 ```
 
 Mirrors are stored by repo type:
@@ -56,13 +56,21 @@ model-mirror verify --all --max-age 7d
 local `.verification` and `.checksums` files. `--max-age` is useful for periodic
 jobs that should skip recently verified clean mirrors.
 
-If verification finds missing or corrupt files, repair can redownload only the
-paths listed in `.verification`:
+Verification records missing or corrupt files as repair paths in
+`.verification`. Repairs redownload only those paths:
 
 ```bash
 model-mirror verify --repair org/model
 model-mirror repair org/model
 ```
+
+`repair org/model` consumes the existing `.verification` state. If no
+verification state exists, it tells you to run `verify` first. It prints how old
+the verification result is, warns after 24 hours, updates checksums for repaired
+files, and runs a final verification from checksum state. In a `verify --repair`
+workflow, the initial full verify hashes existing files once; repaired files are
+hashed again after download, but unchanged large files are not rehashed a second
+time.
 
 ## Upstream Updates
 
@@ -71,7 +79,8 @@ specific Hub commit. The local mirror is tied to that commit.
 
 If `verify` sees that upstream `main` now points at a different commit, it marks
 the mirror with `upstream_status: changed` but does not overwrite local files.
-Updating is explicit:
+`repair` consumes that verification state, repairs the recorded commit, and
+reports that the upstream change was not applied. Updating is explicit:
 
 ```bash
 model-mirror update org/model
@@ -87,7 +96,7 @@ model-mirror mirror org/model              # download and verify
 model-mirror mirror --no-verify org/model  # download without final verification
 model-mirror verify org/model              # full verification
 model-mirror verify --quick org/model      # no SHA-256 pass
-model-mirror repair org/model              # redownload known bad/missing paths
+model-mirror repair org/model              # redownload paths from .verification
 model-mirror update org/model              # move to latest requested revision
 model-mirror list                          # show mirrors and verification age
 ```
