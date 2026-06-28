@@ -64,15 +64,3 @@ The conservative default is:
 
 This keeps the default path usable on lower-memory machines and lets power users
 tune throughput explicitly.
-
-## Future Peer Distribution
-
-A magnet link is not enough by itself to seed a Hugging Face repo. BitTorrent
-clients need torrent metadata: file paths, sizes, piece size, and piece hashes.
-For model-mirror, a workable design would bind torrent metadata to
-`repo_id`, `repo_type`, and resolved Hub commit, then let a torrent client hash
-an existing mirror and seed matching pieces.
-
-The final trust boundary should remain model-mirror verification. A torrent can
-move bytes efficiently, but `.verification`, Hub metadata, and local checksums
-should decide whether the archive is complete and usable.
