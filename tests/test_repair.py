@@ -1,0 +1,141 @@
+from dataclasses import dataclass
+
+import yaml
+
+from model_mirror.config import Config
+from model_mirror.checksums import load_records, write_checksums
+from model_mirror.repair import repair
+from model_mirror.state import VerificationState, read_verification_state, write_verification_state
+
+
+@dataclass
+class FakeFile:
+    path: str
+    size: int
+    lfs_sha256: str | None = None
+
+
+class FakeHub:
+    def __init__(self, metadata):
+        self.metadata = metadata
+        self.downloads = []
+
+    def files(self, repo_id, repo_type, revision):
+        return self.metadata
+
+    def snapshot_download(self, repo_id, repo_type, revision, local_dir, allow_patterns=None):
+        self.downloads.append((repo_id, repo_type, revision, local_dir, allow_patterns))
+        selected = set(allow_patterns or [item.path for item in self.metadata])
+        for item in self.metadata:
+            if item.path not in selected:
+                continue
+            path = local_dir / item.path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"x" * item.size)
+        return local_dir
+
+
+def test_repair_uses_local_verification_state_without_reverifying_first(tmp_path):
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    (archive / "config.json").write_text("{}", encoding="utf-8")
+    (archive / "good.bin").write_bytes(b"good")
+    (archive / "bad.bin").write_bytes(b"bad")
+    write_verification_state(
+        archive,
+        VerificationState(
+            status="dirty",
+            repo_id="org/model",
+            repair_paths=["bad.bin", "missing.bin"],
+        ),
+    )
+    hub = FakeHub(
+        [
+            FakeFile("good.bin", 4),
+            FakeFile("bad.bin", 5),
+            FakeFile("missing.bin", 7),
+        ]
+    )
+
+    result = repair(Config(directory=tmp_path), "org/model", hub=hub)
+
+    assert result.status == "repaired"
+    assert result.paths == ["bad.bin", "missing.bin"]
+    assert hub.downloads[0][4] == ["bad.bin", "missing.bin"]
+    assert (archive / "good.bin").read_bytes() == b"good"
+    assert read_verification_state(archive).status == "clean"
+
+
+def test_repair_noops_when_verification_state_is_clean(tmp_path):
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    write_verification_state(archive, VerificationState(status="clean", repo_id="org/model"))
+    hub = FakeHub([FakeFile("file.bin", 3)])
+
+    result = repair(Config(directory=tmp_path), "org/model", hub=hub)
+
+    assert result.status == "complete"
+    assert hub.downloads == []
+    assert read_verification_state(archive).status == "clean"
+
+
+def test_repair_noops_when_dirty_state_has_no_repair_paths(tmp_path):
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    write_verification_state(archive, VerificationState(status="dirty", repo_id="org/model"))
+    hub = FakeHub([FakeFile("file.bin", 3)])
+
+    result = repair(Config(directory=tmp_path), "org/model", hub=hub)
+
+    assert result.status == "complete"
+    assert hub.downloads == []
+
+
+def test_repair_updates_existing_checksums_for_repaired_paths(tmp_path):
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    (archive / "config.json").write_text("{}", encoding="utf-8")
+    (archive / "bad.bin").write_bytes(b"bad")
+    write_checksums(archive)
+    write_verification_state(
+        archive,
+        VerificationState(status="dirty", repo_id="org/model", repair_paths=["bad.bin"]),
+    )
+    hub = FakeHub([FakeFile("bad.bin", 5)])
+
+    result = repair(Config(directory=tmp_path), "org/model", hub=hub)
+
+    checksums, manifest = load_records(archive)
+    assert result.status == "repaired"
+    assert checksums.keys() >= {"bad.bin"}
+    assert manifest["bad.bin"]["size"] == 5
+
+
+def test_repair_can_run_without_checksum_writes(tmp_path):
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    (archive / "config.json").write_text("{}", encoding="utf-8")
+    write_verification_state(
+        archive,
+        VerificationState(status="dirty", repo_id="org/model", repair_paths=["missing.bin"]),
+    )
+    hub = FakeHub([FakeFile("missing.bin", 3)])
+
+    result = repair(Config(directory=tmp_path, checksum=False), "org/model", hub=hub)
+
+    assert result.status == "repaired"
+    assert not (archive / ".checksums").exists()
+
+
+def test_repair_without_state_derives_repair_paths_from_verification(tmp_path):
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    (archive / "config.json").write_text("{}", encoding="utf-8")
+    (archive / "wrong-size.bin").write_bytes(b"x")
+    hub = FakeHub([FakeFile("wrong-size.bin", 3), FakeFile("missing.bin", 2)])
+
+    result = repair(Config(directory=tmp_path), "org/model", hub=hub)
+
+    assert result.status == "repaired"
+    assert result.paths == ["missing.bin", "wrong-size.bin"]
+    assert hub.downloads[0][4] == ["missing.bin", "wrong-size.bin"]

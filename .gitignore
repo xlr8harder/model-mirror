@@ -1,0 +1,59 @@
+# Secrets and local configuration
+.env
+.env.*
+*.pem
+*.key
+*.token
+.model-mirror.yaml
+model-mirror.yaml
+.model-mirror/
+.verification
+.checksums
+.manifest
+
+# Model archives and large local state
+models/
+datasets/
+spaces/
+archives/
+downloads/
+.cache/
+cache/
+tmp/
+logs/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.gguf
+*.onnx
+*.msgpack
+*.h5
+*.incomplete
+SHA256SUMS
+MANIFEST.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+
+# Test and tooling output
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*~
+*.swp
