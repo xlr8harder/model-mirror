@@ -9,6 +9,12 @@ Hub commit mirrored, writes a local hash manifest, and keeps verification state
 beside each model. If you already use `hf auth login`, model-mirror will try to
 find that token automatically.
 
+Online operations resolve the requested Hugging Face revision, usually `main`,
+to a specific Hub commit before downloading, verifying, or repairing. The local
+mirror stays tied to that commit so files are not mixed across upstream updates.
+If the Hub repo later moves to a newer commit, `verify` reports the upstream
+change without modifying local files.
+
 ## Quick Start
 
 ```bash
