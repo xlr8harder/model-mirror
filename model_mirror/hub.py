@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import patch
 
-from .config import Config, apply_hf_environment
+from .config import Config, TOKEN_SETUP_HINT, apply_hf_environment, hf_token_available
 
 
 @dataclass(slots=True)
@@ -13,6 +14,7 @@ class HubFile:
     path: str
     size: int | None
     lfs_sha256: str | None = None
+    blob_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -27,12 +29,13 @@ class HubSnapshot:
 class HuggingFaceHub:
     def __init__(self, config: Config):
         self.config = config
+        self._warned_missing_token = False
 
     def files(self, repo_id: str, repo_type: str, revision: str) -> list[HubFile]:
         return self.snapshot(repo_id, repo_type, revision).files
 
     def snapshot(self, repo_id: str, repo_type: str, revision: str) -> HubSnapshot:
-        with patch.dict(os.environ, apply_hf_environment(self.config), clear=False):
+        with patch.dict(os.environ, self._environment(), clear=False):
             from huggingface_hub import HfApi
 
             api = HfApi()
@@ -54,7 +57,7 @@ class HuggingFaceHub:
         allow_patterns: list[str] | None = None,
     ) -> Path:
         local_dir.mkdir(parents=True, exist_ok=True)
-        with patch.dict(os.environ, apply_hf_environment(self.config), clear=False):
+        with patch.dict(os.environ, self._environment(), clear=False):
             from huggingface_hub import snapshot_download
 
             path = snapshot_download(
@@ -66,6 +69,18 @@ class HuggingFaceHub:
             )
         return Path(path)
 
+    def _environment(self) -> dict[str, str]:
+        env = apply_hf_environment(self.config)
+        if not hf_token_available(env) and not self._warned_missing_token:
+            print(
+                "warning: no Hugging Face token found; private or gated repositories may fail "
+                "and unauthenticated access can affect throughput. Configure a token file with: "
+                f"{TOKEN_SETUP_HINT} (or export HF_TOKEN).",
+                file=sys.stderr,
+            )
+            self._warned_missing_token = True
+        return env
+
     @staticmethod
     def _file_from_sibling(sibling) -> HubFile:
         lfs = getattr(sibling, "lfs", None)
@@ -74,6 +89,7 @@ class HuggingFaceHub:
             path=getattr(sibling, "rfilename"),
             size=getattr(sibling, "size", None),
             lfs_sha256=lfs_sha256,
+            blob_id=getattr(sibling, "blob_id", None),
         )
 
 

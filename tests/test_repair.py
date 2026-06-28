@@ -14,22 +14,24 @@ class FakeFile:
 
 
 class FakeHub:
-    def __init__(self, metadata):
+    def __init__(self, metadata, metadata_by_revision=None):
         self.metadata = metadata
+        self.metadata_by_revision = metadata_by_revision or {}
         self.downloads = []
 
     def files(self, repo_id, repo_type, revision):
-        return self.metadata
+        return self.metadata_by_revision.get(revision, self.metadata)
 
     def snapshot_download(self, repo_id, repo_type, revision, local_dir, allow_patterns=None):
         self.downloads.append((repo_id, repo_type, revision, local_dir, allow_patterns))
-        selected = set(allow_patterns or [item.path for item in self.metadata])
-        for item in self.metadata:
+        selected_metadata = self.metadata_by_revision.get(revision, self.metadata)
+        selected = set(allow_patterns or [item.path for item in selected_metadata])
+        for item in selected_metadata:
             if item.path not in selected:
                 continue
             path = local_dir / item.path
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(b"x" * item.size)
+            path.write_bytes(b"{}" if item.path == "config.json" else b"x" * item.size)
         return local_dir
 
 
@@ -189,3 +191,58 @@ def test_repair_defaults_to_recorded_commit_when_upstream_changed(tmp_path):
     assert state.resolved_commit == "oldcommit"
     assert state.upstream_commit == "newcommit"
     assert state.upstream_status == "changed"
+
+
+def test_repair_update_applies_changed_upstream_commit(tmp_path):
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    write_verification_state(
+        archive,
+        VerificationState(
+            status="clean",
+            repo_id="org/model",
+            requested_revision="main",
+            resolved_commit="oldcommit",
+            upstream_commit="newcommit",
+            upstream_status="changed",
+        ),
+    )
+    hub = FakeHub(
+        [FakeFile("file.bin", 3)],
+        metadata_by_revision={"newcommit": [FakeFile("config.json", 2), FakeFile("file.bin", 4)]},
+    )
+
+    result = repair(Config(directory=tmp_path), "org/model", hub=hub, update=True)
+
+    state = read_verification_state(archive)
+    assert result.status == "updated"
+    assert hub.downloads[0][2] == "newcommit"
+    assert (archive / "file.bin").stat().st_size == 4
+    assert state.resolved_commit == "newcommit"
+    assert state.upstream_commit == "newcommit"
+    assert state.upstream_status == "current"
+
+
+def test_repair_update_can_skip_checksum_writes(tmp_path):
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    write_verification_state(
+        archive,
+        VerificationState(
+            status="clean",
+            repo_id="org/model",
+            requested_revision="main",
+            resolved_commit="oldcommit",
+            upstream_commit="newcommit",
+            upstream_status="changed",
+        ),
+    )
+    hub = FakeHub(
+        [FakeFile("file.bin", 3)],
+        metadata_by_revision={"newcommit": [FakeFile("config.json", 2), FakeFile("file.bin", 4)]},
+    )
+
+    result = repair(Config(directory=tmp_path, checksum=False), "org/model", hub=hub, update=True)
+
+    assert result.status == "updated"
+    assert not (archive / ".checksums").exists()

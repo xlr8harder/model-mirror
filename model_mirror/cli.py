@@ -46,7 +46,12 @@ CONFIG_OPTIONS = [
         "MODEL_MIRROR_HF_XET_NUM_CONCURRENT_RANGE_GETS",
         "Sets HF_XET_NUM_CONCURRENT_RANGE_GETS. Leave unset to use Hugging Face defaults.",
     ),
-    ("token_path", "MODEL_MIRROR_TOKEN_PATH", "Path to a Hugging Face token file. Token contents are never printed."),
+    (
+        "token_path",
+        "MODEL_MIRROR_TOKEN_PATH",
+        "Path to a Hugging Face token file. If unset, model-mirror checks HF_TOKEN_PATH, "
+        "HF_HOME/token, ~/.cache/huggingface/token, and ~/.huggingface/token. Token contents are never printed.",
+    ),
     ("cache_dir", None, "Overrides the Hugging Face cache root; defaults to DIRECTORY/.cache."),
     ("tmp_dir", None, "Overrides temporary file directory; defaults to DIRECTORY/tmp."),
 ]
@@ -99,18 +104,13 @@ def build_parser() -> argparse.ArgumentParser:
     repair_parser.add_argument("model", metavar="repo", nargs="?", help="repo id to repair unless --all is used")
     repair_parser.add_argument("--all", action="store_true", help="repair every mirrored model with verification state")
     repair_parser.add_argument(
+        "--update",
+        action="store_true",
+        help="apply upstream commit changes recorded by verify before repairing",
+    )
+    repair_parser.add_argument(
         "--repo-type", choices=["model", "dataset", "space"], default="model", help="repo kind to repair"
     )
-
-    update_parser = subparsers.add_parser(
-        "update",
-        help="explicitly update a mirror to the latest requested revision",
-        description="Force a mirror refresh. This is the explicit path for moving to a newer upstream commit.",
-    )
-    update_parser.add_argument("model", metavar="repo", help="repo id to update")
-    update_parser.add_argument("--repo-type", choices=["model", "dataset", "space"], help="repo kind to update")
-    add_revision_options(update_parser)
-    update_parser.add_argument("--no-verify", action="store_true", help="skip verification after update")
 
     subparsers.add_parser("list", help="list mirrored models", description="Show mirrored models and verification age.")
 
@@ -169,19 +169,6 @@ def main(argv: list[str] | None = None, *, hub=None) -> int:
             return handle_verify(args, config, hub=hub)
         if args.command == "repair":
             return handle_repair(args, config, hub=hub)
-        if args.command == "update":
-            selected_hub = hub or HuggingFaceHub(config)
-            result = mirror(
-                config,
-                args.model,
-                hub=selected_hub,
-                repo_type=args.repo_type,
-                revision=selected_revision_arg(args),
-                force=True,
-                verify_after=config.verify_after_mirror and not args.no_verify,
-            )
-            print(f"updated: {args.model} -> {result.path}")
-            return mirror_exit_code(result.status)
     except ModelBusyError as exc:
         print(str(exc))
         return 1
@@ -305,6 +292,7 @@ def handle_list(config: Config) -> int:
 def handle_verify(args, config: Config, *, hub=None) -> int:
     if args.all:
         failures = 0
+        changed = 0
         for repo_id in list_model_ids(config):
             if args.max_age and should_skip_recent_clean(config, repo_id, args.repo_type, args.max_age):
                 print(f"skipped recent clean verification: {repo_id}")
@@ -315,8 +303,15 @@ def handle_verify(args, config: Config, *, hub=None) -> int:
                 print(f"skipped busy: {repo_id} -> {exc.root} ({lock_label(exc.info)})")
                 failures += 1
                 continue
+            state = read_verification_state(archive_path(config, repo_id, args.repo_type))
+            if state is not None and state.upstream_status == "changed":
+                changed += 1
             if rc != 0:
                 failures += 1
+        if failures:
+            print("next: model-mirror repair --all")
+        if changed:
+            print("update changed upstreams: model-mirror repair --all --update")
         return 1 if failures else 0
 
     if not args.model:
@@ -353,12 +348,13 @@ def repair_one(config: Config, repo_id: str, args, *, hub=None) -> int:
         repo_id,
         hub=selected_hub,
         repo_type=args.repo_type,
+        update=args.update,
     )
     if result.status == "verify-required":
         print(f"run verify first: model-mirror verify {repo_id}")
     print_repair_commit_notice(repo_id, result)
     print(f"{result.status}: {repo_id} -> {result.path}")
-    return 0 if result.status in {"complete", "repaired"} else 1
+    return 0 if result.status in {"complete", "repaired", "updated"} else 1
 
 
 def verify_one(config: Config, repo_id: str, args, *, hub=None) -> int:
@@ -418,17 +414,32 @@ def verify_one_locked(config: Config, repo_id: str, args, selected_hub, root: Pa
 
     if audit is not None and not audit.ok:
         print(f"verification failed: {repo_id}{upstream_change_suffix(state)}")
+        print_verification_next_steps(repo_id, state)
         return 1
     if result.ok:
         mode = "quick" if args.quick else "full"
         print(f"verified ({mode}): {repo_id}{upstream_change_suffix(state)}")
+        if state.upstream_status == "changed":
+            print_update_next_step(repo_id)
         return 0
     print(f"verification failed: {repo_id}{upstream_change_suffix(state)}")
+    print_verification_next_steps(repo_id, state)
     return 1
 
 
 def upstream_change_suffix(state) -> str:
     return " upstream=changed" if state.upstream_status == "changed" else ""
+
+
+def print_verification_next_steps(repo_id: str, state) -> None:
+    if state.repair_paths:
+        print(f"next: model-mirror repair {repo_id}")
+    if state.upstream_status == "changed":
+        print_update_next_step(repo_id)
+
+
+def print_update_next_step(repo_id: str) -> None:
+    print(f"update changed upstream: model-mirror repair --update {repo_id}")
 
 
 def print_repair_commit_notice(repo_id: str, result) -> None:

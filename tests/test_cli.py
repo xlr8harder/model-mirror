@@ -35,18 +35,20 @@ class FakeFile:
 
 
 class FakeHub:
-    def __init__(self, metadata):
+    def __init__(self, metadata, metadata_by_revision=None):
         self.metadata = metadata
+        self.metadata_by_revision = metadata_by_revision or {}
         self.downloads = []
         self.download_revisions = []
 
     def files(self, repo_id, repo_type, revision):
-        return self.metadata
+        return self.metadata_by_revision.get(revision, self.metadata)
 
     def snapshot_download(self, repo_id, repo_type, revision, local_dir, allow_patterns=None):
         self.downloads.append(repo_id)
         self.download_revisions.append(revision)
-        for item in self.metadata:
+        selected_metadata = self.metadata_by_revision.get(revision, self.metadata)
+        for item in selected_metadata:
             if allow_patterns and item.path not in allow_patterns:
                 continue
             path = local_dir / item.path
@@ -312,6 +314,7 @@ def test_verify_uses_stored_commit_and_reports_changed_upstream(tmp_path, capsys
     assert rc == 0
     output = capsys.readouterr().out
     assert "upstream=changed" in output
+    assert "update changed upstream: model-mirror repair --update org/model" in output
     state = read_verification_state(archive)
     assert state.resolved_commit == "oldcommit"
     assert state.upstream_commit == "newcommit"
@@ -336,8 +339,22 @@ def test_verify_failure_reports_changed_upstream(tmp_path, capsys):
 
     rc = main(["--config", str(config_path), "verify", "--quick", "org/model"], hub=hub)
 
+    output = capsys.readouterr().out
     assert rc == 1
-    assert "verification failed: org/model upstream=changed" in capsys.readouterr().out
+    assert "verification failed: org/model upstream=changed" in output
+    assert "next: model-mirror repair org/model" in output
+    assert "update changed upstream: model-mirror repair --update org/model" in output
+
+
+def test_print_verification_next_steps_can_show_only_update_hint(capsys):
+    cli_module.print_verification_next_steps(
+        "org/model",
+        VerificationState(status="dirty", repo_id="org/model", upstream_status="changed"),
+    )
+
+    output = capsys.readouterr().out
+    assert "next: model-mirror repair org/model" not in output
+    assert "update changed upstream: model-mirror repair --update org/model" in output
 
 
 def test_verify_command_reports_failure(tmp_path, capsys):
@@ -402,6 +419,33 @@ def test_verify_all_returns_failure_when_any_model_fails(tmp_path, capsys):
     assert rc == 1
     assert "verified (quick): ok/model" in output
     assert "verification failed: bad/model" in output
+    assert "next: model-mirror repair --all" in output
+
+
+def test_verify_all_reports_changed_upstream_update_hint(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    (archive / "config.json").write_text("{}", encoding="utf-8")
+    (archive / "file.bin").write_bytes(b"abc")
+    write_verification_state(
+        archive,
+        VerificationState(
+            status="clean",
+            repo_id="org/model",
+            requested_revision="main",
+            resolved_commit="oldcommit",
+        ),
+    )
+    hub = MovingBranchHub([FakeFile("file.bin", 3)])
+
+    rc = main(["--config", str(config_path), "verify", "--quick", "--all"], hub=hub)
+
+    output = capsys.readouterr().out
+    assert rc == 0
+    assert "verified (quick): org/model upstream=changed" in output
+    assert "update changed upstreams: model-mirror repair --all --update" in output
 
 
 def test_verify_all_skips_busy_model_and_continues(tmp_path, capsys):
@@ -778,19 +822,40 @@ def test_repair_rejects_missing_or_conflicting_targets(tmp_path):
         main(["--config", str(config_path), "repair", "--all", "org/model"])
 
 
-def test_update_command_forces_mirror(tmp_path, capsys):
+def test_repair_update_applies_changed_upstream_from_verification_state(tmp_path, capsys):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
     archive = tmp_path / "models" / "org" / "model"
     archive.mkdir(parents=True)
-    (archive / "file.bin").write_bytes(b"abc")
-    hub = FakeHub([FakeFile("file.bin", 3)])
+    write_verification_state(
+        archive,
+        VerificationState(
+            status="clean",
+            repo_id="org/model",
+            requested_revision="main",
+            resolved_commit="oldcommit",
+            upstream_commit="newcommit",
+            upstream_status="changed",
+        ),
+    )
+    hub = FakeHub(
+        [FakeFile("file.bin", 3)],
+        metadata_by_revision={"newcommit": [FakeFile("config.json", 2), FakeFile("file.bin", 4)]},
+    )
 
-    rc = main(["--config", str(config_path), "update", "--no-verify", "org/model"], hub=hub)
+    rc = main(["--config", str(config_path), "repair", "--update", "org/model"], hub=hub)
 
     assert rc == 0
     assert hub.downloads == ["org/model"]
+    assert hub.download_revisions == ["newcommit"]
     assert "updated: org/model" in capsys.readouterr().out
+
+
+def test_update_command_is_removed(tmp_path):
+    config_path = tmp_path / "config.yaml"
+
+    with pytest.raises(SystemExit):
+        main(["--config", str(config_path), "update", "org/model"])
 
 
 def test_verify_all_max_age_skips_recent_clean_model(tmp_path, capsys):

@@ -3,7 +3,15 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 
 from model_mirror.checksums import write_checksums
-from model_mirror.verify import RemoteVerifyResult, merge_checksum_result, metadata_lfs_sha256, metadata_path, verify_remote
+from model_mirror.verify import (
+    RemoteVerifyResult,
+    git_blob_sha1_file,
+    merge_checksum_result,
+    metadata_blob_id,
+    metadata_lfs_sha256,
+    metadata_path,
+    verify_remote,
+)
 
 
 @dataclass
@@ -11,6 +19,7 @@ class FakeFile:
     path: str
     size: int
     lfs_sha256: str | None = None
+    blob_id: str | None = None
 
 
 def test_verify_remote_quick_checks_presence_and_size_only(tmp_path):
@@ -35,6 +44,35 @@ def test_verify_remote_from_checksums_compares_lfs_hashes_without_rehashing(tmp_
 
     assert result.ok is True
     assert result.hashes_checked == 1
+
+
+def test_git_blob_sha1_file_uses_git_blob_object_format(tmp_path):
+    path = tmp_path / "README.md"
+    path.write_bytes(b"hello\n")
+    expected = hashlib.sha1(b"blob 6\0hello\n").hexdigest()
+
+    assert git_blob_sha1_file(path) == expected
+
+
+def test_verify_remote_validates_regular_git_blob_id(tmp_path):
+    path = tmp_path / "README.md"
+    path.write_bytes(b"abc")
+    metadata = [FakeFile("README.md", 3, blob_id=git_blob_sha1_file(path))]
+
+    result = verify_remote(tmp_path, metadata, from_checksums=True)
+
+    assert result.ok is True
+    assert result.hashes_checked == 1
+
+
+def test_verify_remote_reports_regular_git_blob_mismatch(tmp_path):
+    (tmp_path / "README.md").write_bytes(b"abc")
+    metadata = [FakeFile("README.md", 3, blob_id="0" * 40)]
+
+    result = verify_remote(tmp_path, metadata)
+
+    assert result.ok is False
+    assert result.hash_mismatches == ["README.md"]
 
 
 def test_verify_remote_reports_missing_size_and_hash_failures(tmp_path):
@@ -77,10 +115,11 @@ def test_verify_remote_reports_missing_checksum_record(tmp_path):
 
 def test_metadata_adapters_support_huggingface_sibling_shape():
     lfs = SimpleNamespace(sha256="abc")
-    sibling = SimpleNamespace(rfilename="file.bin", size=1, lfs=lfs)
+    sibling = SimpleNamespace(rfilename="file.bin", size=1, lfs=lfs, blob_id="blob123")
 
     assert metadata_path(sibling) == "file.bin"
     assert metadata_lfs_sha256(sibling) == "abc"
+    assert metadata_blob_id(sibling) == "blob123"
 
 
 def test_merge_checksum_result_adds_only_new_paths():

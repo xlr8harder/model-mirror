@@ -6,7 +6,8 @@ files remain complete.
 `model-mirror` downloads directly into one archive directory, avoiding payload
 files being left behind in the default Hugging Face cache. It records the exact
 Hub commit mirrored, writes local SHA-256 checksums, and keeps verification
-state beside each model.
+state beside each model. If you already use `hf auth login`, model-mirror will
+try to find that token automatically.
 
 ## Quick Start
 
@@ -15,6 +16,8 @@ uv sync
 
 uv run model-mirror config directory /mnt/big-drive/huggingface
 uv run model-mirror config set hf-xet-reconstruct-write-sequentially true  # useful for HDDs
+# Optional if token autodetection does not find your Hugging Face token:
+uv run model-mirror config set token-path ~/.cache/huggingface/token
 
 uv run model-mirror mirror org/model
 uv run model-mirror list
@@ -40,6 +43,8 @@ reference. Run `model-mirror config options` for every supported config key.
 - all expected Hub files present
 - expected file sizes
 - local SHA-256 checksums in `.checksums`
+- LFS file hashes compared with Hub LFS SHA-256 metadata
+- regular Git files compared with Hub Git blob ids
 - local file metadata in `.manifest`
 - `.verification` with `status: clean`
 
@@ -112,7 +117,8 @@ the mirror with `upstream_status: changed` but does not overwrite local files.
 reports that the upstream change was not applied. Updating is explicit:
 
 ```bash
-model-mirror update org/model
+model-mirror repair --update org/model
+model-mirror repair --all --update
 model-mirror mirror --commit abc123 org/model
 ```
 
@@ -127,7 +133,7 @@ model-mirror verify org/model              # full verification
 model-mirror verify --quick org/model      # no SHA-256 pass
 model-mirror repair org/model              # redownload paths from .verification
 model-mirror repair --all                  # repair all mirrors with recorded repair paths
-model-mirror update org/model              # move to latest requested revision
+model-mirror repair --update org/model     # apply a changed upstream commit recorded by verify
 model-mirror list                          # show mirrors and verification age
 ```
 
@@ -144,7 +150,7 @@ model-mirror config set checksum-workers 1
 model-mirror config set hf-xet-reconstruct-write-sequentially true
 ```
 
-Important switches:
+Important configuration options:
 
 - `directory`: archive root
 - `repo_type`: default repo type, usually `model`
@@ -152,7 +158,11 @@ Important switches:
 - `checksum`: whether mirror/repair writes local SHA-256 records
 - `checksum_workers`: checksum hashing concurrency; `1` is HDD-friendly
 - `verify_after_mirror`: run verification after `mirror`
-- `token_path`: Hugging Face token file path; token contents are never printed
+- `token_path`: Hugging Face token file path; optional when autodetection finds
+  `HF_TOKEN_PATH`, `HF_HOME/token`, `~/.cache/huggingface/token`, or
+  `~/.huggingface/token`. If no token is found during Hub access,
+  model-mirror warns and prints the config command to set this path. Token
+  contents are never printed.
 - `hf_xet_reconstruct_write_sequentially`: sequential Xet writes for HDDs
 - `hf_xet_num_concurrent_range_gets`: Xet range-get concurrency; leave unset to
   use Hugging Face's default of `16`

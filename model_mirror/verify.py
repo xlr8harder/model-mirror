@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -48,6 +49,20 @@ def metadata_lfs_sha256(item) -> str | None:
     return getattr(lfs, "sha256", None)
 
 
+def metadata_blob_id(item) -> str | None:
+    return getattr(item, "blob_id", None)
+
+
+def git_blob_sha1_file(path: Path) -> str:
+    digest = hashlib.sha1()
+    size = path.stat().st_size
+    digest.update(f"blob {size}\0".encode("ascii"))
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(16 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def verify_remote(
     root: Path,
     metadata,
@@ -84,19 +99,27 @@ def verify_remote(
         if quick:
             continue
 
-        expected_hash = metadata_lfs_sha256(item)
-        if expected_hash is None:
+        expected_lfs_hash = metadata_lfs_sha256(item)
+        if expected_lfs_hash is not None:
+            if from_checksums:
+                actual_hash = checksums.get(rel)
+                if actual_hash is None:
+                    result.hash_missing.append(rel)
+                    continue
+            else:
+                actual_hash = sha256_file(path)
+            result.hashes_checked += 1
+            if actual_hash != expected_lfs_hash:
+                result.hash_mismatches.append(rel)
             continue
 
-        if from_checksums:
-            actual_hash = checksums.get(rel)
-            if actual_hash is None:
-                result.hash_missing.append(rel)
-                continue
-        else:
-            actual_hash = sha256_file(path)
+        expected_blob_id = metadata_blob_id(item)
+        if expected_blob_id is None:
+            continue
+
+        actual_hash = git_blob_sha1_file(path)
         result.hashes_checked += 1
-        if actual_hash != expected_hash:
+        if actual_hash != expected_blob_id:
             result.hash_mismatches.append(rel)
 
     if strict:

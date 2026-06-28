@@ -29,6 +29,7 @@ def repair(
     hub=None,
     repo_type: str | None = None,
     revision: str | None = None,
+    update: bool = False,
 ) -> RepairResult:
     selected_type = repo_type or config.repo_type
     selected_revision = revision or config.revision
@@ -42,6 +43,7 @@ def repair(
             selected_type,
             selected_revision,
             root,
+            update=update,
         )
 
 
@@ -52,10 +54,22 @@ def repair_locked(
     selected_type: str,
     selected_revision: str,
     root: Path,
+    *,
+    update: bool,
 ) -> RepairResult:
     state = read_audit_state(root)
     if state is None:
         return RepairResult("verify-required", root, [])
+    if update and state.upstream_status == "changed" and state.upstream_commit:
+        return update_to_upstream(
+            config,
+            repo_id,
+            selected_hub,
+            selected_type,
+            selected_revision,
+            root,
+            state,
+        )
     if state.clean:
         return repair_result("complete", root, [], state)
 
@@ -94,6 +108,39 @@ def repair_locked(
     )
     write_audit_state(root, final_state)
     return repair_result("repaired" if final_state.clean else "incomplete", root, paths, final_state)
+
+
+def update_to_upstream(
+    config: Config,
+    repo_id: str,
+    selected_hub,
+    selected_type: str,
+    selected_revision: str,
+    root: Path,
+    state: AuditState,
+) -> RepairResult:
+    requested_revision = state.requested_revision or selected_revision
+    target_revision = state.upstream_commit
+    root.mkdir(parents=True, exist_ok=True)
+    selected_hub.snapshot_download(repo_id, selected_type, target_revision, root)
+    checksums_available = False
+    if config.checksum:
+        write_checksums(root, max_workers=config.checksum_workers)
+        checksums_available = True
+    final_state = derive_state(
+        config,
+        repo_id,
+        selected_hub,
+        selected_type,
+        requested_revision,
+        root,
+        resolved_commit=target_revision,
+        upstream_commit=target_revision,
+        quick=False,
+        from_checksums=checksums_available,
+    )
+    write_audit_state(root, final_state)
+    return repair_result("updated" if final_state.clean else "incomplete", root, [], final_state)
 
 
 def repair_result(

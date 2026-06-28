@@ -7,12 +7,15 @@ from model_mirror.config import (
     Config,
     apply_hf_environment,
     archive_path,
+    detect_token_path,
+    hf_token_available,
     load_config,
     parse_bool,
     parse_optional_positive_int,
     parse_positive_int,
     save_config,
     safe_repo_path,
+    token_path_candidates,
 )
 
 
@@ -236,6 +239,77 @@ def test_apply_hf_environment_uses_legacy_token_path_when_present(tmp_path, monk
     env = apply_hf_environment(Config(directory=tmp_path / "archive"), environ={})
 
     assert env["HF_TOKEN_PATH"] == str(legacy)
+
+
+def test_apply_hf_environment_detects_hf_home_token_before_relocating_cache(tmp_path):
+    hf_home = tmp_path / "hf-home"
+    token = hf_home / "token"
+    hf_home.mkdir()
+    token.write_text("hf_example", encoding="utf-8")
+
+    env = apply_hf_environment(
+        Config(directory=tmp_path / "archive"),
+        environ={"HF_HOME": str(hf_home)},
+    )
+
+    assert env["HF_TOKEN_PATH"] == str(token)
+    assert env["HF_HOME"] == str(tmp_path / "archive" / ".cache")
+
+
+def test_detect_token_path_prefers_configured_path_even_if_missing(tmp_path):
+    configured = tmp_path / "configured-token"
+    fallback = tmp_path / "hf-home" / "token"
+    fallback.parent.mkdir()
+    fallback.write_text("hf_example", encoding="utf-8")
+
+    detected = detect_token_path(
+        Config(directory=tmp_path / "archive", token_path=configured),
+        environ={"HF_HOME": str(fallback.parent)},
+    )
+
+    assert detected == configured
+
+
+def test_token_path_candidates_include_common_locations_without_duplicates(tmp_path, monkeypatch):
+    monkeypatch.setattr(config_module.Path, "home", lambda: tmp_path / "home")
+
+    candidates = token_path_candidates(
+        {
+            "HF_TOKEN_PATH": str(tmp_path / "token"),
+            "MODEL_MIRROR_TOKEN_PATH": str(tmp_path / "token"),
+            "HF_HOME": str(tmp_path / "hf-home"),
+        }
+    )
+
+    assert candidates == [
+        tmp_path / "token",
+        tmp_path / "hf-home" / "token",
+        tmp_path / "home" / ".cache" / "huggingface" / "token",
+        tmp_path / "home" / ".huggingface" / "token",
+    ]
+
+
+def test_hf_token_available_checks_env_token_and_nonempty_token_file(tmp_path):
+    token = tmp_path / "token"
+
+    assert hf_token_available({"HF_TOKEN": "hf_secret"}) is True
+    assert hf_token_available({"HF_TOKEN_PATH": str(token)}) is False
+
+    token.write_text("", encoding="utf-8")
+    assert hf_token_available({"HF_TOKEN_PATH": str(token)}) is False
+
+    token.write_text("hf_example", encoding="utf-8")
+    assert hf_token_available({"HF_TOKEN_PATH": str(token)}) is True
+
+
+def test_hf_token_available_handles_token_file_stat_errors(tmp_path, monkeypatch):
+    def raise_stat(self):
+        raise OSError("stat failed")
+
+    monkeypatch.setattr(config_module.Path, "is_file", lambda self: True)
+    monkeypatch.setattr(config_module.Path, "stat", raise_stat)
+
+    assert hf_token_available({"HF_TOKEN_PATH": str(tmp_path / "token")}) is False
 
 
 def test_apply_hf_environment_leaves_optional_token_and_xet_knobs_unset(tmp_path, monkeypatch):

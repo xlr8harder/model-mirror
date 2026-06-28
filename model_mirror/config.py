@@ -9,6 +9,7 @@ import yaml
 
 
 DEFAULT_CONFIG_PATH = Path("~/.model-mirror.yaml").expanduser()
+TOKEN_SETUP_HINT = "model-mirror config set token-path /path/to/huggingface/token"
 REPO_TYPE_DIRS = {
     "model": "models",
     "dataset": "datasets",
@@ -128,6 +129,55 @@ def _path_or_none(value: object) -> Path | None:
     return Path(str(value)).expanduser()
 
 
+def token_path_candidates(environ: Mapping[str, str] | None = None) -> list[Path]:
+    env = os.environ if environ is None else environ
+    candidates: list[Path] = []
+    if env.get("HF_TOKEN_PATH"):
+        candidates.append(Path(env["HF_TOKEN_PATH"]).expanduser())
+    if env.get("MODEL_MIRROR_TOKEN_PATH"):
+        candidates.append(Path(env["MODEL_MIRROR_TOKEN_PATH"]).expanduser())
+    if env.get("HF_HOME"):
+        candidates.append(Path(env["HF_HOME"]).expanduser() / "token")
+    candidates.extend(
+        [
+            Path.home() / ".cache" / "huggingface" / "token",
+            Path.home() / ".huggingface" / "token",
+        ]
+    )
+
+    deduped: list[Path] = []
+    seen = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(candidate)
+    return deduped
+
+
+def detect_token_path(config: Config, environ: Mapping[str, str] | None = None) -> Path | None:
+    if config.token_path is not None:
+        return config.token_path
+    for candidate in token_path_candidates(environ):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def hf_token_available(environ: Mapping[str, str]) -> bool:
+    if environ.get("HF_TOKEN"):
+        return True
+    token_path = environ.get("HF_TOKEN_PATH")
+    if not token_path:
+        return False
+    try:
+        path = Path(token_path).expanduser()
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
 def save_config(config: Config, path: Path | str | None = None) -> None:
     config_path = Path(path).expanduser() if path is not None else DEFAULT_CONFIG_PATH
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -171,7 +221,9 @@ def archive_path(config: Config, repo_id: str, repo_type: str | None = None) -> 
 
 
 def apply_hf_environment(config: Config, environ: Mapping[str, str] | None = None) -> dict[str, str]:
-    env = dict(os.environ if environ is None else environ)
+    base_env = dict(os.environ if environ is None else environ)
+    token_path = detect_token_path(config, base_env)
+    env = dict(base_env)
     cache_dir = config.cache_dir or Path(config.directory) / ".cache"
     tmp_dir = config.tmp_dir or Path(config.directory) / "tmp"
 
@@ -184,12 +236,8 @@ def apply_hf_environment(config: Config, environ: Mapping[str, str] | None = Non
     env["TMPDIR"] = str(tmp_dir)
     env.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
-    token_path = config.token_path
-    legacy_token_path = Path.home() / ".cache" / "huggingface" / "token"
-    if token_path is None and legacy_token_path.exists():
-        token_path = legacy_token_path
     if token_path is not None:
-        env.setdefault("HF_TOKEN_PATH", str(token_path))
+        env["HF_TOKEN_PATH"] = str(token_path)
 
     if config.hf_xet_high_performance:
         env["HF_XET_HIGH_PERFORMANCE"] = "1"
