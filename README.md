@@ -31,6 +31,13 @@ uv run model-mirror verify org/model
 uv run model-mirror repair org/model  # if verify reports repair paths
 ```
 
+For periodic maintenance of the whole archive:
+
+```bash
+uv run model-mirror verify --all --max-age 30d || true
+uv run model-mirror repair --all
+```
+
 Mirrors are stored by repo type:
 
 ```text
