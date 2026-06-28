@@ -5,14 +5,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .audit import audit_model
-from .checksums import CHECKSUMS, write_checksums, verify_checksums
+from .checksums import MANIFEST, write_checksums, verify_checksums
 from .config import Config, archive_path, load_config, save_config, parse_bool, parse_positive_int
 from .hub import HuggingFaceHub, get_snapshot
 from .lock import ModelBusyError, ModelLock, lock_label, read_active_lock
 from .mirror import mirror
 from .repair import repair
-from .state import read_verification_state, state_from_results, verification_state_path, write_verification_state
-from .verify import merge_checksum_result, verify_remote
+from .state import (
+    VerificationState,
+    read_verification_state,
+    state_from_results,
+    verification_state_path,
+    write_verification_state,
+)
+from .verify import RemoteVerifyResult, merge_checksum_result, verify_remote
 
 
 CONFIG_OPTIONS = [
@@ -23,7 +29,7 @@ CONFIG_OPTIONS = [
     ),
     ("repo_type", "MODEL_MIRROR_REPO_TYPE", "Default Hugging Face repo type: model, dataset, or space."),
     ("revision", "MODEL_MIRROR_REVISION", "Default revision to mirror or verify, usually main."),
-    ("checksum", None, "Whether mirror/repair writes local SHA-256 checksum records."),
+    ("checksum", None, "Whether mirror/repair writes local hash manifest records."),
     (
         "checksum_workers",
         "MODEL_MIRROR_CHECKSUM_WORKERS",
@@ -70,6 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
         "mirror",
         help="mirror a Hugging Face repo",
         description="Download a repo at a resolved Hub commit and verify it unless --no-verify is used.",
+        epilog="Exit status: 0 when complete or downloaded cleanly; 1 when final verification is not clean.",
     )
     mirror_parser.add_argument("model", metavar="repo", help="Hugging Face repo id, e.g. org/model")
     mirror_parser.add_argument("--repo-type", choices=["model", "dataset", "space"], help="repo kind to mirror")
@@ -81,9 +88,14 @@ def build_parser() -> argparse.ArgumentParser:
         "verify",
         help="verify mirrored archives",
         description="Check local files against Hub metadata, local checksums, and model metadata.",
+        epilog=(
+            "Exit status: 0 when verification is clean; 1 when files are missing, corrupt, extra, busy, "
+            "the upstream repository is unavailable, or cached verification data is missing/stale; "
+            "2 for command-line errors."
+        ),
     )
     verify_parser.add_argument("model", metavar="repo", nargs="?", help="repo id to verify unless --all is used")
-    verify_parser.add_argument("--quick", action="store_true", help="skip full SHA-256 checks")
+    verify_parser.add_argument("--cached", action="store_true", help="verify Hub hashes from cached .manifest rows")
     verify_parser.add_argument("--all", action="store_true", help="verify every mirrored model")
     verify_parser.add_argument(
         "--repo-type", choices=["model", "dataset", "space"], default="model", help="repo kind to verify"
@@ -100,6 +112,11 @@ def build_parser() -> argparse.ArgumentParser:
             "Redownload files listed in existing .verification repair paths, "
             "then run a final verification. Run verify first."
         ),
+        epilog=(
+            "Exit status: 0 when complete, repaired, or updated cleanly; 1 when verification state is missing, "
+            "repair is incomplete, cached verification data is incomplete, or a model is busy; "
+            "2 for command-line errors."
+        ),
     )
     repair_parser.add_argument("model", metavar="repo", nargs="?", help="repo id to repair unless --all is used")
     repair_parser.add_argument("--all", action="store_true", help="repair every mirrored model with verification state")
@@ -109,7 +126,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="apply upstream commit changes recorded by verify before repairing",
     )
     repair_parser.add_argument(
+        "--force-partial",
+        action="store_true",
+        help=(
+            "attempt repair even when cached verification data for untouched files is incomplete; "
+            "may leave the repository inconsistent"
+        ),
+    )
+    repair_parser.add_argument(
         "--repo-type", choices=["model", "dataset", "space"], default="model", help="repo kind to repair"
+    )
+
+    offline_parser = subparsers.add_parser(
+        "offline",
+        help="mark a mirror offline-only",
+        description=(
+            "Disable Hub checks for one mirrored repo. Use this when the upstream repo is gone "
+            "and you want verification to use local state only."
+        ),
+        epilog="Exit status: 0 when the mirror is marked offline-only; 1 when local verification state is missing or busy.",
+    )
+    offline_parser.add_argument("model", metavar="repo", help="repo id to mark offline-only")
+    offline_parser.add_argument(
+        "--repo-type", choices=["model", "dataset", "space"], default="model", help="repo kind to update"
+    )
+
+    online_parser = subparsers.add_parser(
+        "online",
+        help="re-enable Hub checks for a mirror",
+        description="Clear offline-only mode so verify and repair contact the Hub again.",
+        epilog="Exit status: 0 when the mirror is marked online; 1 when local verification state is missing or busy.",
+    )
+    online_parser.add_argument("model", metavar="repo", help="repo id to mark online")
+    online_parser.add_argument(
+        "--repo-type", choices=["model", "dataset", "space"], default="model", help="repo kind to update"
     )
 
     subparsers.add_parser("list", help="list mirrored models", description="Show mirrored models and verification age.")
@@ -169,6 +219,10 @@ def main(argv: list[str] | None = None, *, hub=None) -> int:
             return handle_verify(args, config, hub=hub)
         if args.command == "repair":
             return handle_repair(args, config, hub=hub)
+        if args.command == "offline":
+            return handle_offline_mode(args, config, offline_only=True)
+        if args.command == "online":
+            return handle_offline_mode(args, config, offline_only=False)
     except ModelBusyError as exc:
         print(str(exc))
         return 1
@@ -279,20 +333,43 @@ def handle_list(config: Config) -> int:
     for owner in sorted(path for path in models_root.iterdir() if path.is_dir()):
         for model in sorted(path for path in owner.iterdir() if path.is_dir()):
             state = read_verification_state(model)
+            active_lock = read_active_lock(model)
             suffix = ""
             if state is not None:
-                suffix = f"  verification={state.status} age={verification_age_label(state.checked_at_utc)}"
-            active_lock = read_active_lock(model)
+                suffix = (
+                    f"  verification={state.status}"
+                    f" state=[{','.join(list_state_tags(state, active_lock))}]"
+                    f" age={verification_age_label(state.checked_at_utc)}"
+                )
             if active_lock is not None:
                 suffix += f"  busy=({lock_label(active_lock)})"
             print(f"{owner.name}/{model.name}{suffix}")
     return 0
 
 
+def list_state_tags(state, active_lock: dict | None) -> list[str]:
+    tags = []
+    if state.offline_only:
+        tags.append("offline")
+    if state.repair_paths:
+        tags.append("needs-repair")
+    if state.status == "incomplete":
+        tags.append("incomplete")
+    if state.upstream_status == "changed":
+        tags.append("upstream-changed")
+    if state_has_upstream_unavailable(state):
+        tags.append("upstream-unavailable")
+    if active_lock is not None:
+        tags.append("busy")
+    return tags or ["clean" if state.clean else state.status]
+
+
 def handle_verify(args, config: Config, *, hub=None) -> int:
     if args.all:
         failures = 0
         changed = 0
+        repair_needed = 0
+        cache_incomplete = 0
         for repo_id in list_model_ids(config):
             if args.max_age and should_skip_recent_clean(config, repo_id, args.repo_type, args.max_age):
                 print(f"skipped recent clean verification: {repo_id}")
@@ -308,8 +385,14 @@ def handle_verify(args, config: Config, *, hub=None) -> int:
                 changed += 1
             if rc != 0:
                 failures += 1
-        if failures:
+                if state is not None and state.repair_paths:
+                    repair_needed += 1
+                if state is not None and state_has_cached_hash_missing(state):
+                    cache_incomplete += 1
+        if repair_needed:
             print("next: model-mirror repair --all")
+        if cache_incomplete:
+            print("cached verification incomplete: run full verification with model-mirror verify --all")
         if changed:
             print("update changed upstreams: model-mirror repair --all --update")
         return 1 if failures else 0
@@ -325,6 +408,10 @@ def handle_repair(args, config: Config, *, hub=None) -> int:
     if args.all:
         failures = 0
         for repo_id in list_model_ids(config):
+            state = read_verification_state(archive_path(config, repo_id, args.repo_type))
+            if state is not None and state.offline_only:
+                print(f"skipped offline-only: {repo_id}; repair requires an upstream repository")
+                continue
             try:
                 rc = repair_one(config, repo_id, args, hub=hub)
             except ModelBusyError as exc:
@@ -340,18 +427,43 @@ def handle_repair(args, config: Config, *, hub=None) -> int:
     return repair_one(config, args.model, args, hub=hub)
 
 
+def state_has_cached_hash_missing(state) -> bool:
+    return any(str(issue).startswith("cached_hash_missing:") for issue in state.issues)
+
+
+def state_has_upstream_unavailable(state) -> bool:
+    return state.status == "unavailable" or any(
+        str(issue).startswith("upstream unavailable:") for issue in state.issues
+    )
+
+
 def repair_one(config: Config, repo_id: str, args, *, hub=None) -> int:
     selected_hub = hub or HuggingFaceHub(config)
     print_verification_age(config, repo_id, args.repo_type)
+    if args.force_partial:
+        print(
+            "warning: --force-partial can leave the repository inconsistent when verification data is incomplete"
+        )
     result = repair(
         config,
         repo_id,
         hub=selected_hub,
         repo_type=args.repo_type,
         update=args.update,
+        force_partial=args.force_partial,
     )
     if result.status == "verify-required":
         print(f"run verify first: model-mirror verify {repo_id}")
+    if result.status == "verification-incomplete":
+        print(
+            f"could not fully repair {repo_id}; missing verification data for some files. "
+            f"Run full verify and repair again: model-mirror verify {repo_id} && model-mirror repair {repo_id}"
+        )
+    if result.status == "offline-only":
+        print(
+            f"cannot repair offline-only model {repo_id}; upstream link is disabled. "
+            f"Run model-mirror online {repo_id} to re-enable Hub-backed repair."
+        )
     print_repair_commit_notice(repo_id, result)
     print(f"{result.status}: {repo_id} -> {result.path}")
     return 0 if result.status in {"complete", "repaired", "updated"} else 1
@@ -371,28 +483,39 @@ def verify_one_locked(config: Config, repo_id: str, args, selected_hub, root: Pa
     )
 
     if args.offline:
-        return verify_one_offline(root, repo_id, args, existing_state)
+        return verify_one_offline(config, root, repo_id, args, existing_state, mode="offline")
+    if existing_state is not None and existing_state.offline_only:
+        return verify_one_offline(config, root, repo_id, args, existing_state, mode="offline-only")
 
-    upstream_snapshot = get_snapshot(selected_hub, repo_id, args.repo_type, requested_revision)
+    try:
+        upstream_snapshot = get_snapshot(selected_hub, repo_id, args.repo_type, requested_revision)
+    except Exception as exc:
+        return handle_upstream_unavailable(root, repo_id, args, existing_state, requested_revision, exc)
     resolved_commit = existing_state.resolved_commit if existing_state and existing_state.resolved_commit else upstream_snapshot.resolved_commit
-    snapshot = upstream_snapshot if resolved_commit == upstream_snapshot.resolved_commit else get_snapshot(
-        selected_hub, repo_id, args.repo_type, resolved_commit
-    )
+    try:
+        snapshot = upstream_snapshot if resolved_commit == upstream_snapshot.resolved_commit else get_snapshot(
+            selected_hub, repo_id, args.repo_type, resolved_commit
+        )
+    except Exception as exc:
+        return handle_upstream_unavailable(root, repo_id, args, existing_state, requested_revision, exc)
     metadata = snapshot.files
     checksum_result = None
-    if not args.quick and config.checksum:
-        if (root / CHECKSUMS).exists():
+    manifest_verified = False
+    if not args.cached and config.checksum:
+        if (root / MANIFEST).exists():
             checksum_result = verify_checksums(root, strict=args.strict)
             if checksum_result.ok:
                 write_checksums(root, max_workers=config.checksum_workers)
+                manifest_verified = True
         else:
             write_checksums(root, max_workers=config.checksum_workers)
-    from_checksums = not args.quick and (root / CHECKSUMS).exists()
+            manifest_verified = True
+    from_manifest = args.cached or manifest_verified
     result = verify_remote(
         root,
         metadata,
-        quick=args.quick,
-        from_checksums=from_checksums,
+        cached=args.cached,
+        from_manifest=from_manifest,
         strict=args.strict,
     )
     if checksum_result is not None:
@@ -412,12 +535,18 @@ def verify_one_locked(config: Config, repo_id: str, args, selected_hub, root: Pa
     )
     write_verification_state(root, state)
 
+    if state.status == "incomplete":
+        print(f"cached verification incomplete: {repo_id}{upstream_change_suffix(state)}")
+        print(f"run full verification: model-mirror verify {repo_id}")
+        if state.upstream_status == "changed":
+            print_update_next_step(repo_id)
+        return 1
     if audit is not None and not audit.ok:
         print(f"verification failed: {repo_id}{upstream_change_suffix(state)}")
         print_verification_next_steps(repo_id, state)
         return 1
     if result.ok:
-        mode = "quick" if args.quick else "full"
+        mode = "cached" if args.cached else "full"
         print(f"verified ({mode}): {repo_id}{upstream_change_suffix(state)}")
         if state.upstream_status == "changed":
             print_update_next_step(repo_id)
@@ -450,21 +579,123 @@ def print_repair_commit_notice(repo_id: str, result) -> None:
         )
 
 
-def verify_one_offline(root: Path, repo_id: str, args, existing_state) -> int:
-    from .checksums import verify_checksums
-
+def verify_one_offline(config: Config, root: Path, repo_id: str, args, existing_state, *, mode: str) -> int:
     if existing_state is None:
-        print(f"offline verification unavailable: {repo_id}")
+        print(f"{mode} verification unavailable: {repo_id}")
         return 1
-    if args.quick:
-        print(f"verified (offline quick): {repo_id} state={existing_state.status}")
+    if args.cached:
+        print(f"verified ({mode} cached): {repo_id} state={existing_state.status}")
         return 0 if existing_state.clean else 1
-    result = verify_checksums(root)
+    if not (root / MANIFEST).exists():
+        state = local_incomplete_state(repo_id, args.repo_type, existing_state, f"{MANIFEST} missing")
+        write_verification_state(root, state)
+        print(f"{mode} verification incomplete: {repo_id} missing {MANIFEST}")
+        return 1
+    result = verify_checksums(root, strict=args.strict)
+    remote_result = RemoteVerifyResult(
+        missing=result.missing,
+        hash_mismatches=result.failures,
+        extras=result.extras,
+    )
+    state = state_from_results(
+        repo_id,
+        args.repo_type,
+        existing_state.requested_revision,
+        remote_result,
+        resolved_commit=existing_state.resolved_commit,
+        upstream_commit=existing_state.upstream_commit,
+        offline_only=existing_state.offline_only,
+    )
+    write_verification_state(root, state)
     if result.ok:
-        print(f"verified (offline full): {repo_id}")
+        print(f"verified ({mode} full): {repo_id}")
         return 0
-    print(f"offline verification failed: {repo_id}")
+    print(f"{mode} verification failed: {repo_id}")
+    if existing_state.offline_only:
+        print(f"repair unavailable for offline-only model: {repo_id}")
+    else:
+        print_verification_next_steps(repo_id, state)
     return 1
+
+
+def local_incomplete_state(repo_id: str, repo_type: str, existing_state, issue: str) -> VerificationState:
+    return VerificationState(
+        status="incomplete",
+        repo_id=repo_id,
+        repo_type=repo_type,
+        requested_revision=existing_state.requested_revision,
+        resolved_commit=existing_state.resolved_commit,
+        upstream_commit=existing_state.upstream_commit,
+        upstream_status=existing_state.upstream_status,
+        offline_only=existing_state.offline_only,
+        repair_paths=[],
+        issues=[issue],
+    )
+
+
+def handle_upstream_unavailable(
+    root: Path,
+    repo_id: str,
+    args,
+    existing_state,
+    requested_revision: str,
+    exc: Exception,
+) -> int:
+    issue = f"upstream unavailable: {exc}"
+    if existing_state is not None:
+        issues = [item for item in existing_state.issues if not str(item).startswith("upstream unavailable:")]
+        issues.append(issue)
+        state = VerificationState(
+            status=existing_state.status,
+            repo_id=repo_id,
+            repo_type=args.repo_type,
+            requested_revision=requested_revision,
+            resolved_commit=existing_state.resolved_commit,
+            upstream_commit=existing_state.upstream_commit,
+            upstream_status=existing_state.upstream_status,
+            offline_only=existing_state.offline_only,
+            repair_paths=existing_state.repair_paths,
+            issues=issues,
+            checked_at_utc=existing_state.checked_at_utc,
+        )
+    else:
+        state = VerificationState(
+            status="unavailable",
+            repo_id=repo_id,
+            repo_type=args.repo_type,
+            requested_revision=requested_revision,
+            issues=[issue],
+        )
+    write_verification_state(root, state)
+    print(f"verification failed: {repo_id} upstream repository unavailable: {exc}")
+    print(
+        f"if the source repository is no longer available and you want to keep this local mirror, "
+        f"run: model-mirror offline {repo_id}"
+    )
+    return 1
+
+
+def handle_offline_mode(args, config: Config, *, offline_only: bool) -> int:
+    command = "offline" if offline_only else "online"
+    root = archive_path(config, args.model, args.repo_type)
+    with ModelLock(root, command, args.model, args.repo_type):
+        state = read_verification_state(root)
+        if state is None:
+            print(f"verification state unavailable: {args.model}")
+            print(f"run verify first: model-mirror verify {args.model}")
+            return 1
+        state.offline_only = offline_only
+        if offline_only:
+            state.issues = [item for item in state.issues if not str(item).startswith("upstream unavailable:")]
+            if state.status == "unavailable":
+                state.status = "incomplete"
+                state.issues.append("local verification required")
+        write_verification_state(root, state)
+    if offline_only:
+        print(f"offline-only enabled: {args.model}")
+    else:
+        print(f"offline-only disabled: {args.model}")
+    return 0
 
 
 def list_model_ids(config: Config) -> list[str]:
@@ -538,7 +769,7 @@ def print_verification_age(config: Config, repo_id: str, repo_type: str) -> None
 
 def should_skip_recent_clean(config: Config, repo_id: str, repo_type: str, max_age: str) -> bool:
     state = read_verification_state(archive_path(config, repo_id, repo_type))
-    if state is None or not state.clean:
+    if state is None or not state.clean or state_has_upstream_unavailable(state):
         return False
     age = verification_age_seconds(state.checked_at_utc)
     return age is not None and age <= parse_age(max_age)

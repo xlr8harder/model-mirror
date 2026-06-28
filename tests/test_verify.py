@@ -2,10 +2,11 @@ import hashlib
 from dataclasses import dataclass
 from types import SimpleNamespace
 
-from model_mirror.checksums import write_checksums
+import model_mirror.verify as verify_module
+from model_mirror.checksums import file_hashes, write_checksums
 from model_mirror.verify import (
     RemoteVerifyResult,
-    git_blob_sha1_file,
+    current_manifest_hash,
     merge_checksum_result,
     metadata_blob_id,
     metadata_lfs_sha256,
@@ -22,47 +23,87 @@ class FakeFile:
     blob_id: str | None = None
 
 
-def test_verify_remote_quick_checks_presence_and_size_only(tmp_path):
+def test_verify_remote_can_check_presence_and_size_only(tmp_path):
     (tmp_path / "weights.safetensors").write_bytes(b"abc")
     metadata = [FakeFile("weights.safetensors", 3, "not-the-real-hash")]
 
-    result = verify_remote(tmp_path, metadata, quick=True)
+    result = verify_remote(tmp_path, metadata, check_hashes=False)
 
     assert result.ok is True
     assert result.files_checked == 1
     assert result.hashes_checked == 0
 
 
-def test_verify_remote_from_checksums_compares_lfs_hashes_without_rehashing(tmp_path):
+def test_verify_remote_cached_compares_lfs_hashes_without_rehashing(tmp_path, monkeypatch):
     payload = b"abc"
     digest = hashlib.sha256(payload).hexdigest()
     (tmp_path / "weights.safetensors").write_bytes(payload)
     write_checksums(tmp_path)
     metadata = [FakeFile("weights.safetensors", 3, digest)]
 
-    result = verify_remote(tmp_path, metadata, from_checksums=True)
+    def fail_if_called(path):
+        raise AssertionError("cached verify should not hash file bytes")
+
+    monkeypatch.setattr(verify_module, "file_hashes", fail_if_called)
+    result = verify_remote(tmp_path, metadata, cached=True)
 
     assert result.ok is True
     assert result.hashes_checked == 1
 
 
-def test_git_blob_sha1_file_uses_git_blob_object_format(tmp_path):
-    path = tmp_path / "README.md"
-    path.write_bytes(b"hello\n")
-    expected = hashlib.sha1(b"blob 6\0hello\n").hexdigest()
+def test_verify_remote_full_hashes_lfs_when_manifest_is_not_used(tmp_path):
+    payload = b"abc"
+    digest = hashlib.sha256(payload).hexdigest()
+    (tmp_path / "weights.safetensors").write_bytes(payload)
+    metadata = [FakeFile("weights.safetensors", 3, digest)]
 
-    assert git_blob_sha1_file(path) == expected
+    result = verify_remote(tmp_path, metadata)
+
+    assert result.ok is True
+    assert result.hashes_checked == 1
 
 
-def test_verify_remote_validates_regular_git_blob_id(tmp_path):
+def test_verify_remote_cached_reports_missing_or_stale_manifest_hashes(tmp_path):
+    stale = tmp_path / "stale-cache.safetensors"
+    stale.write_bytes(b"abc")
+    write_checksums(tmp_path)
+    (tmp_path / "missing-cache.safetensors").write_bytes(b"abc")
+    stale.write_bytes(b"abcd")
+    metadata = [
+        FakeFile("missing-cache.safetensors", 3, hashlib.sha256(b"abc").hexdigest()),
+        FakeFile("stale-cache.safetensors", 4, hashlib.sha256(b"abcd").hexdigest()),
+    ]
+
+    result = verify_remote(tmp_path, metadata, cached=True)
+
+    assert result.ok is False
+    assert result.cached_hash_missing == ["missing-cache.safetensors", "stale-cache.safetensors"]
+
+
+def test_current_manifest_hash_rejects_missing_rows():
+    assert current_manifest_hash({}, "file.bin", 1, 2, "sha256") is None
+
+
+def test_verify_remote_validates_regular_git_blob_id_from_cached_manifest(tmp_path):
     path = tmp_path / "README.md"
     path.write_bytes(b"abc")
-    metadata = [FakeFile("README.md", 3, blob_id=git_blob_sha1_file(path))]
+    write_checksums(tmp_path)
+    metadata = [FakeFile("README.md", 3, blob_id=file_hashes(path).git_blob_sha1)]
 
-    result = verify_remote(tmp_path, metadata, from_checksums=True)
+    result = verify_remote(tmp_path, metadata, cached=True)
 
     assert result.ok is True
     assert result.hashes_checked == 1
+
+
+def test_verify_remote_cached_reports_missing_regular_git_blob_hash(tmp_path):
+    (tmp_path / "README.md").write_bytes(b"abc")
+    metadata = [FakeFile("README.md", 3, blob_id="blob123")]
+
+    result = verify_remote(tmp_path, metadata, cached=True)
+
+    assert result.ok is False
+    assert result.cached_hash_missing == ["README.md"]
 
 
 def test_verify_remote_reports_regular_git_blob_mismatch(tmp_path):
@@ -97,20 +138,10 @@ def test_verify_remote_strict_reports_extra_payload_files(tmp_path):
     (tmp_path / "extra.bin").write_bytes(b"b")
     metadata = [FakeFile("expected.bin", 1, None)]
 
-    result = verify_remote(tmp_path, metadata, quick=True, strict=True)
+    result = verify_remote(tmp_path, metadata, check_hashes=False, strict=True)
 
     assert result.ok is False
     assert result.extras == ["extra.bin"]
-
-
-def test_verify_remote_reports_missing_checksum_record(tmp_path):
-    (tmp_path / "weights.safetensors").write_bytes(b"abc")
-    metadata = [FakeFile("weights.safetensors", 3, "0" * 64)]
-
-    result = verify_remote(tmp_path, metadata, from_checksums=True)
-
-    assert result.ok is False
-    assert result.hash_missing == ["weights.safetensors"]
 
 
 def test_metadata_adapters_support_huggingface_sibling_shape():

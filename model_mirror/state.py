@@ -19,6 +19,7 @@ class VerificationState:
     resolved_commit: str = ""
     upstream_commit: str = ""
     upstream_status: str = "unknown"
+    offline_only: bool = False
     repair_paths: list[str] = field(default_factory=list)
     issues: list[str] = field(default_factory=list)
     checked_at_utc: str = ""
@@ -55,6 +56,7 @@ def read_verification_state(root: Path) -> VerificationState | None:
         resolved_commit=str(data.get("resolved_commit", "")),
         upstream_commit=str(data.get("upstream_commit", "")),
         upstream_status=str(data.get("upstream_status", "unknown")),
+        offline_only=bool(data.get("offline_only", False)),
         repair_paths=sorted(str(item) for item in data.get("repair_paths", []) or []),
         issues=[str(item) for item in data.get("issues", []) or []],
         checked_at_utc=str(data.get("checked_at_utc", "")),
@@ -72,6 +74,7 @@ def write_verification_state(root: Path, state: VerificationState) -> Path:
         "resolved_commit": state.resolved_commit,
         "upstream_commit": state.upstream_commit,
         "upstream_status": state.upstream_status,
+        "offline_only": state.offline_only,
         "repair_paths": sorted(set(state.repair_paths)),
         "issues": state.issues,
         "checked_at_utc": state.checked_at_utc or utc_now(),
@@ -87,7 +90,6 @@ def repair_paths_from_results(remote_result, audit_result=None) -> list[str]:
     paths.update(getattr(remote_result, "missing", []))
     paths.update(getattr(remote_result, "size_mismatches", []))
     paths.update(getattr(remote_result, "hash_mismatches", []))
-    paths.update(getattr(remote_result, "hash_missing", []))
     if audit_result is not None:
         paths.update(getattr(audit_result, "missing_files", []))
         for failure in getattr(audit_result, "failures", []):
@@ -106,9 +108,10 @@ def state_from_results(
     *,
     resolved_commit: str = "",
     upstream_commit: str = "",
+    offline_only: bool = False,
 ) -> VerificationState:
     issues = []
-    for name in ("missing", "size_mismatches", "hash_mismatches", "hash_missing", "extras"):
+    for name in ("missing", "size_mismatches", "hash_mismatches", "cached_hash_missing", "extras"):
         values = getattr(remote_result, name, [])
         issues.extend(f"{name}: {value}" for value in values)
     if audit_result is not None:
@@ -116,15 +119,18 @@ def state_from_results(
         issues.extend(f"audit: {value}" for value in getattr(audit_result, "failures", []))
 
     ok = getattr(remote_result, "ok", False) and (audit_result is None or getattr(audit_result, "ok", False))
+    repair_paths = repair_paths_from_results(remote_result, audit_result)
+    cache_incomplete = bool(getattr(remote_result, "cached_hash_missing", [])) and not repair_paths
     return VerificationState(
-        status="clean" if ok else "dirty",
+        status="clean" if ok else "incomplete" if cache_incomplete else "dirty",
         repo_id=repo_id,
         repo_type=repo_type,
         requested_revision=requested_revision,
         resolved_commit=resolved_commit,
         upstream_commit=upstream_commit,
         upstream_status=upstream_status(resolved_commit, upstream_commit),
-        repair_paths=[] if ok else repair_paths_from_results(remote_result, audit_result),
+        offline_only=offline_only,
+        repair_paths=[] if ok else repair_paths,
         issues=[] if ok else issues,
         checked_at_utc=utc_now(),
     )

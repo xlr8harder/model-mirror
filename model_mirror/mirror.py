@@ -74,7 +74,7 @@ def mirror_locked(
     snapshot = get_snapshot(selected_hub, repo_id, selected_type, selected_revision)
     metadata = snapshot.files
 
-    if not force and verify_remote(destination, metadata, quick=True).ok:
+    if not force and verify_remote(destination, metadata, check_hashes=False).ok:
         if not verify_after:
             return MirrorResult("complete", destination, len(metadata))
         if (
@@ -96,8 +96,8 @@ def mirror_locked(
             destination,
             snapshot=snapshot,
             upstream_commit=snapshot.resolved_commit,
-            quick=False,
-            from_checksums=checksums_written,
+            cached=False,
+            from_manifest=checksums_written,
         )
         return MirrorResult("complete" if state.clean else "downloaded-unverified", destination, len(metadata))
 
@@ -130,8 +130,8 @@ def mirror_locked(
             destination,
             snapshot=snapshot,
             upstream_commit=snapshot.resolved_commit,
-            quick=False,
-            from_checksums=checksums_written,
+            cached=False,
+            from_manifest=checksums_written,
         )
         return MirrorResult("downloaded" if state.clean else "downloaded-unverified", destination, len(metadata))
     write_verification_state(

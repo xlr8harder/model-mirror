@@ -1,8 +1,15 @@
+import hashlib
+import json
+
 import pytest
 
 import model_mirror.checksums as checksums_module
 from model_mirror.checksums import (
-    load_records,
+    FileHashes,
+    MANIFEST_SCHEMA,
+    MANIFEST_VERSION,
+    file_hashes,
+    load_manifest,
     record_is_current,
     update_checksums,
     verify_checksums,
@@ -10,25 +17,49 @@ from model_mirror.checksums import (
 )
 
 
-def test_write_and_verify_checksums_excludes_metadata(tmp_path):
-    (tmp_path / "a.txt").write_text("alpha", encoding="utf-8")
+def git_blob_sha1(payload: bytes) -> str:
+    return hashlib.sha1(f"blob {len(payload)}\0".encode("ascii") + payload).hexdigest()
+
+
+def test_write_and_verify_checksums_excludes_metadata_and_writes_versioned_manifest(tmp_path):
+    payload = b"alpha"
+    (tmp_path / "a.txt").write_bytes(payload)
     (tmp_path / ".model-mirror").mkdir()
     (tmp_path / ".model-mirror" / "meta.json").write_text("{}", encoding="utf-8")
     (tmp_path / ".cache").mkdir()
     (tmp_path / ".cache" / "partial").write_text("partial", encoding="utf-8")
     (tmp_path / ".verification.lock").write_text("", encoding="utf-8")
     (tmp_path / ".verification.tmp").write_text("partial", encoding="utf-8")
-    (tmp_path / ".checksums.tmp").write_text("partial", encoding="utf-8")
+    (tmp_path / ".checksums").write_text("obsolete", encoding="utf-8")
+    (tmp_path / ".checksums.tmp").write_text("obsolete", encoding="utf-8")
     (tmp_path / ".manifest.tmp").write_text("partial", encoding="utf-8")
 
     write_checksums(tmp_path)
-    checksums, manifest = load_records(tmp_path)
+    manifest = load_manifest(tmp_path)
 
-    assert set(checksums) == {"a.txt"}
+    header = json.loads((tmp_path / ".manifest").read_text(encoding="utf-8").splitlines()[0])
+    assert header == {"schema": MANIFEST_SCHEMA, "version": MANIFEST_VERSION}
+    assert set(manifest) == {"a.txt"}
     assert manifest["a.txt"]["size"] == 5
+    assert manifest["a.txt"]["sha256"] == hashlib.sha256(payload).hexdigest()
+    assert manifest["a.txt"]["git_blob_sha1"] == git_blob_sha1(payload)
+    assert not (tmp_path / ".checksums").exists()
+    assert not (tmp_path / ".checksums.tmp").exists()
+
     result = verify_checksums(tmp_path)
     assert result.ok is True
     assert result.checked == 1
+
+
+def test_file_hashes_computes_sha256_and_git_blob_sha1_in_one_call(tmp_path):
+    payload = b"hello\n"
+    path = tmp_path / "README.md"
+    path.write_bytes(payload)
+
+    hashes = file_hashes(path)
+
+    assert hashes.sha256 == hashlib.sha256(payload).hexdigest()
+    assert hashes.git_blob_sha1 == git_blob_sha1(payload)
 
 
 def test_write_checksums_skips_current_manifest_records(tmp_path, monkeypatch):
@@ -42,7 +73,7 @@ def test_write_checksums_skips_current_manifest_records(tmp_path, monkeypatch):
         calls.append(path)
         raise AssertionError("current file should not be rehashed")
 
-    monkeypatch.setattr(checksums_module, "sha256_file", fail_if_called)
+    monkeypatch.setattr(checksums_module, "file_hashes", fail_if_called)
     second = write_checksums(tmp_path)
 
     assert second.hashed == 0
@@ -54,18 +85,19 @@ def test_write_checksums_checkpoints_completed_files_before_failure(tmp_path, mo
     (tmp_path / "a.txt").write_text("alpha", encoding="utf-8")
     (tmp_path / "b.txt").write_text("beta", encoding="utf-8")
 
-    def fake_sha(path):
+    def fake_hashes(path):
         if path.name == "b.txt":
             raise RuntimeError("boom")
-        return "digest-a"
+        return FileHashes(sha256="sha-a", git_blob_sha1="blob-a")
 
-    monkeypatch.setattr(checksums_module, "sha256_file", fake_sha)
+    monkeypatch.setattr(checksums_module, "file_hashes", fake_hashes)
     with pytest.raises(RuntimeError):
         write_checksums(tmp_path)
 
-    checksums, manifest = load_records(tmp_path)
-    assert checksums == {"a.txt": "digest-a"}
+    manifest = load_manifest(tmp_path)
     assert set(manifest) == {"a.txt"}
+    assert manifest["a.txt"]["sha256"] == "sha-a"
+    assert manifest["a.txt"]["git_blob_sha1"] == "blob-a"
 
 
 def test_write_checksums_supports_multiple_workers(tmp_path):
@@ -74,9 +106,8 @@ def test_write_checksums_supports_multiple_workers(tmp_path):
 
     result = write_checksums(tmp_path, max_workers=2)
 
-    checksums, manifest = load_records(tmp_path)
+    manifest = load_manifest(tmp_path)
     assert result.hashed == 2
-    assert set(checksums) == {"a.txt", "b.txt"}
     assert set(manifest) == {"a.txt", "b.txt"}
 
 
@@ -87,9 +118,8 @@ def test_write_checksums_removes_records_for_deleted_files(tmp_path):
 
     result = write_checksums(tmp_path)
 
-    checksums, manifest = load_records(tmp_path)
+    manifest = load_manifest(tmp_path)
     assert result.removed == 1
-    assert checksums == {}
     assert manifest == {}
 
 
@@ -135,8 +165,8 @@ def test_update_checksums_rewrites_changed_paths_and_removes_missing_paths(tmp_p
     (tmp_path / "b.txt").unlink()
     update_checksums(tmp_path, ["a.txt", "b.txt"])
 
-    checksums, manifest = load_records(tmp_path)
-    assert set(checksums) == {"a.txt"}
+    manifest = load_manifest(tmp_path)
+    assert set(manifest) == {"a.txt"}
     assert manifest["a.txt"]["size"] == 7
     assert verify_checksums(tmp_path).ok is True
 
@@ -148,9 +178,8 @@ def test_update_checksums_removes_missing_record_without_work(tmp_path):
 
     result = update_checksums(tmp_path, ["a.txt"])
 
-    checksums, manifest = load_records(tmp_path)
+    manifest = load_manifest(tmp_path)
     assert result.removed == 1
-    assert checksums == {}
     assert manifest == {}
 
 
@@ -161,8 +190,10 @@ def test_update_checksums_ignores_missing_untracked_path(tmp_path):
     assert result.hashed == 0
 
 
-def test_record_is_current_rejects_missing_manifest_row():
+def test_record_is_current_rejects_missing_or_incomplete_manifest_rows():
     assert record_is_current(None, 1, 2) is False
+    assert record_is_current({"size": 1, "mtime_ns": 2, "sha256": "sha"}, 1, 2) is False
+    assert record_is_current({"size": 1, "mtime_ns": 2, "git_blob_sha1": "blob"}, 1, 2) is False
 
 
 def test_update_checksums_supports_multiple_workers(tmp_path):
@@ -171,9 +202,8 @@ def test_update_checksums_supports_multiple_workers(tmp_path):
 
     result = update_checksums(tmp_path, ["a.txt", "b.txt"], max_workers=2)
 
-    checksums, manifest = load_records(tmp_path)
+    manifest = load_manifest(tmp_path)
     assert result.hashed == 2
-    assert set(checksums) == {"a.txt", "b.txt"}
     assert set(manifest) == {"a.txt", "b.txt"}
 
 
@@ -184,33 +214,62 @@ def test_verify_checksums_without_records_is_empty_success(tmp_path):
     assert result.checked == 0
 
 
-def test_load_records_rejects_malformed_checksum_file(tmp_path):
-    (tmp_path / ".checksums").write_text("not split correctly\n", encoding="utf-8")
-
-    try:
-        load_records(tmp_path)
-    except ValueError as exc:
-        assert "Malformed line" in str(exc)
-    else:
-        raise AssertionError("malformed checksum file should fail")
-
-
-def test_load_records_rejects_malformed_manifest_file(tmp_path):
+def test_load_manifest_rejects_malformed_manifest_file(tmp_path):
     (tmp_path / ".manifest").write_text("{not-json}\n", encoding="utf-8")
 
     try:
-        load_records(tmp_path)
+        load_manifest(tmp_path)
     except ValueError as exc:
         assert "Malformed line" in str(exc)
     else:
         raise AssertionError("malformed manifest file should fail")
 
 
-def test_load_records_ignores_blank_lines(tmp_path):
-    (tmp_path / ".checksums").write_text("\nabc  a.txt\n\n", encoding="utf-8")
-    (tmp_path / ".manifest").write_text('\n{"path": "a.txt", "size": 1, "mtime_ns": 2}\n\n', encoding="utf-8")
+def test_load_manifest_requires_header(tmp_path):
+    (tmp_path / ".manifest").write_text('{"path": "a.txt"}\n', encoding="utf-8")
 
-    checksums, manifest = load_records(tmp_path)
+    try:
+        load_manifest(tmp_path)
+    except ValueError as exc:
+        assert "missing header" in str(exc)
+    else:
+        raise AssertionError("headerless manifest should fail")
 
-    assert checksums == {"a.txt": "abc"}
-    assert manifest == {"a.txt": {"path": "a.txt", "size": 1, "mtime_ns": 2}}
+
+def test_load_manifest_rejects_unknown_schema_or_version(tmp_path):
+    for row, expected in (
+        ({"schema": "other", "version": MANIFEST_VERSION}, "schema"),
+        ({"schema": MANIFEST_SCHEMA, "version": 999}, "version"),
+    ):
+        (tmp_path / ".manifest").write_text(json.dumps(row) + "\n", encoding="utf-8")
+        try:
+            load_manifest(tmp_path)
+        except ValueError as exc:
+            assert expected in str(exc)
+        else:
+            raise AssertionError(f"unsupported manifest {expected} should fail")
+
+
+def test_load_manifest_rejects_rows_without_path(tmp_path):
+    header = {"schema": MANIFEST_SCHEMA, "version": MANIFEST_VERSION}
+    (tmp_path / ".manifest").write_text(json.dumps(header) + "\n{}\n", encoding="utf-8")
+
+    try:
+        load_manifest(tmp_path)
+    except ValueError as exc:
+        assert "Malformed line" in str(exc)
+    else:
+        raise AssertionError("manifest row without path should fail")
+
+
+def test_load_manifest_ignores_blank_lines(tmp_path):
+    header = {"schema": MANIFEST_SCHEMA, "version": MANIFEST_VERSION}
+    row = {"path": "a.txt", "size": 1, "mtime_ns": 2, "sha256": "sha", "git_blob_sha1": "blob"}
+    (tmp_path / ".manifest").write_text(
+        "\n" + json.dumps(header) + "\n\n" + json.dumps(row) + "\n\n",
+        encoding="utf-8",
+    )
+
+    manifest = load_manifest(tmp_path)
+
+    assert manifest == {"a.txt": row}

@@ -69,6 +69,27 @@ class MovingBranchHub(FakeHub):
         )
 
 
+class UnavailableHub:
+    def snapshot(self, repo_id, repo_type, revision):
+        raise RuntimeError("repository not found")
+
+    def snapshot_download(self, repo_id, repo_type, revision, local_dir, allow_patterns=None):
+        raise RuntimeError("repository not found")
+
+
+class MissingStoredCommitHub:
+    def snapshot(self, repo_id, repo_type, revision):
+        if revision == "oldcommit":
+            raise RuntimeError("stored commit not found")
+        return HubSnapshot(
+            repo_id=repo_id,
+            repo_type=repo_type,
+            requested_revision=revision,
+            resolved_commit="newcommit",
+            files=[FakeFile("file.bin", 3)],
+        )
+
+
 def test_config_directory_command_writes_config(tmp_path, capsys):
     config_path = tmp_path / "config.yaml"
     archive = tmp_path / "archive"
@@ -217,6 +238,25 @@ def test_config_options_describes_supported_keys(tmp_path, capsys):
     assert "HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY" in output
 
 
+@pytest.mark.parametrize(
+    "command,expected",
+    [
+        ("mirror", "Exit status: 0 when complete or downloaded cleanly"),
+        ("verify", "cached verification data is missing/stale"),
+        ("repair", "--force-partial"),
+    ],
+)
+def test_command_help_documents_exit_status_and_risky_options(command, expected, capsys):
+    with pytest.raises(SystemExit) as exc:
+        main([command, "--help"])
+
+    output = capsys.readouterr().out
+    normalized_output = " ".join(output.split())
+    assert exc.value.code == 0
+    assert "Exit status:" in output
+    assert expected in normalized_output
+
+
 def test_config_without_subcommand_defaults_to_options(tmp_path, capsys):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
@@ -276,7 +316,7 @@ def test_list_command_is_empty_when_directory_missing(tmp_path, capsys):
     assert capsys.readouterr().out == ""
 
 
-def test_verify_quick_command_succeeds_with_injected_hub(tmp_path, capsys):
+def test_verify_cached_command_succeeds_with_injected_hub(tmp_path, capsys):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
     archive = tmp_path / "models" / "org" / "model"
@@ -285,10 +325,10 @@ def test_verify_quick_command_succeeds_with_injected_hub(tmp_path, capsys):
     (archive / "file.bin").write_bytes(b"abc")
     hub = FakeHub([FakeFile("file.bin", 3)])
 
-    rc = main(["--config", str(config_path), "verify", "--quick", "org/model"], hub=hub)
+    rc = main(["--config", str(config_path), "verify", "--cached", "org/model"], hub=hub)
 
     assert rc == 0
-    assert "verified (quick)" in capsys.readouterr().out
+    assert "verified (cached)" in capsys.readouterr().out
 
 
 def test_verify_uses_stored_commit_and_reports_changed_upstream(tmp_path, capsys):
@@ -309,7 +349,7 @@ def test_verify_uses_stored_commit_and_reports_changed_upstream(tmp_path, capsys
     )
     hub = MovingBranchHub([FakeFile("file.bin", 3)])
 
-    rc = main(["--config", str(config_path), "verify", "--quick", "org/model"], hub=hub)
+    rc = main(["--config", str(config_path), "verify", "--cached", "org/model"], hub=hub)
 
     assert rc == 0
     output = capsys.readouterr().out
@@ -337,7 +377,7 @@ def test_verify_failure_reports_changed_upstream(tmp_path, capsys):
     )
     hub = MovingBranchHub([FakeFile("missing.bin", 3)])
 
-    rc = main(["--config", str(config_path), "verify", "--quick", "org/model"], hub=hub)
+    rc = main(["--config", str(config_path), "verify", "--cached", "org/model"], hub=hub)
 
     output = capsys.readouterr().out
     assert rc == 1
@@ -362,10 +402,60 @@ def test_verify_command_reports_failure(tmp_path, capsys):
     config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
     hub = FakeHub([FakeFile("missing.bin", 3)])
 
-    rc = main(["--config", str(config_path), "verify", "--quick", "org/model"], hub=hub)
+    rc = main(["--config", str(config_path), "verify", "--cached", "org/model"], hub=hub)
 
     assert rc == 1
     assert "verification failed" in capsys.readouterr().out
+
+
+def test_verify_cached_reports_incomplete_when_manifest_hash_is_missing(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    (archive / "config.json").write_text("{}", encoding="utf-8")
+    (archive / "file.bin").write_bytes(b"abc")
+    digest = hashlib.sha256(b"abc").hexdigest()
+    hub = FakeHub([FakeFile("config.json", 2), FakeFile("file.bin", 3, lfs_sha256=digest)])
+
+    rc = main(["--config", str(config_path), "verify", "--cached", "org/model"], hub=hub)
+
+    output = capsys.readouterr().out
+    state = read_verification_state(archive)
+    assert rc == 1
+    assert "cached verification incomplete: org/model" in output
+    assert "run full verification: model-mirror verify org/model" in output
+    assert "next: model-mirror repair org/model" not in output
+    assert state.status == "incomplete"
+    assert state.repair_paths == []
+
+
+def test_verify_cached_incomplete_reports_changed_upstream_hint(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    (archive / "config.json").write_text("{}", encoding="utf-8")
+    (archive / "file.bin").write_bytes(b"abc")
+    write_verification_state(
+        archive,
+        VerificationState(
+            status="clean",
+            repo_id="org/model",
+            requested_revision="main",
+            resolved_commit="oldcommit",
+        ),
+    )
+    hub = MovingBranchHub(
+        [FakeFile("config.json", 2), FakeFile("file.bin", 3, lfs_sha256=hashlib.sha256(b"abc").hexdigest())]
+    )
+
+    rc = main(["--config", str(config_path), "verify", "--cached", "org/model"], hub=hub)
+
+    output = capsys.readouterr().out
+    assert rc == 1
+    assert "cached verification incomplete: org/model upstream=changed" in output
+    assert "update changed upstream: model-mirror repair --update org/model" in output
 
 
 def test_verify_dataset_skips_model_audit(tmp_path, capsys):
@@ -377,12 +467,12 @@ def test_verify_dataset_skips_model_audit(tmp_path, capsys):
     hub = FakeHub([FakeFile("file.bin", 3)])
 
     rc = main(
-        ["--config", str(config_path), "verify", "--repo-type", "dataset", "--quick", "org/data"],
+        ["--config", str(config_path), "verify", "--repo-type", "dataset", "--cached", "org/data"],
         hub=hub,
     )
 
     assert rc == 0
-    assert "verified (quick)" in capsys.readouterr().out
+    assert "verified (cached)" in capsys.readouterr().out
 
 
 def test_verify_all_checks_every_model(tmp_path, capsys):
@@ -395,10 +485,10 @@ def test_verify_all_checks_every_model(tmp_path, capsys):
         (archive / "file.bin").write_bytes(b"abc")
     hub = FakeHub([FakeFile("file.bin", 3)])
 
-    rc = main(["--config", str(config_path), "verify", "--quick", "--all"], hub=hub)
+    rc = main(["--config", str(config_path), "verify", "--cached", "--all"], hub=hub)
 
     assert rc == 0
-    assert capsys.readouterr().out.count("verified (quick)") == 2
+    assert capsys.readouterr().out.count("verified (cached)") == 2
 
 
 def test_verify_all_returns_failure_when_any_model_fails(tmp_path, capsys):
@@ -413,13 +503,31 @@ def test_verify_all_returns_failure_when_any_model_fails(tmp_path, capsys):
     (bad_archive / "config.json").write_text("{}", encoding="utf-8")
     hub = FakeHub([FakeFile("file.bin", 3)])
 
-    rc = main(["--config", str(config_path), "verify", "--quick", "--all"], hub=hub)
+    rc = main(["--config", str(config_path), "verify", "--cached", "--all"], hub=hub)
 
     output = capsys.readouterr().out
     assert rc == 1
-    assert "verified (quick): ok/model" in output
+    assert "verified (cached): ok/model" in output
     assert "verification failed: bad/model" in output
     assert "next: model-mirror repair --all" in output
+
+
+def test_verify_all_reports_cached_incomplete_without_repair_hint(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    (archive / "config.json").write_text("{}", encoding="utf-8")
+    (archive / "file.bin").write_bytes(b"abc")
+    hub = FakeHub([FakeFile("config.json", 2), FakeFile("file.bin", 3, lfs_sha256=hashlib.sha256(b"abc").hexdigest())])
+
+    rc = main(["--config", str(config_path), "verify", "--cached", "--all"], hub=hub)
+
+    output = capsys.readouterr().out
+    assert rc == 1
+    assert "cached verification incomplete: org/model" in output
+    assert "cached verification incomplete: run full verification with model-mirror verify --all" in output
+    assert "next: model-mirror repair --all" not in output
 
 
 def test_verify_all_reports_changed_upstream_update_hint(tmp_path, capsys):
@@ -440,11 +548,11 @@ def test_verify_all_reports_changed_upstream_update_hint(tmp_path, capsys):
     )
     hub = MovingBranchHub([FakeFile("file.bin", 3)])
 
-    rc = main(["--config", str(config_path), "verify", "--quick", "--all"], hub=hub)
+    rc = main(["--config", str(config_path), "verify", "--cached", "--all"], hub=hub)
 
     output = capsys.readouterr().out
     assert rc == 0
-    assert "verified (quick): org/model upstream=changed" in output
+    assert "verified (cached): org/model upstream=changed" in output
     assert "update changed upstreams: model-mirror repair --all --update" in output
 
 
@@ -460,13 +568,13 @@ def test_verify_all_skips_busy_model_and_continues(tmp_path, capsys):
     hub = FakeHub([FakeFile("file.bin", 3)])
 
     with ModelLock(busy_archive, "mirror", "busy/model"):
-        rc = main(["--config", str(config_path), "verify", "--quick", "--all"], hub=hub)
+        rc = main(["--config", str(config_path), "verify", "--cached", "--all"], hub=hub)
 
     output = capsys.readouterr().out
     assert rc == 1
     assert "skipped busy: busy/model" in output
     assert "command=mirror" in output
-    assert "verified (quick): ok/model" in output
+    assert "verified (cached): ok/model" in output
 
 
 def test_verify_requires_model_without_all(tmp_path):
@@ -510,6 +618,7 @@ def test_list_command_prints_verification_status_and_age(tmp_path, capsys):
     output = capsys.readouterr().out
     assert "org/model" in output
     assert "verification=clean" in output
+    assert "state=[clean]" in output
     assert "age=3h" in output
 
 
@@ -517,6 +626,7 @@ def test_list_command_prints_busy_lock(tmp_path, capsys):
     config_path = tmp_path / "config.yaml"
     archive = tmp_path / "models" / "org" / "model"
     archive.mkdir(parents=True)
+    write_verification_state(archive, VerificationState(status="clean", repo_id="org/model"))
     config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
 
     with ModelLock(archive, "mirror", "org/model"):
@@ -525,8 +635,34 @@ def test_list_command_prints_busy_lock(tmp_path, capsys):
     assert rc == 0
     output = capsys.readouterr().out
     assert "org/model" in output
+    assert "state=[busy]" in output
     assert "busy=" in output
     assert "command=mirror" in output
+
+
+def test_list_state_tags_cover_multi_tag_states():
+    tags = cli_module.list_state_tags(
+        VerificationState(
+            status="dirty",
+            repo_id="org/model",
+            offline_only=True,
+            repair_paths=["bad.bin"],
+            upstream_status="changed",
+        ),
+        {"command": "verify"},
+    )
+    unavailable_tags = cli_module.list_state_tags(
+        VerificationState(status="unavailable", repo_id="org/model"),
+        None,
+    )
+    incomplete_tags = cli_module.list_state_tags(
+        VerificationState(status="incomplete", repo_id="org/model"),
+        None,
+    )
+
+    assert tags == ["offline", "needs-repair", "upstream-changed", "busy"]
+    assert unavailable_tags == ["upstream-unavailable"]
+    assert incomplete_tags == ["incomplete"]
 
 
 def test_verify_writes_dirty_verification_state(tmp_path, capsys):
@@ -534,7 +670,7 @@ def test_verify_writes_dirty_verification_state(tmp_path, capsys):
     config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
     hub = FakeHub([FakeFile("missing.bin", 3)])
 
-    rc = main(["--config", str(config_path), "verify", "--quick", "org/model"], hub=hub)
+    rc = main(["--config", str(config_path), "verify", "--cached", "org/model"], hub=hub)
 
     assert rc == 1
     state = read_verification_state(tmp_path / "models" / "org" / "model")
@@ -550,7 +686,7 @@ def test_verify_then_repair_repairs_dirty_archive(tmp_path, capsys):
     (archive / "config.json").write_text("{}", encoding="utf-8")
     hub = FakeHub([FakeFile("missing.bin", 3)])
 
-    verify_rc = main(["--config", str(config_path), "verify", "--quick", "org/model"], hub=hub)
+    verify_rc = main(["--config", str(config_path), "verify", "--cached", "org/model"], hub=hub)
     repair_rc = main(["--config", str(config_path), "repair", "org/model"], hub=hub)
 
     assert verify_rc == 1
@@ -620,13 +756,13 @@ def test_verify_then_repair_hashes_unchanged_files_once(tmp_path, monkeypatch, c
         ]
     )
     calls = []
-    real_sha = checksums_module.sha256_file
+    real_hashes = checksums_module.file_hashes
 
-    def tracking_sha(path):
+    def tracking_hashes(path):
         calls.append(path.name)
-        return real_sha(path)
+        return real_hashes(path)
 
-    monkeypatch.setattr(checksums_module, "sha256_file", tracking_sha)
+    monkeypatch.setattr(checksums_module, "file_hashes", tracking_hashes)
 
     verify_rc = main(["--config", str(config_path), "verify", "org/model"], hub=hub)
     repair_rc = main(["--config", str(config_path), "repair", "org/model"], hub=hub)
@@ -651,7 +787,7 @@ def test_full_verify_can_hash_directly_when_checksums_are_disabled(tmp_path, cap
 
     assert rc == 0
     assert "verified (full)" in capsys.readouterr().out
-    assert not (archive / ".checksums").exists()
+    assert not (archive / ".manifest").exists()
 
 
 def test_repair_command_uses_existing_verification_state_and_reports_age(tmp_path, capsys):
@@ -665,6 +801,7 @@ def test_repair_command_uses_existing_verification_state_and_reports_age(tmp_pat
         VerificationState(
             status="dirty",
             repo_id="org/model",
+            resolved_commit="main",
             repair_paths=["missing.bin"],
             checked_at_utc=(datetime.now(timezone.utc) - timedelta(days=2)).isoformat(timespec="seconds"),
         ),
@@ -693,6 +830,86 @@ def test_repair_command_reports_missing_verification_state(tmp_path, capsys):
     assert "verification age: unavailable" in output
     assert "run verify first: model-mirror verify org/model" in output
     assert "verify-required" in output
+
+
+def test_repair_command_reports_incomplete_verification_data(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    (archive / "config.json").write_text("{}", encoding="utf-8")
+    (archive / "good.bin").write_bytes(b"good")
+    write_verification_state(
+        archive,
+        VerificationState(
+            status="dirty",
+            repo_id="org/model",
+            resolved_commit="main",
+            repair_paths=["missing.bin"],
+        ),
+    )
+    hub = FakeHub([FakeFile("config.json", 2), FakeFile("good.bin", 4, lfs_sha256="sha"), FakeFile("missing.bin", 3)])
+
+    rc = main(["--config", str(config_path), "repair", "org/model"], hub=hub)
+
+    output = capsys.readouterr().out
+    assert rc == 1
+    assert "could not fully repair org/model; missing verification data" in output
+    assert "model-mirror verify org/model && model-mirror repair org/model" in output
+    assert "verification-incomplete" in output
+    assert hub.downloads == []
+
+
+def test_repair_force_partial_warns_and_attempts_download(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    (archive / "config.json").write_text("{}", encoding="utf-8")
+    (archive / "good.bin").write_bytes(b"good")
+    write_verification_state(
+        archive,
+        VerificationState(
+            status="dirty",
+            repo_id="org/model",
+            resolved_commit="main",
+            repair_paths=["missing.bin"],
+        ),
+    )
+    hub = FakeHub([FakeFile("config.json", 2), FakeFile("good.bin", 4, lfs_sha256="sha"), FakeFile("missing.bin", 3)])
+
+    rc = main(["--config", str(config_path), "repair", "--force-partial", "org/model"], hub=hub)
+
+    output = capsys.readouterr().out
+    assert rc == 1
+    assert "warning: --force-partial can leave the repository inconsistent" in output
+    assert "verification-incomplete" in output
+    assert hub.downloads == ["org/model"]
+
+
+def test_repair_command_fails_for_offline_only_model(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    write_verification_state(
+        archive,
+        VerificationState(
+            status="dirty",
+            repo_id="org/model",
+            resolved_commit="main",
+            offline_only=True,
+            repair_paths=["missing.bin"],
+        ),
+    )
+
+    rc = main(["--config", str(config_path), "repair", "org/model"], hub=UnavailableHub())
+
+    output = capsys.readouterr().out
+    assert rc == 1
+    assert "cannot repair offline-only model org/model" in output
+    assert "model-mirror online org/model" in output
+    assert "offline-only: org/model" in output
 
 
 def test_repair_command_reports_changed_upstream_from_verification_state(tmp_path, capsys):
@@ -730,7 +947,7 @@ def test_repair_command_returns_failure_when_repair_is_incomplete(tmp_path, caps
     archive.mkdir(parents=True)
     write_verification_state(
         archive,
-        VerificationState(status="dirty", repo_id="org/model", repair_paths=["missing.bin"]),
+        VerificationState(status="dirty", repo_id="org/model", resolved_commit="main", repair_paths=["missing.bin"]),
     )
     hub = FakeHub([])
 
@@ -749,7 +966,7 @@ def test_repair_all_repairs_each_model_with_verification_state(tmp_path, capsys)
         (archive / "config.json").write_text("{}", encoding="utf-8")
         write_verification_state(
             archive,
-            VerificationState(status="dirty", repo_id=repo, repair_paths=["missing.bin"]),
+            VerificationState(status="dirty", repo_id=repo, resolved_commit="main", repair_paths=["missing.bin"]),
         )
     hub = FakeHub([FakeFile("missing.bin", 3)])
 
@@ -770,14 +987,14 @@ def test_repair_all_skips_busy_model_and_continues(tmp_path, capsys):
     busy_archive.mkdir(parents=True)
     write_verification_state(
         busy_archive,
-        VerificationState(status="dirty", repo_id="busy/model", repair_paths=["missing.bin"]),
+        VerificationState(status="dirty", repo_id="busy/model", resolved_commit="main", repair_paths=["missing.bin"]),
     )
     ok_archive = tmp_path / "models" / "ok" / "model"
     ok_archive.mkdir(parents=True)
     (ok_archive / "config.json").write_text("{}", encoding="utf-8")
     write_verification_state(
         ok_archive,
-        VerificationState(status="dirty", repo_id="ok/model", repair_paths=["missing.bin"]),
+        VerificationState(status="dirty", repo_id="ok/model", resolved_commit="main", repair_paths=["missing.bin"]),
     )
     hub = FakeHub([FakeFile("missing.bin", 3)])
 
@@ -801,7 +1018,7 @@ def test_repair_all_returns_failure_when_any_model_needs_verify(tmp_path, capsys
     (ok_archive / "config.json").write_text("{}", encoding="utf-8")
     write_verification_state(
         ok_archive,
-        VerificationState(status="dirty", repo_id="ok/model", repair_paths=["missing.bin"]),
+        VerificationState(status="dirty", repo_id="ok/model", resolved_commit="main", repair_paths=["missing.bin"]),
     )
     hub = FakeHub([FakeFile("missing.bin", 3)])
 
@@ -811,6 +1028,39 @@ def test_repair_all_returns_failure_when_any_model_needs_verify(tmp_path, capsys
     assert rc == 1
     assert "verify-required: missing/state" in output
     assert "repaired: ok/model" in output
+
+
+def test_repair_all_skips_offline_only_models_without_failing(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    offline_archive = tmp_path / "models" / "offline" / "model"
+    offline_archive.mkdir(parents=True)
+    write_verification_state(
+        offline_archive,
+        VerificationState(
+            status="dirty",
+            repo_id="offline/model",
+            resolved_commit="main",
+            offline_only=True,
+            repair_paths=["missing.bin"],
+        ),
+    )
+    ok_archive = tmp_path / "models" / "ok" / "model"
+    ok_archive.mkdir(parents=True)
+    (ok_archive / "config.json").write_text("{}", encoding="utf-8")
+    write_verification_state(
+        ok_archive,
+        VerificationState(status="dirty", repo_id="ok/model", resolved_commit="main", repair_paths=["missing.bin"]),
+    )
+    hub = FakeHub([FakeFile("missing.bin", 3)])
+
+    rc = main(["--config", str(config_path), "repair", "--all"], hub=hub)
+
+    output = capsys.readouterr().out
+    assert rc == 0
+    assert "skipped offline-only: offline/model" in output
+    assert "repaired: ok/model" in output
+    assert hub.downloads == ["ok/model"]
 
 
 def test_repair_rejects_missing_or_conflicting_targets(tmp_path):
@@ -858,6 +1108,220 @@ def test_update_command_is_removed(tmp_path):
         main(["--config", str(config_path), "update", "org/model"])
 
 
+def test_offline_and_online_commands_toggle_state_and_list_tags(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    write_verification_state(
+        archive,
+        VerificationState(status="dirty", repo_id="org/model", repair_paths=["bad.bin"]),
+    )
+
+    assert main(["--config", str(config_path), "offline", "org/model"]) == 0
+    assert read_verification_state(archive).offline_only is True
+    assert main(["--config", str(config_path), "list"]) == 0
+    list_output = capsys.readouterr().out
+    assert "offline-only enabled: org/model" in list_output
+    assert "state=[offline,needs-repair]" in list_output
+
+    assert main(["--config", str(config_path), "online", "org/model"]) == 0
+    assert read_verification_state(archive).offline_only is False
+    assert "offline-only disabled: org/model" in capsys.readouterr().out
+
+
+def test_offline_command_reports_missing_state(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+
+    rc = main(["--config", str(config_path), "offline", "org/model"])
+
+    output = capsys.readouterr().out
+    assert rc == 1
+    assert "verification state unavailable: org/model" in output
+    assert "run verify first: model-mirror verify org/model" in output
+
+
+def test_verify_unavailable_upstream_suggests_offline_and_preserves_clean_state(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    write_verification_state(archive, VerificationState(status="clean", repo_id="org/model"))
+
+    rc = main(["--config", str(config_path), "verify", "org/model"], hub=UnavailableHub())
+
+    output = capsys.readouterr().out
+    state = read_verification_state(archive)
+    assert rc == 1
+    assert state.status == "clean"
+    assert "upstream unavailable: repository not found" in state.issues
+    assert "upstream repository unavailable: repository not found" in output
+    assert "run: model-mirror offline org/model" in output
+
+    assert main(["--config", str(config_path), "list"]) == 0
+    assert "state=[upstream-unavailable]" in capsys.readouterr().out
+
+    assert main(["--config", str(config_path), "offline", "org/model"]) == 0
+    state = read_verification_state(archive)
+    assert state.offline_only is True
+    assert state.status == "clean"
+    assert state.issues == []
+
+    assert main(["--config", str(config_path), "verify", "--cached", "org/model"], hub=UnavailableHub()) == 0
+    assert "verified (offline-only cached)" in capsys.readouterr().out
+
+
+def test_verify_all_max_age_does_not_skip_upstream_unavailable_state(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    write_verification_state(
+        archive,
+        VerificationState(
+            status="clean",
+            repo_id="org/model",
+            issues=["upstream unavailable: repository not found"],
+            checked_at_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        ),
+    )
+
+    rc = main(["--config", str(config_path), "verify", "--all", "--max-age", "7d"], hub=UnavailableHub())
+
+    output = capsys.readouterr().out
+    assert rc == 1
+    assert "skipped recent clean verification" not in output
+    assert "run: model-mirror offline org/model" in output
+
+
+def test_verify_unavailable_upstream_without_state_writes_unavailable_state(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    archive = tmp_path / "models" / "org" / "model"
+
+    rc = main(["--config", str(config_path), "verify", "org/model"], hub=UnavailableHub())
+
+    output = capsys.readouterr().out
+    state = read_verification_state(archive)
+    assert rc == 1
+    assert state.status == "unavailable"
+    assert "run: model-mirror offline org/model" in output
+
+    assert main(["--config", str(config_path), "offline", "org/model"]) == 0
+    state = read_verification_state(archive)
+    assert state.offline_only is True
+    assert state.status == "incomplete"
+    assert state.issues == ["local verification required"]
+
+
+def test_verify_unavailable_stored_commit_suggests_offline(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    write_verification_state(
+        archive,
+        VerificationState(status="clean", repo_id="org/model", requested_revision="main", resolved_commit="oldcommit"),
+    )
+
+    rc = main(["--config", str(config_path), "verify", "org/model"], hub=MissingStoredCommitHub())
+
+    output = capsys.readouterr().out
+    state = read_verification_state(archive)
+    assert rc == 1
+    assert state.status == "clean"
+    assert state.issues == ["upstream unavailable: stored commit not found"]
+    assert "upstream repository unavailable: stored commit not found" in output
+    assert "run: model-mirror offline org/model" in output
+
+
+def test_offline_only_verify_uses_local_manifest_without_hub(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    (archive / "file.bin").write_bytes(b"abc")
+    write_checksums(archive)
+    write_verification_state(archive, VerificationState(status="clean", repo_id="org/model", offline_only=True))
+
+    rc = main(["--config", str(config_path), "verify", "org/model"], hub=UnavailableHub())
+
+    assert rc == 0
+    assert "verified (offline-only full): org/model" in capsys.readouterr().out
+    assert read_verification_state(archive).offline_only is True
+
+
+def test_offline_only_verify_without_manifest_is_incomplete(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    write_verification_state(archive, VerificationState(status="clean", repo_id="org/model", offline_only=True))
+
+    rc = main(["--config", str(config_path), "verify", "org/model"], hub=UnavailableHub())
+
+    output = capsys.readouterr().out
+    state = read_verification_state(archive)
+    assert rc == 1
+    assert "offline-only verification incomplete: org/model missing .manifest" in output
+    assert state.status == "incomplete"
+    assert state.issues == [".manifest missing"]
+
+
+def test_offline_full_verify_requires_manifest_even_when_checksums_disabled(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path), "checksum": False}), encoding="utf-8")
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    write_verification_state(archive, VerificationState(status="clean", repo_id="org/model"))
+
+    rc = main(["--config", str(config_path), "verify", "--offline", "org/model"])
+
+    output = capsys.readouterr().out
+    assert rc == 1
+    assert "offline verification incomplete: org/model missing .manifest" in output
+
+
+def test_offline_only_verify_failure_does_not_suggest_repair(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    (archive / "file.bin").write_bytes(b"abc")
+    write_checksums(archive)
+    (archive / "file.bin").write_bytes(b"changed")
+    write_verification_state(archive, VerificationState(status="clean", repo_id="org/model", offline_only=True))
+
+    rc = main(["--config", str(config_path), "verify", "org/model"], hub=UnavailableHub())
+
+    output = capsys.readouterr().out
+    assert rc == 1
+    assert "offline-only verification failed: org/model" in output
+    assert "repair unavailable for offline-only model: org/model" in output
+    assert "next: model-mirror repair" not in output
+
+
+def test_offline_full_verify_strict_reports_extra_files(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    (archive / "tracked.bin").write_bytes(b"abc")
+    write_checksums(archive)
+    (archive / "extra.bin").write_bytes(b"extra")
+    write_verification_state(archive, VerificationState(status="clean", repo_id="org/model"))
+
+    rc = main(["--config", str(config_path), "verify", "--offline", "--strict", "org/model"])
+
+    output = capsys.readouterr().out
+    state = read_verification_state(archive)
+    assert rc == 1
+    assert "offline verification failed: org/model" in output
+    assert state.repair_paths == []
+    assert "extras: extra.bin" in state.issues
+
+
 def test_verify_all_max_age_skips_recent_clean_model(tmp_path, capsys):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
@@ -873,7 +1337,7 @@ def test_verify_all_max_age_skips_recent_clean_model(tmp_path, capsys):
     )
     hub = FakeHub([FakeFile("file.bin", 3)])
 
-    rc = main(["--config", str(config_path), "verify", "--all", "--quick", "--max-age", "7d"], hub=hub)
+    rc = main(["--config", str(config_path), "verify", "--all", "--cached", "--max-age", "7d"], hub=hub)
 
     assert rc == 0
     assert "skipped recent clean verification" in capsys.readouterr().out
@@ -885,12 +1349,12 @@ def test_offline_verify_modes(tmp_path, capsys):
     archive = tmp_path / "models" / "org" / "model"
     archive.mkdir(parents=True)
 
-    assert main(["--config", str(config_path), "verify", "--offline", "--quick", "org/model"]) == 1
+    assert main(["--config", str(config_path), "verify", "--offline", "--cached", "org/model"]) == 1
     assert "offline verification unavailable" in capsys.readouterr().out
 
     write_verification_state(archive, VerificationState(status="clean", repo_id="org/model"))
-    assert main(["--config", str(config_path), "verify", "--offline", "--quick", "org/model"]) == 0
-    assert "verified (offline quick)" in capsys.readouterr().out
+    assert main(["--config", str(config_path), "verify", "--offline", "--cached", "org/model"]) == 0
+    assert "verified (offline cached)" in capsys.readouterr().out
 
 
 def test_offline_full_verify_modes(tmp_path, capsys):

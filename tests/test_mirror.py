@@ -55,7 +55,7 @@ class InspectingFakeHub(FakeHub):
         return super().snapshot_download(repo_id, repo_type, revision, local_dir, allow_patterns)
 
 
-def test_mirror_noops_without_verification_when_quick_verify_says_archive_is_complete(tmp_path):
+def test_mirror_noops_without_verification_when_cached_verify_says_archive_is_complete(tmp_path):
     archive = tmp_path / "models" / "org" / "model"
     archive.mkdir(parents=True)
     (archive / "file.bin").write_bytes(b"abc")
@@ -107,7 +107,7 @@ def test_mirror_existing_complete_archive_can_skip_checksum_writes(tmp_path):
     result = mirror(Config(directory=tmp_path, checksum=False), "org/model", hub=hub)
 
     assert result.status == "complete"
-    assert not (archive / ".checksums").exists()
+    assert not (archive / ".manifest").exists()
 
 
 def test_mirror_downloads_missing_archive_and_writes_checksums(tmp_path):
@@ -118,7 +118,7 @@ def test_mirror_downloads_missing_archive_and_writes_checksums(tmp_path):
     assert result.status == "downloaded"
     assert hub.downloads
     assert result.path.joinpath("file.bin").read_bytes() == b"xxx"
-    assert result.path.joinpath(".checksums").exists()
+    assert result.path.joinpath(".manifest").exists()
     assert result.path.joinpath(".verification").exists()
     assert not result.path.joinpath(".model-mirror").exists()
 
@@ -129,7 +129,7 @@ def test_mirror_download_can_skip_checksum_writes(tmp_path):
     result = mirror(Config(directory=tmp_path, checksum=False), "org/model", hub=hub)
 
     assert result.status == "downloaded"
-    assert not result.path.joinpath(".checksums").exists()
+    assert not result.path.joinpath(".manifest").exists()
 
 
 def test_mirror_writes_in_progress_verification_before_download(tmp_path):

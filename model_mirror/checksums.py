@@ -9,6 +9,8 @@ from pathlib import Path
 
 CHECKSUMS = ".checksums"
 MANIFEST = ".manifest"
+MANIFEST_SCHEMA = "model-mirror-manifest"
+MANIFEST_VERSION = 1
 SKIP_DIRS = {".model-mirror", ".cache", ".archive"}
 SKIP_FILES = {
     CHECKSUMS,
@@ -41,6 +43,12 @@ class ChecksumWriteResult:
     removed: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class FileHashes:
+    sha256: str
+    git_blob_sha1: str
+
+
 def iter_payload_files(root: Path):
     for path in sorted(root.rglob("*")):
         if not path.is_file():
@@ -53,22 +61,25 @@ def iter_payload_files(root: Path):
         yield path
 
 
-def sha256_file(path: Path) -> str:
+def file_hashes(path: Path) -> FileHashes:
+    stat = path.stat()
     digest = hashlib.sha256()
+    blob_digest = hashlib.sha1()
+    blob_digest.update(f"blob {stat.st_size}\0".encode("ascii"))
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(16 * 1024 * 1024), b""):
             digest.update(chunk)
-    return digest.hexdigest()
+            blob_digest.update(chunk)
+    return FileHashes(sha256=digest.hexdigest(), git_blob_sha1=blob_digest.hexdigest())
 
 
 def write_checksums(root: Path, *, max_workers: int = 1) -> ChecksumWriteResult:
-    checksums, manifest = load_records(root)
+    manifest = load_manifest(root)
     payload_files = list(iter_payload_files(root))
     current_paths = {path.relative_to(root).as_posix() for path in payload_files}
     result = ChecksumWriteResult(total=len(payload_files))
 
-    for rel in sorted((set(checksums) | set(manifest)) - current_paths):
-        checksums.pop(rel, None)
+    for rel in sorted(set(manifest) - current_paths):
         manifest.pop(rel, None)
         result.removed += 1
 
@@ -76,13 +87,13 @@ def write_checksums(root: Path, *, max_workers: int = 1) -> ChecksumWriteResult:
     for path in payload_files:
         rel = path.relative_to(root).as_posix()
         stat = path.stat()
-        if checksums.get(rel) and record_is_current(manifest.get(rel), stat.st_size, stat.st_mtime_ns):
+        if record_is_current(manifest.get(rel), stat.st_size, stat.st_mtime_ns):
             result.skipped += 1
             continue
         work.append(path)
 
     if result.removed and not work:
-        write_records(root, checksums, manifest)
+        write_manifest(root, manifest)
     if not work:
         return result
 
@@ -90,68 +101,72 @@ def write_checksums(root: Path, *, max_workers: int = 1) -> ChecksumWriteResult:
     if workers == 1:
         for path in work:
             row = checksum_row(root, path)
-            checksums[row["path"]] = row["sha256"]
             manifest[row["path"]] = row
             result.hashed += 1
-            write_records(root, checksums, manifest)
+            write_manifest(root, manifest)
         return result
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [executor.submit(checksum_row, root, path) for path in work]
         for future in as_completed(futures):
             row = future.result()
-            checksums[row["path"]] = row["sha256"]
             manifest[row["path"]] = row
             result.hashed += 1
-            write_records(root, checksums, manifest)
+            write_manifest(root, manifest)
     return result
 
 
 def record_is_current(row: dict | None, size: int, mtime_ns: int) -> bool:
     if row is None:
         return False
-    return row.get("size") == size and row.get("mtime_ns") == mtime_ns
+    return (
+        row.get("size") == size
+        and row.get("mtime_ns") == mtime_ns
+        and bool(row.get("sha256"))
+        and bool(row.get("git_blob_sha1"))
+    )
 
 
 def checksum_row(root: Path, path: Path) -> dict:
-    digest = sha256_file(path)
+    hashes = file_hashes(path)
     stat = path.stat()
     return {
         "path": path.relative_to(root).as_posix(),
-        "sha256": digest,
+        "sha256": hashes.sha256,
+        "git_blob_sha1": hashes.git_blob_sha1,
         "size": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
     }
 
 
-def write_records(root: Path, checksums: dict[str, str], manifest: dict[str, dict]) -> None:
-    checksum_tmp = root / f"{CHECKSUMS}.tmp"
+def write_manifest(root: Path, manifest: dict[str, dict]) -> None:
     manifest_tmp = root / f"{MANIFEST}.tmp"
-    with checksum_tmp.open("w", encoding="utf-8", newline="\n") as handle:
-        for rel in sorted(checksums):
-            handle.write(f"{checksums[rel]}  {rel}\n")
     with manifest_tmp.open("w", encoding="utf-8", newline="\n") as handle:
+        handle.write(json.dumps({"schema": MANIFEST_SCHEMA, "version": MANIFEST_VERSION}, sort_keys=True) + "\n")
         for rel in sorted(manifest):
             handle.write(json.dumps(manifest[rel], sort_keys=True) + "\n")
-    checksum_tmp.replace(root / CHECKSUMS)
     manifest_tmp.replace(root / MANIFEST)
+    remove_obsolete_checksum_files(root)
+
+
+def remove_obsolete_checksum_files(root: Path) -> None:
+    for path in (root / CHECKSUMS, root / f"{CHECKSUMS}.tmp"):
+        path.unlink(missing_ok=True)
 
 
 def update_checksums(root: Path, paths: list[str], *, max_workers: int = 1) -> ChecksumWriteResult:
-    checksums, manifest = load_records(root)
+    manifest = load_manifest(root)
     result = ChecksumWriteResult(total=len(paths))
     work: list[Path] = []
     for rel in paths:
         path = root / rel
         if not path.exists() or not path.is_file():
-            removed_checksum = checksums.pop(rel, None) is not None
-            removed_manifest = manifest.pop(rel, None) is not None
-            if removed_checksum or removed_manifest:
+            if manifest.pop(rel, None) is not None:
                 result.removed += 1
             continue
         work.append(path)
     if result.removed and not work:
-        write_records(root, checksums, manifest)
+        write_manifest(root, manifest)
     if not work:
         return result
 
@@ -159,70 +174,73 @@ def update_checksums(root: Path, paths: list[str], *, max_workers: int = 1) -> C
     if workers == 1:
         for path in work:
             row = checksum_row(root, path)
-            checksums[row["path"]] = row["sha256"]
             manifest[row["path"]] = row
             result.hashed += 1
-            write_records(root, checksums, manifest)
+            write_manifest(root, manifest)
         return result
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [executor.submit(checksum_row, root, path) for path in work]
         for future in as_completed(futures):
             row = future.result()
-            checksums[row["path"]] = row["sha256"]
             manifest[row["path"]] = row
             result.hashed += 1
-            write_records(root, checksums, manifest)
+            write_manifest(root, manifest)
     return result
 
 
-def load_records(root: Path) -> tuple[dict[str, str], dict[str, dict]]:
-    checksums: dict[str, str] = {}
-    checksum_path = root / CHECKSUMS
-    if checksum_path.exists():
-        with checksum_path.open("r", encoding="utf-8") as handle:
-            for line_number, line in enumerate(handle, 1):
-                line = line.rstrip("\n")
-                if not line:
-                    continue
-                try:
-                    digest, rel = line.split("  ", 1)
-                except ValueError as exc:
-                    raise ValueError(f"Malformed line {line_number} in {checksum_path}") from exc
-                checksums[rel] = digest
-
+def load_manifest(root: Path) -> dict[str, dict]:
     manifest: dict[str, dict] = {}
     manifest_path = root / MANIFEST
     if manifest_path.exists():
         with manifest_path.open("r", encoding="utf-8") as handle:
+            saw_record = False
             for line_number, line in enumerate(handle, 1):
                 if not line.strip():
                     continue
                 try:
                     row = json.loads(line)
-                    manifest[row["path"]] = row
                 except Exception as exc:
                     raise ValueError(f"Malformed line {line_number} in {manifest_path}") from exc
-    return checksums, manifest
+                if not saw_record:
+                    if not row.get("schema"):
+                        raise ValueError(f"Manifest missing header: {manifest_path}")
+                    validate_manifest_header(row, manifest_path)
+                    saw_record = True
+                    continue
+                saw_record = True
+                try:
+                    manifest[row["path"]] = row
+                except KeyError as exc:
+                    raise ValueError(f"Malformed line {line_number} in {manifest_path}") from exc
+    return manifest
+
+
+def validate_manifest_header(row: dict, path: Path) -> None:
+    if row.get("schema") != MANIFEST_SCHEMA:
+        raise ValueError(f"Unsupported manifest schema in {path}: {row.get('schema')}")
+    if row.get("version") != MANIFEST_VERSION:
+        raise ValueError(f"Unsupported manifest version in {path}: {row.get('version')}")
 
 
 def verify_checksums(root: Path, strict: bool = False) -> ChecksumResult:
-    checksums, _ = load_records(root)
-    if not checksums:
+    manifest = load_manifest(root)
+    if not manifest:
         return ChecksumResult()
 
     result = ChecksumResult()
-    for rel, expected in checksums.items():
+    for rel, row in manifest.items():
         path = root / rel
         if not path.exists():
             result.missing.append(rel)
             continue
         result.checked += 1
-        if sha256_file(path) != expected:
+        hashes = file_hashes(path)
+        if hashes.sha256 != row.get("sha256") or hashes.git_blob_sha1 != row.get("git_blob_sha1"):
             result.failures.append(rel)
 
     if strict:
-        tracked = set(checksums)
+        tracked = set(manifest)
         result.extras = [
             path.relative_to(root).as_posix()
             for path in iter_payload_files(root)

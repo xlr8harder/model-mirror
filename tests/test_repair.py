@@ -1,8 +1,8 @@
 from dataclasses import dataclass
 
 from model_mirror.config import Config
-from model_mirror.checksums import load_records, write_checksums
-from model_mirror.repair import repair
+from model_mirror.checksums import load_manifest, write_checksums
+from model_mirror.repair import missing_manifest_paths, repair
 from model_mirror.state import VerificationState, read_verification_state, write_verification_state
 
 
@@ -11,6 +11,7 @@ class FakeFile:
     path: str
     size: int
     lfs_sha256: str | None = None
+    blob_id: str | None = None
 
 
 class FakeHub:
@@ -46,6 +47,7 @@ def test_repair_uses_local_verification_state_without_reverifying_first(tmp_path
         VerificationState(
             status="dirty",
             repo_id="org/model",
+            resolved_commit="main",
             repair_paths=["bad.bin", "missing.bin"],
         ),
     )
@@ -100,6 +102,28 @@ def test_repair_requires_verification_state(tmp_path):
     assert hub.downloads == []
 
 
+def test_repair_refuses_offline_only_state(tmp_path):
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    write_verification_state(
+        archive,
+        VerificationState(
+            status="dirty",
+            repo_id="org/model",
+            resolved_commit="main",
+            offline_only=True,
+            repair_paths=["missing.bin"],
+        ),
+    )
+    hub = FakeHub([FakeFile("missing.bin", 3)])
+
+    result = repair(Config(directory=tmp_path), "org/model", hub=hub)
+
+    assert result.status == "offline-only"
+    assert result.paths == []
+    assert hub.downloads == []
+
+
 def test_repair_updates_existing_checksums_for_repaired_paths(tmp_path):
     archive = tmp_path / "models" / "org" / "model"
     archive.mkdir(parents=True)
@@ -108,15 +132,14 @@ def test_repair_updates_existing_checksums_for_repaired_paths(tmp_path):
     write_checksums(archive)
     write_verification_state(
         archive,
-        VerificationState(status="dirty", repo_id="org/model", repair_paths=["bad.bin"]),
+        VerificationState(status="dirty", repo_id="org/model", resolved_commit="main", repair_paths=["bad.bin"]),
     )
     hub = FakeHub([FakeFile("bad.bin", 5)])
 
     result = repair(Config(directory=tmp_path), "org/model", hub=hub)
 
-    checksums, manifest = load_records(archive)
+    manifest = load_manifest(archive)
     assert result.status == "repaired"
-    assert checksums.keys() >= {"bad.bin"}
     assert manifest["bad.bin"]["size"] == 5
 
 
@@ -126,14 +149,14 @@ def test_repair_can_run_without_checksum_writes(tmp_path):
     (archive / "config.json").write_text("{}", encoding="utf-8")
     write_verification_state(
         archive,
-        VerificationState(status="dirty", repo_id="org/model", repair_paths=["missing.bin"]),
+        VerificationState(status="dirty", repo_id="org/model", resolved_commit="main", repair_paths=["missing.bin"]),
     )
     hub = FakeHub([FakeFile("missing.bin", 3)])
 
     result = repair(Config(directory=tmp_path, checksum=False), "org/model", hub=hub)
 
     assert result.status == "repaired"
-    assert not (archive / ".checksums").exists()
+    assert not (archive / ".manifest").exists()
 
 
 def test_repair_does_not_discover_paths_without_verification_state(tmp_path):
@@ -193,6 +216,96 @@ def test_repair_defaults_to_recorded_commit_when_upstream_changed(tmp_path):
     assert state.upstream_status == "changed"
 
 
+def test_repair_requires_recorded_commit_for_dirty_state(tmp_path):
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    write_verification_state(
+        archive,
+        VerificationState(status="dirty", repo_id="org/model", repair_paths=["missing.bin"]),
+    )
+    hub = FakeHub([FakeFile("missing.bin", 3)])
+
+    result = repair(Config(directory=tmp_path), "org/model", hub=hub)
+
+    assert result.status == "verification-incomplete"
+    assert hub.downloads == []
+
+
+def test_repair_stops_when_untouched_file_lacks_cached_verification_data(tmp_path):
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    (archive / "config.json").write_text("{}", encoding="utf-8")
+    (archive / "good.bin").write_bytes(b"good")
+    write_verification_state(
+        archive,
+        VerificationState(
+            status="dirty",
+            repo_id="org/model",
+            resolved_commit="main",
+            repair_paths=["missing.bin"],
+        ),
+    )
+    hub = FakeHub(
+        [
+            FakeFile("config.json", 2),
+            FakeFile("good.bin", 4, lfs_sha256="sha"),
+            FakeFile("missing.bin", 3),
+        ]
+    )
+
+    result = repair(Config(directory=tmp_path), "org/model", hub=hub)
+
+    assert result.status == "verification-incomplete"
+    assert hub.downloads == []
+
+
+def test_repair_force_partial_attempts_repair_with_incomplete_cached_data(tmp_path):
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    (archive / "config.json").write_text("{}", encoding="utf-8")
+    (archive / "good.bin").write_bytes(b"good")
+    write_verification_state(
+        archive,
+        VerificationState(
+            status="dirty",
+            repo_id="org/model",
+            resolved_commit="main",
+            repair_paths=["missing.bin"],
+        ),
+    )
+    hub = FakeHub(
+        [
+            FakeFile("config.json", 2),
+            FakeFile("good.bin", 4, lfs_sha256="sha"),
+            FakeFile("missing.bin", 3),
+        ]
+    )
+
+    result = repair(Config(directory=tmp_path), "org/model", hub=hub, force_partial=True)
+
+    assert result.status == "verification-incomplete"
+    assert hub.downloads
+
+
+def test_missing_manifest_paths_skips_unrepairable_or_unavailable_files(tmp_path):
+    (tmp_path / "wrong-size.bin").write_bytes(b"x")
+    (tmp_path / "git-file.txt").write_bytes(b"abc")
+
+    missing = missing_manifest_paths(
+        tmp_path,
+        [
+            FakeFile("ignored.bin", 3, lfs_sha256="sha"),
+            FakeFile("missing.bin", 3, lfs_sha256="sha"),
+            FakeFile("wrong-size.bin", 3, lfs_sha256="sha"),
+            FakeFile("git-file.txt", 3, blob_id="blob"),
+            FakeFile("no-hash.txt", 3),
+        ],
+        ignored_paths={"ignored.bin"},
+    )
+
+    assert missing == ["git-file.txt"]
+
+
 def test_repair_update_applies_changed_upstream_commit(tmp_path):
     archive = tmp_path / "models" / "org" / "model"
     archive.mkdir(parents=True)
@@ -245,4 +358,4 @@ def test_repair_update_can_skip_checksum_writes(tmp_path):
     result = repair(Config(directory=tmp_path, checksum=False), "org/model", hub=hub, update=True)
 
     assert result.status == "updated"
-    assert not (archive / ".checksums").exists()
+    assert not (archive / ".manifest").exists()
