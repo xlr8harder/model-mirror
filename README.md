@@ -19,6 +19,7 @@ uv run model-mirror config set hf-xet-reconstruct-write-sequentially true  # use
 uv run model-mirror mirror org/model
 uv run model-mirror list
 uv run model-mirror verify org/model
+uv run model-mirror repair org/model  # if verify reports repair paths
 ```
 
 Mirrors are stored by repo type:
@@ -52,9 +53,11 @@ model-mirror verify --all
 model-mirror verify --all --max-age 7d
 ```
 
-`--quick` checks presence and sizes without rehashing. `--offline` uses only the
-local `.verification` and `.checksums` files. `--max-age` is useful for periodic
-jobs that should skip recently verified clean mirrors.
+`--quick` checks presence and sizes without rehashing. `--offline` uses only
+local `.verification` and `.checksums` state; it does not contact the Hub, so it
+does not detect whether the upstream repo has moved to a newer commit.
+`--max-age` is useful for periodic jobs that should skip recently verified
+clean mirrors.
 
 If one repo is already locked, a single-repo `verify` exits non-zero. With
 `verify --all`, locked repos are reported as skipped, remaining repos are still
@@ -64,17 +67,39 @@ Verification records missing or corrupt files as repair paths in
 `.verification`. Repairs redownload only those paths:
 
 ```bash
-model-mirror verify --repair org/model
+model-mirror verify org/model
 model-mirror repair org/model
 ```
 
 `repair org/model` consumes the existing `.verification` state. If no
 verification state exists, it tells you to run `verify` first. It prints how old
 the verification result is, warns after 24 hours, updates checksums for repaired
-files, and runs a final verification from checksum state. In a `verify --repair`
-workflow, the initial full verify hashes existing files once; repaired files are
-hashed again after download, but unchanged large files are not rehashed a second
-time.
+files, and runs a final verification from checksum state. In a `verify` then
+`repair` workflow, the initial full verify hashes existing files once; repaired
+files are hashed again after download, but unchanged large files are not
+rehashed a second time.
+
+## Periodic Jobs
+
+For alert-only checks, run verification periodically and let its non-zero exit
+status trigger normal alerting:
+
+```bash
+model-mirror verify --all --max-age 30d
+```
+
+For a repair pass after verification:
+
+```bash
+model-mirror verify --all --max-age 30d || true
+model-mirror repair --all
+```
+
+Do not chain verification to repair with `&&`: `verify` exits non-zero when it
+finds repairable damage. `verify --all` skips recently verified clean mirrors
+when `--max-age` is set. Busy mirrors are reported and skipped, the rest of the
+archive is still checked, and the final exit status is non-zero if any mirror is
+dirty, failed, or busy.
 
 ## Upstream Updates
 
@@ -101,6 +126,7 @@ model-mirror mirror --no-verify org/model  # download without final verification
 model-mirror verify org/model              # full verification
 model-mirror verify --quick org/model      # no SHA-256 pass
 model-mirror repair org/model              # redownload paths from .verification
+model-mirror repair --all                  # repair all mirrors with recorded repair paths
 model-mirror update org/model              # move to latest requested revision
 model-mirror list                          # show mirrors and verification age
 ```

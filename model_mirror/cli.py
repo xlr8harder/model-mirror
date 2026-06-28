@@ -85,7 +85,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_revision_options(verify_parser)
     verify_parser.add_argument("--strict", action="store_true", help="fail on extra local files")
-    verify_parser.add_argument("--repair", action="store_true", help="repair dirty archives after verification")
     verify_parser.add_argument("--max-age", help="with --all, skip clean archives verified within this age, e.g. 7d")
     verify_parser.add_argument("--offline", action="store_true", help="verify only against local checksum state")
 
@@ -94,10 +93,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="repair a mirrored archive",
         description=(
             "Redownload files listed in existing .verification repair paths, "
-            "then run a final verification. Run verify first or use verify --repair."
+            "then run a final verification. Run verify first."
         ),
     )
-    repair_parser.add_argument("model", metavar="repo", help="repo id to repair")
+    repair_parser.add_argument("model", metavar="repo", nargs="?", help="repo id to repair unless --all is used")
+    repair_parser.add_argument("--all", action="store_true", help="repair every mirrored model with verification state")
     repair_parser.add_argument(
         "--repo-type", choices=["model", "dataset", "space"], default="model", help="repo kind to repair"
     )
@@ -168,19 +168,7 @@ def main(argv: list[str] | None = None, *, hub=None) -> int:
         if args.command == "verify":
             return handle_verify(args, config, hub=hub)
         if args.command == "repair":
-            selected_hub = hub or HuggingFaceHub(config)
-            print_verification_age(config, args.model, args.repo_type)
-            result = repair(
-                config,
-                args.model,
-                hub=selected_hub,
-                repo_type=args.repo_type,
-            )
-            if result.status == "verify-required":
-                print(f"run verify first: model-mirror verify {args.model}")
-            print_repair_commit_notice(args.model, result)
-            print(f"{result.status}: {args.model} -> {result.path}")
-            return 0 if result.status in {"complete", "repaired"} else 1
+            return handle_repair(args, config, hub=hub)
         if args.command == "update":
             selected_hub = hub or HuggingFaceHub(config)
             result = mirror(
@@ -336,33 +324,58 @@ def handle_verify(args, config: Config, *, hub=None) -> int:
     return verify_one(config, args.model, args, hub=hub)
 
 
+def handle_repair(args, config: Config, *, hub=None) -> int:
+    if args.all and args.model:
+        raise SystemExit("repair accepts a model id or --all, not both")
+    if args.all:
+        failures = 0
+        for repo_id in list_model_ids(config):
+            try:
+                rc = repair_one(config, repo_id, args, hub=hub)
+            except ModelBusyError as exc:
+                print(f"skipped busy: {repo_id} -> {exc.root} ({lock_label(exc.info)})")
+                failures += 1
+                continue
+            if rc != 0:
+                failures += 1
+        return 1 if failures else 0
+
+    if not args.model:
+        raise SystemExit("repair requires a model id unless --all is used")
+    return repair_one(config, args.model, args, hub=hub)
+
+
+def repair_one(config: Config, repo_id: str, args, *, hub=None) -> int:
+    selected_hub = hub or HuggingFaceHub(config)
+    print_verification_age(config, repo_id, args.repo_type)
+    result = repair(
+        config,
+        repo_id,
+        hub=selected_hub,
+        repo_type=args.repo_type,
+    )
+    if result.status == "verify-required":
+        print(f"run verify first: model-mirror verify {repo_id}")
+    print_repair_commit_notice(repo_id, result)
+    print(f"{result.status}: {repo_id} -> {result.path}")
+    return 0 if result.status in {"complete", "repaired"} else 1
+
+
 def verify_one(config: Config, repo_id: str, args, *, hub=None) -> int:
     selected_hub = hub or HuggingFaceHub(config)
     root = archive_path(config, repo_id, args.repo_type)
     with ModelLock(root, "verify", repo_id, args.repo_type):
-        rc, needs_repair, requested_revision = verify_one_locked(config, repo_id, args, selected_hub, root)
-    if needs_repair:
-        repair_result = repair(
-            config,
-            repo_id,
-            hub=selected_hub,
-            repo_type=args.repo_type,
-            revision=requested_revision,
-        )
-        print_repair_commit_notice(repo_id, repair_result)
-        print(f"{repair_result.status}: {repo_id}")
-        return 0 if repair_result.status in {"complete", "repaired"} else 1
-    return rc
+        return verify_one_locked(config, repo_id, args, selected_hub, root)
 
 
-def verify_one_locked(config: Config, repo_id: str, args, selected_hub, root: Path) -> tuple[int, bool, str]:
+def verify_one_locked(config: Config, repo_id: str, args, selected_hub, root: Path) -> int:
     existing_state = read_verification_state(root)
     requested_revision = selected_revision_arg(args) or (
         existing_state.requested_revision if existing_state else config.revision
     )
 
     if args.offline:
-        return verify_one_offline(root, repo_id, args, existing_state), False, requested_revision
+        return verify_one_offline(root, repo_id, args, existing_state)
 
     upstream_snapshot = get_snapshot(selected_hub, repo_id, args.repo_type, requested_revision)
     resolved_commit = existing_state.resolved_commit if existing_state and existing_state.resolved_commit else upstream_snapshot.resolved_commit
@@ -403,18 +416,15 @@ def verify_one_locked(config: Config, repo_id: str, args, selected_hub, root: Pa
     )
     write_verification_state(root, state)
 
-    if args.repair and not state.clean:
-        return 0, True, requested_revision
-
     if audit is not None and not audit.ok:
         print(f"verification failed: {repo_id}{upstream_change_suffix(state)}")
-        return 1, False, requested_revision
+        return 1
     if result.ok:
         mode = "quick" if args.quick else "full"
         print(f"verified ({mode}): {repo_id}{upstream_change_suffix(state)}")
-        return 0, False, requested_revision
+        return 0
     print(f"verification failed: {repo_id}{upstream_change_suffix(state)}")
-    return 1, False, requested_revision
+    return 1
 
 
 def upstream_change_suffix(state) -> str:

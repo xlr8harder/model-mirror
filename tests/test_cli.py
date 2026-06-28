@@ -498,7 +498,7 @@ def test_verify_writes_dirty_verification_state(tmp_path, capsys):
     assert "missing.bin" in state.repair_paths
 
 
-def test_verify_repair_repairs_dirty_archive(tmp_path, capsys):
+def test_verify_then_repair_repairs_dirty_archive(tmp_path, capsys):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
     archive = tmp_path / "models" / "org" / "model"
@@ -506,12 +506,21 @@ def test_verify_repair_repairs_dirty_archive(tmp_path, capsys):
     (archive / "config.json").write_text("{}", encoding="utf-8")
     hub = FakeHub([FakeFile("missing.bin", 3)])
 
-    rc = main(["--config", str(config_path), "verify", "--quick", "--repair", "org/model"], hub=hub)
+    verify_rc = main(["--config", str(config_path), "verify", "--quick", "org/model"], hub=hub)
+    repair_rc = main(["--config", str(config_path), "repair", "org/model"], hub=hub)
 
-    assert rc == 0
+    assert verify_rc == 1
+    assert repair_rc == 0
     assert (archive / "missing.bin").read_bytes() == b"xxx"
     assert "repaired: org/model" in capsys.readouterr().out
     assert read_verification_state(archive).status == "clean"
+
+
+def test_verify_rejects_repair_option(tmp_path):
+    config_path = tmp_path / "config.yaml"
+
+    with pytest.raises(SystemExit):
+        main(["--config", str(config_path), "verify", "--repair", "org/model"])
 
 
 def test_full_verify_detects_tampering_when_checksums_already_exist(tmp_path, capsys):
@@ -551,7 +560,7 @@ def test_full_verify_refreshes_when_existing_checksums_are_clean(tmp_path, capsy
     assert "verified (full)" in capsys.readouterr().out
 
 
-def test_verify_repair_hashes_unchanged_files_once(tmp_path, monkeypatch, capsys):
+def test_verify_then_repair_hashes_unchanged_files_once(tmp_path, monkeypatch, capsys):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
     archive = tmp_path / "models" / "org" / "model"
@@ -575,9 +584,11 @@ def test_verify_repair_hashes_unchanged_files_once(tmp_path, monkeypatch, capsys
 
     monkeypatch.setattr(checksums_module, "sha256_file", tracking_sha)
 
-    rc = main(["--config", str(config_path), "verify", "--repair", "org/model"], hub=hub)
+    verify_rc = main(["--config", str(config_path), "verify", "org/model"], hub=hub)
+    repair_rc = main(["--config", str(config_path), "repair", "org/model"], hub=hub)
 
-    assert rc == 0
+    assert verify_rc == 1
+    assert repair_rc == 0
     assert "repaired: org/model" in capsys.readouterr().out
     assert calls.count("good.bin") == 1
     assert calls.count("bad.bin") == 2
@@ -683,6 +694,88 @@ def test_repair_command_returns_failure_when_repair_is_incomplete(tmp_path, caps
 
     assert rc == 1
     assert "incomplete" in capsys.readouterr().out
+
+
+def test_repair_all_repairs_each_model_with_verification_state(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    for repo in ("one/model", "two/model"):
+        archive = tmp_path / "models" / repo
+        archive.mkdir(parents=True)
+        (archive / "config.json").write_text("{}", encoding="utf-8")
+        write_verification_state(
+            archive,
+            VerificationState(status="dirty", repo_id=repo, repair_paths=["missing.bin"]),
+        )
+    hub = FakeHub([FakeFile("missing.bin", 3)])
+
+    rc = main(["--config", str(config_path), "repair", "--all"], hub=hub)
+
+    output = capsys.readouterr().out
+    assert rc == 0
+    assert "repaired: one/model" in output
+    assert "repaired: two/model" in output
+    assert (tmp_path / "models" / "one" / "model" / "missing.bin").exists()
+    assert (tmp_path / "models" / "two" / "model" / "missing.bin").exists()
+
+
+def test_repair_all_skips_busy_model_and_continues(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    busy_archive = tmp_path / "models" / "busy" / "model"
+    busy_archive.mkdir(parents=True)
+    write_verification_state(
+        busy_archive,
+        VerificationState(status="dirty", repo_id="busy/model", repair_paths=["missing.bin"]),
+    )
+    ok_archive = tmp_path / "models" / "ok" / "model"
+    ok_archive.mkdir(parents=True)
+    (ok_archive / "config.json").write_text("{}", encoding="utf-8")
+    write_verification_state(
+        ok_archive,
+        VerificationState(status="dirty", repo_id="ok/model", repair_paths=["missing.bin"]),
+    )
+    hub = FakeHub([FakeFile("missing.bin", 3)])
+
+    with ModelLock(busy_archive, "mirror", "busy/model"):
+        rc = main(["--config", str(config_path), "repair", "--all"], hub=hub)
+
+    output = capsys.readouterr().out
+    assert rc == 1
+    assert "skipped busy: busy/model" in output
+    assert "command=mirror" in output
+    assert "repaired: ok/model" in output
+
+
+def test_repair_all_returns_failure_when_any_model_needs_verify(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    missing_state_archive = tmp_path / "models" / "missing" / "state"
+    missing_state_archive.mkdir(parents=True)
+    ok_archive = tmp_path / "models" / "ok" / "model"
+    ok_archive.mkdir(parents=True)
+    (ok_archive / "config.json").write_text("{}", encoding="utf-8")
+    write_verification_state(
+        ok_archive,
+        VerificationState(status="dirty", repo_id="ok/model", repair_paths=["missing.bin"]),
+    )
+    hub = FakeHub([FakeFile("missing.bin", 3)])
+
+    rc = main(["--config", str(config_path), "repair", "--all"], hub=hub)
+
+    output = capsys.readouterr().out
+    assert rc == 1
+    assert "verify-required: missing/state" in output
+    assert "repaired: ok/model" in output
+
+
+def test_repair_rejects_missing_or_conflicting_targets(tmp_path):
+    config_path = tmp_path / "config.yaml"
+
+    with pytest.raises(SystemExit):
+        main(["--config", str(config_path), "repair"])
+    with pytest.raises(SystemExit):
+        main(["--config", str(config_path), "repair", "--all", "org/model"])
 
 
 def test_update_command_forces_mirror(tmp_path, capsys):
