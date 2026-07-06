@@ -76,7 +76,7 @@ class StreamingFakeHub(FakeHub):
             files=self.metadata,
         )
 
-    def download_snapshot(self, snapshot, local_dir, allow_patterns=None):
+    def download_snapshot(self, snapshot, local_dir, allow_patterns=None, stall_timeout_seconds=None):
         self.downloads.append((snapshot.repo_id, snapshot.repo_type, snapshot.resolved_commit, local_dir, allow_patterns))
         for item in self.metadata:
             path = local_dir / item.path

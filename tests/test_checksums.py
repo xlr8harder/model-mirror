@@ -64,6 +64,25 @@ def test_file_hashes_computes_sha256_and_git_blob_sha1_in_one_call(tmp_path):
     assert hashes.git_blob_sha1 == git_blob_sha1(payload)
 
 
+def test_file_hashing_progress_callbacks_report_bytes(tmp_path):
+    payload = b"hello\n"
+    path = tmp_path / "README.md"
+    path.write_bytes(payload)
+    file_progress = []
+    prefix_progress = []
+    writer_progress = []
+
+    file_hashes(path, on_progress=file_progress.append)
+    hash_file_prefix(path, total_size=len(payload), prefix_size=len(payload), on_progress=prefix_progress.append)
+    with (tmp_path / "out.bin").open("wb") as raw:
+        writer = HashingWriter(raw, expected_size=len(payload), on_progress=writer_progress.append)
+        writer.write(payload)
+
+    assert file_progress == [len(payload)]
+    assert prefix_progress == [len(payload)]
+    assert writer_progress == [len(payload)]
+
+
 def test_hashing_writer_resets_hashes_when_http_retry_truncates(tmp_path):
     path = tmp_path / "file.bin"
     with path.open("wb") as raw:

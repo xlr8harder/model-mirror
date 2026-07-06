@@ -5,6 +5,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 
 CHECKSUMS = ".checksums"
@@ -61,10 +62,18 @@ class FileHashState:
 
 
 class HashingWriter:
-    def __init__(self, handle, *, expected_size: int, hash_state: FileHashState | None = None):
+    def __init__(
+        self,
+        handle,
+        *,
+        expected_size: int,
+        hash_state: FileHashState | None = None,
+        on_progress: Callable[[int], None] | None = None,
+    ):
         self._handle = handle
         self._expected_size = expected_size
         self._hash_state = hash_state or new_hash_state(expected_size)
+        self._on_progress = on_progress
 
     def write(self, data: bytes) -> int:
         written = self._handle.write(data)
@@ -72,6 +81,8 @@ class HashingWriter:
         self._hash_state.sha256.update(chunk)
         self._hash_state.git_blob_sha1.update(chunk)
         self._hash_state.bytes_hashed += written
+        if self._on_progress is not None:
+            self._on_progress(self._hash_state.bytes_hashed)
         return written
 
     def tell(self) -> int:
@@ -106,7 +117,13 @@ def new_hash_state(expected_size: int) -> FileHashState:
     return FileHashState(sha256=sha256, git_blob_sha1=git_blob_sha1)
 
 
-def hash_file_prefix(path: Path, *, total_size: int, prefix_size: int) -> FileHashState:
+def hash_file_prefix(
+    path: Path,
+    *,
+    total_size: int,
+    prefix_size: int,
+    on_progress: Callable[[int], None] | None = None,
+) -> FileHashState:
     state = new_hash_state(total_size)
     remaining = prefix_size
     with path.open("rb") as handle:
@@ -117,6 +134,8 @@ def hash_file_prefix(path: Path, *, total_size: int, prefix_size: int) -> FileHa
             state.sha256.update(chunk)
             state.git_blob_sha1.update(chunk)
             state.bytes_hashed += len(chunk)
+            if on_progress is not None:
+                on_progress(state.bytes_hashed)
             remaining -= len(chunk)
     return state
 
@@ -133,15 +152,19 @@ def iter_payload_files(root: Path):
         yield path
 
 
-def file_hashes(path: Path) -> FileHashes:
+def file_hashes(path: Path, *, on_progress: Callable[[int], None] | None = None) -> FileHashes:
     stat = path.stat()
     digest = hashlib.sha256()
     blob_digest = hashlib.sha1()
     blob_digest.update(f"blob {stat.st_size}\0".encode("ascii"))
+    bytes_hashed = 0
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(16 * 1024 * 1024), b""):
             digest.update(chunk)
             blob_digest.update(chunk)
+            bytes_hashed += len(chunk)
+            if on_progress is not None:
+                on_progress(bytes_hashed)
     return FileHashes(sha256=digest.hexdigest(), git_blob_sha1=blob_digest.hexdigest())
 
 

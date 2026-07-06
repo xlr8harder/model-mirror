@@ -11,6 +11,7 @@ from model_mirror.config import (
     hf_token_available,
     load_config,
     parse_bool,
+    parse_nonnegative_int,
     parse_optional_positive_int,
     parse_positive_int,
     save_config,
@@ -29,6 +30,8 @@ def test_load_config_defaults_are_safe(tmp_path, monkeypatch):
     assert config.checksum is True
     assert config.checksum_workers == 1
     assert config.download_workers == 1
+    assert config.stall_timeout_seconds == 600
+    assert config.stall_retries == 3
     assert config.verify_after_mirror is True
     assert config.hf_xet_high_performance is False
     assert config.hf_xet_reconstruct_write_sequentially is False
@@ -45,6 +48,8 @@ def test_load_config_file_and_environment_override(tmp_path, monkeypatch):
                 "revision": "abc123",
                 "checksum_workers": 2,
                 "download_workers": 3,
+                "stall_timeout_seconds": 7,
+                "stall_retries": 2,
                 "hf_xet_high_performance": True,
                 "hf_xet_reconstruct_write_sequentially": True,
                 "hf_xet_num_concurrent_range_gets": 8,
@@ -61,6 +66,8 @@ def test_load_config_file_and_environment_override(tmp_path, monkeypatch):
     assert config.revision == "abc123"
     assert config.checksum_workers == 2
     assert config.download_workers == 3
+    assert config.stall_timeout_seconds == 7
+    assert config.stall_retries == 2
     assert config.hf_xet_high_performance is True
     assert config.hf_xet_reconstruct_write_sequentially is True
     assert config.hf_xet_num_concurrent_range_gets == 8
@@ -109,6 +116,8 @@ def test_load_config_environment_overrides_more_fields(tmp_path):
             "MODEL_MIRROR_HF_XET_NUM_CONCURRENT_RANGE_GETS": "12",
             "MODEL_MIRROR_CHECKSUM_WORKERS": "3",
             "MODEL_MIRROR_DOWNLOAD_WORKERS": "4",
+            "MODEL_MIRROR_STALL_TIMEOUT": "0",
+            "MODEL_MIRROR_STALL_RETRIES": "5",
         },
     )
 
@@ -120,6 +129,8 @@ def test_load_config_environment_overrides_more_fields(tmp_path):
     assert config.hf_xet_num_concurrent_range_gets == 12
     assert config.checksum_workers == 3
     assert config.download_workers == 4
+    assert config.stall_timeout_seconds == 0
+    assert config.stall_retries == 5
 
 
 def test_save_config_writes_yaml_without_secret_values(tmp_path):
@@ -132,6 +143,8 @@ def test_save_config_writes_yaml_without_secret_values(tmp_path):
         hf_xet_num_concurrent_range_gets=4,
         checksum_workers=2,
         download_workers=3,
+        stall_timeout_seconds=9,
+        stall_retries=4,
     )
 
     save_config(config, config_path)
@@ -143,6 +156,8 @@ def test_save_config_writes_yaml_without_secret_values(tmp_path):
     assert data["hf_xet_num_concurrent_range_gets"] == 4
     assert data["checksum_workers"] == 2
     assert data["download_workers"] == 3
+    assert data["stall_timeout_seconds"] == 9
+    assert data["stall_retries"] == 4
     assert "token" not in data
 
 
@@ -340,6 +355,8 @@ def test_parse_bool_handles_common_values():
 
 def test_positive_int_parsers_handle_defaults_and_invalid_values():
     assert parse_positive_int("", default=7) == 7
+    assert parse_nonnegative_int("", default=8) == 8
+    assert parse_nonnegative_int("0", default=8) == 0
     assert parse_optional_positive_int("") is None
     assert parse_optional_positive_int("5") == 5
 
@@ -349,3 +366,10 @@ def test_positive_int_parsers_handle_defaults_and_invalid_values():
         assert "positive integer" in str(exc)
     else:
         raise AssertionError("zero should be rejected")
+
+    try:
+        parse_nonnegative_int("-1", default=1)
+    except ValueError as exc:
+        assert "zero or a positive integer" in str(exc)
+    else:
+        raise AssertionError("negative value should be rejected")

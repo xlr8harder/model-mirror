@@ -9,10 +9,20 @@ from pathlib import Path
 from .audit import audit_model
 from .card import download_card_assets
 from .checksums import MANIFEST, iter_payload_files, write_checksums, verify_checksums
-from .config import Config, REPO_TYPE_DIRS, archive_path, load_config, save_config, parse_bool, parse_positive_int
+from .config import (
+    Config,
+    REPO_TYPE_DIRS,
+    archive_path,
+    load_config,
+    parse_bool,
+    parse_nonnegative_int,
+    parse_positive_int,
+    save_config,
+)
 from .hub import HuggingFaceHub, get_snapshot
 from .lock import ModelBusyError, ModelLock, lock_label, read_active_lock
 from .mirror import mirror
+from .progress import ProgressEntry, ProgressSnapshot, progress_snapshot
 from .repair import repair
 from .state import (
     VerificationState,
@@ -42,6 +52,17 @@ CONFIG_OPTIONS = [
         "download_workers",
         "MODEL_MIRROR_DOWNLOAD_WORKERS",
         "Number of files to download concurrently. Default 1 is HDD-friendly; increase for SSD/NVMe.",
+    ),
+    (
+        "stall_timeout_seconds",
+        "MODEL_MIRROR_STALL_TIMEOUT",
+        "Abort and retry a file when no local byte progress occurs for this many seconds. "
+        "Default 600; set 0 to disable.",
+    ),
+    (
+        "stall_retries",
+        "MODEL_MIRROR_STALL_RETRIES",
+        "Number of stall-triggered resume retries per file before failing the mirror.",
     ),
     ("verify_after_mirror", None, "Whether mirror runs verification after download unless --no-verify is passed."),
     (
@@ -108,6 +129,12 @@ def build_parser() -> argparse.ArgumentParser:
     add_revision_options(mirror_parser)
     mirror_parser.add_argument("--force", action="store_true", help="download even if the local copy looks complete")
     mirror_parser.add_argument("--no-verify", action="store_true", help="skip verification after download")
+    mirror_parser.add_argument(
+        "--stall-timeout",
+        type=parse_nonnegative_int_arg,
+        metavar="SECONDS",
+        help="override stall timeout for this mirror; default 600 seconds, 0 disables timeout",
+    )
 
     card_parser = add_command_parser(
         "card",
@@ -242,6 +269,13 @@ def add_revision_options(parser: argparse.ArgumentParser) -> None:
     revision_group.add_argument("--commit", help="commit SHA to use")
 
 
+def parse_nonnegative_int_arg(value: str) -> int:
+    try:
+        return parse_nonnegative_int(value, default=0)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def selected_revision_arg(args) -> str | None:
     return args.commit or args.revision
 
@@ -274,6 +308,7 @@ def main(argv: list[str] | None = None, *, hub=None) -> int:
                 revision=selected_revision_arg(args),
                 force=args.force,
                 verify_after=config.verify_after_mirror and not args.no_verify,
+                stall_timeout_seconds=args.stall_timeout,
             )
             print(f"{result.status}: {args.model} -> {result.path}")
             return mirror_exit_code(result.status)
@@ -330,6 +365,8 @@ def handle_config(args, config: Config, config_path: Path | None) -> int:
         print(f"checksum: {config.checksum}")
         print(f"checksum_workers: {config.checksum_workers}")
         print(f"download_workers: {config.download_workers}")
+        print(f"stall_timeout_seconds: {config.stall_timeout_seconds}")
+        print(f"stall_retries: {config.stall_retries}")
         print(f"verify_after_mirror: {config.verify_after_mirror}")
         print(f"hf_xet_high_performance: {config.hf_xet_high_performance}")
         print(f"hf_xet_reconstruct_write_sequentially: {config.hf_xet_reconstruct_write_sequentially}")
@@ -366,6 +403,8 @@ def handle_config_options(config: Config) -> int:
         "checksum": config.checksum,
         "checksum_workers": config.checksum_workers,
         "download_workers": config.download_workers,
+        "stall_timeout_seconds": config.stall_timeout_seconds,
+        "stall_retries": config.stall_retries,
         "verify_after_mirror": config.verify_after_mirror,
         "hf_xet_high_performance": config.hf_xet_high_performance,
         "hf_xet_reconstruct_write_sequentially": config.hf_xet_reconstruct_write_sequentially,
@@ -396,6 +435,10 @@ def set_config_value(config: Config, key: str, value: str) -> None:
         config.checksum_workers = parse_positive_int(value, default=1)
     elif normalized == "download_workers":
         config.download_workers = parse_positive_int(value, default=1)
+    elif normalized in {"stall_timeout", "stall_timeout_seconds"}:
+        config.stall_timeout_seconds = parse_nonnegative_int(value, default=600)
+    elif normalized == "stall_retries":
+        config.stall_retries = parse_nonnegative_int(value, default=3)
     elif normalized in {"verify_after_mirror", "audit_after_mirror"}:
         config.verify_after_mirror = parse_bool(value)
     elif normalized == "hf_xet_high_performance":
@@ -430,7 +473,8 @@ def handle_list(config: Config) -> int:
                 state = read_verification_state(repo)
                 active_lock = read_active_lock(repo)
                 total_size = mirror_payload_size(repo)
-                entries.append((repo, state, active_lock, total_size))
+                progress = progress_snapshot(repo, stall_timeout_seconds=config.stall_timeout_seconds)
+                entries.append((repo, state, active_lock, total_size, progress))
     entries.sort(key=lambda entry: entry[0].relative_to(archive_root).as_posix())
 
     total_size = sum(entry[3] for entry in entries)
@@ -444,7 +488,7 @@ def handle_list(config: Config) -> int:
         f"mirror_metadata={format_bytes(cache_usage.mirror_cache)}"
     )
 
-    for model, state, active_lock, total_size in entries:
+    for model, state, active_lock, total_size, progress in entries:
         rel_path = model.relative_to(archive_root).as_posix()
         fields = [
             rel_path,
@@ -453,7 +497,7 @@ def handle_list(config: Config) -> int:
         if state is not None:
             fields.extend(
                 [
-                    f"state={','.join(list_state_tags(state, active_lock))}",
+                    f"state={','.join(list_state_tags(state, active_lock, progress))}",
                     f"last_check={verification_age_label(state.checked_at_utc)}",
                 ]
             )
@@ -462,6 +506,9 @@ def handle_list(config: Config) -> int:
         print("  ".join(fields))
         if active_lock is not None:
             print(f"  lock: {format_lock_detail(active_lock)}")
+        progress_detail = format_progress_detail(progress)
+        if progress_detail is not None:
+            print(f"  progress: {progress_detail}")
     return 0
 
 
@@ -566,7 +613,55 @@ def format_lock_detail(info: dict | None) -> str:
     return " ".join(parts) if parts else "lock held"
 
 
-def list_state_tags(state, active_lock: dict | None) -> list[str]:
+def format_progress_detail(progress: ProgressSnapshot) -> str | None:
+    if not progress.active:
+        return None
+    entry = selected_progress_entry(progress.entries)
+    parts = [
+        f"active={len(progress.entries)}",
+        f"path={shorten_path(entry.path)}",
+        f"stage={entry.stage}",
+        f"bytes={format_progress_bytes(entry)}",
+    ]
+    rate = format_rate(entry.rate_bytes_per_second)
+    if rate is not None:
+        parts.append(f"rate={rate}")
+    if entry.idle_seconds is not None:
+        parts.append(f"idle={format_age_seconds(entry.idle_seconds)}")
+    if progress.stalled_count:
+        parts.append(f"stalled={progress.stalled_count}")
+    if entry.source != "heartbeat":
+        parts.append(f"source={entry.source}")
+    return " ".join(parts)
+
+
+def selected_progress_entry(entries: list[ProgressEntry]) -> ProgressEntry:
+    stalled = [entry for entry in entries if entry.stalled]
+    if stalled:
+        return max(stalled, key=lambda entry: entry.idle_seconds or 0)
+    return sorted(entries, key=lambda entry: entry.path)[0]
+
+
+def format_progress_bytes(entry: ProgressEntry) -> str:
+    if entry.bytes_total:
+        percent = (entry.bytes_done / entry.bytes_total) * 100
+        return f"{format_bytes(entry.bytes_done)}/{format_bytes(entry.bytes_total)}({percent:.1f}%)"
+    return format_bytes(entry.bytes_done)
+
+
+def format_rate(rate: float | None) -> str | None:
+    if rate is None:
+        return None
+    return f"{format_bytes(int(rate))}/s"
+
+
+def shorten_path(path: str, *, max_length: int = 48) -> str:
+    if len(path) <= max_length:
+        return path
+    return f"...{path[-(max_length - 3):]}"
+
+
+def list_state_tags(state, active_lock: dict | None, progress: ProgressSnapshot | None = None) -> list[str]:
     tags = [primary_state_tag(state)]
     if state.offline_only:
         append_unique(tags, "offline")
@@ -576,6 +671,8 @@ def list_state_tags(state, active_lock: dict | None) -> list[str]:
         append_unique(tags, "upstream-unavailable")
     if active_lock is not None:
         append_unique(tags, "busy")
+    if progress is not None and progress.any_stalled:
+        append_unique(tags, "stalled")
     return tags
 
 

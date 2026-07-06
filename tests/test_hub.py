@@ -2,6 +2,7 @@ import hashlib
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,6 +17,7 @@ from model_mirror.hub import (
     HubFile,
     HubSnapshot,
     HuggingFaceHub,
+    StallTimeoutError,
     compatible_snapshot_plan,
     download_staging_dir,
     prune_incomplete_downloads,
@@ -24,6 +26,7 @@ from model_mirror.hub import (
     write_snapshot_plan,
     cached_manifest_verifies,
 )
+from model_mirror.progress import ProgressRecorder, progress_snapshot
 
 
 def sha256(payload: bytes) -> str:
@@ -64,7 +67,7 @@ def test_huggingface_hub_adapter_uses_configured_environment(tmp_path, monkeypat
             ]
             return SimpleNamespace(sha="commit123", siblings=siblings)
 
-    def fake_stream_file_to_path(snapshot, item, destination):
+    def fake_stream_file_to_path(snapshot, item, destination, **kwargs):
         captured["snapshot"] = snapshot
         captured["destination_root"] = destination.parents[len(Path(item.path).parents) - 1]
         captured["xet"] = os.environ["HF_XET_HIGH_PERFORMANCE"]
@@ -135,7 +138,7 @@ def test_huggingface_hub_snapshot_download_uses_ephemeral_staging_cache(tmp_path
                 ],
             )
 
-    def fake_stream_file_to_path(snapshot, item, destination):
+    def fake_stream_file_to_path(snapshot, item, destination, **kwargs):
         captured["local_dir"] = download_staging_dir(
             Config(directory=archive),
             snapshot.repo_id,
@@ -215,7 +218,7 @@ def test_huggingface_hub_snapshot_download_prunes_incomplete_local_dir_chunks(tm
                 ],
             )
 
-    def fake_stream_file_to_path(snapshot, item, destination):
+    def fake_stream_file_to_path(snapshot, item, destination, **kwargs):
         captured["stale_removed_before_download"] = not stale.exists()
         captured["staged_stale_removed_before_download"] = not staged_stale.exists()
         destination.write_bytes(payload)
@@ -329,7 +332,7 @@ def test_stream_file_to_path_resumes_xet_incomplete_from_hashed_prefix(tmp_path,
         lambda snapshot, item: (SimpleNamespace(size=len(payload), xet_file_data=object()), {}, "unused"),
     )
 
-    def fake_stream_xet_file(xet_file_data, headers, writer, expected_size, rel, resume_size):
+    def fake_stream_xet_file(xet_file_data, headers, writer, expected_size, rel, resume_size, **kwargs):
         calls.append((expected_size, rel, resume_size))
         writer.write(payload[resume_size:])
 
@@ -359,7 +362,7 @@ def test_stream_file_to_path_retries_corrupt_partial_from_zero(tmp_path, monkeyp
         lambda snapshot, item: (SimpleNamespace(size=len(payload), xet_file_data=object()), {}, "unused"),
     )
 
-    def fake_stream_xet_file(xet_file_data, headers, writer, expected_size, rel, resume_size):
+    def fake_stream_xet_file(xet_file_data, headers, writer, expected_size, rel, resume_size, **kwargs):
         starts.append(resume_size)
         writer.write(payload[resume_size:])
 
@@ -371,6 +374,66 @@ def test_stream_file_to_path_retries_corrupt_partial_from_zero(tmp_path, monkeyp
     assert destination.read_bytes() == payload
     assert not partial.exists()
     assert hashes.sha256 == sha256(payload)
+
+
+def test_stream_file_to_path_retries_stalled_download_from_partial(tmp_path, monkeypatch):
+    payload = b"abcdef"
+    snapshot = HubSnapshot("org/model", "model", "main", "commit123", [])
+    item = HubFile("file.bin", len(payload), lfs_sha256=sha256(payload), blob_id="pointer")
+    destination = tmp_path / "file.bin"
+    starts = []
+
+    monkeypatch.setattr(
+        hub_module,
+        "hf_transport_metadata",
+        lambda snapshot, item: (SimpleNamespace(size=len(payload), xet_file_data=object()), {}, "unused"),
+    )
+
+    def flaky_xet(xet_file_data, headers, writer, expected_size, rel, resume_size, **kwargs):
+        starts.append(resume_size)
+        if len(starts) == 1:
+            writer.write(payload[:2])
+            raise StallTimeoutError("stalled")
+        writer.write(payload[resume_size:])
+
+    monkeypatch.setattr(hub_module, "stream_xet_file", flaky_xet)
+
+    recorder = ProgressRecorder(tmp_path, min_interval_seconds=0, min_bytes=1)
+    progress = recorder.track(item.path, total=item.size, stage="starting")
+    hashes = hub_module.stream_file_to_path(snapshot, item, destination, progress=progress, stall_retries=3)
+
+    assert starts == [0, 2]
+    assert destination.read_bytes() == payload
+    assert hashes.sha256 == sha256(payload)
+    assert progress_snapshot(tmp_path).entries[0].stage == "verifying"
+
+
+def test_stream_file_to_path_fails_after_stall_retry_limit(tmp_path, monkeypatch):
+    payload = b"abcdef"
+    snapshot = HubSnapshot("org/model", "model", "main", "commit123", [])
+    item = HubFile("file.bin", len(payload), lfs_sha256=sha256(payload), blob_id="pointer")
+    destination = tmp_path / "file.bin"
+    attempts = []
+
+    monkeypatch.setattr(
+        hub_module,
+        "hf_transport_metadata",
+        lambda snapshot, item: (SimpleNamespace(size=len(payload), xet_file_data=object()), {}, "unused"),
+    )
+
+    def stalled_xet(xet_file_data, headers, writer, expected_size, rel, resume_size, **kwargs):
+        attempts.append(resume_size)
+        if resume_size < len(payload):
+            writer.write(payload[resume_size : resume_size + 1])
+        raise StallTimeoutError("stalled")
+
+    monkeypatch.setattr(hub_module, "stream_xet_file", stalled_xet)
+
+    with pytest.raises(StallTimeoutError):
+        hub_module.stream_file_to_path(snapshot, item, destination, stall_retries=2)
+
+    assert attempts == [0, 1, 2]
+    assert hub_module.incomplete_path_for(destination).read_bytes() == payload[:3]
 
 
 def test_stream_snapshot_hashes_existing_final_file_after_restart(tmp_path, monkeypatch):
@@ -506,7 +569,7 @@ def test_stream_snapshot_redownloads_corrupt_existing_file(tmp_path, monkeypatch
     local_dir.mkdir(parents=True)
     (local_dir / "file.bin").write_bytes(b"xxxx")
 
-    def fake_stream_file_to_path(snapshot, item, destination):
+    def fake_stream_file_to_path(snapshot, item, destination, **kwargs):
         destination.write_bytes(payload)
         return file_hashes(destination)
 
@@ -526,7 +589,7 @@ def test_stream_snapshot_filters_allow_patterns(tmp_path, monkeypatch):
     local_dir = tmp_path / "models" / "org" / "model"
     seen = []
 
-    def fake_stream_file_to_path(snapshot, item, destination):
+    def fake_stream_file_to_path(snapshot, item, destination, **kwargs):
         seen.append(item.path)
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(payload)
@@ -558,7 +621,7 @@ def test_stream_snapshot_can_download_multiple_files_concurrently(tmp_path, monk
     seen = []
     lock = threading.Lock()
 
-    def fake_stream_file_to_path(snapshot, item, destination):
+    def fake_stream_file_to_path(snapshot, item, destination, **kwargs):
         with lock:
             seen.append(item.path)
         barrier.wait()
@@ -598,7 +661,7 @@ def test_stream_snapshot_parallel_failure_keeps_completed_manifest_rows(tmp_path
     local_dir = tmp_path / "models" / "org" / "model"
     release_good = threading.Event()
 
-    def fake_stream_file_to_path(snapshot, item, destination):
+    def fake_stream_file_to_path(snapshot, item, destination, **kwargs):
         if item.path == "bad.bin":
             release_good.set()
             raise DownloadIntegrityError("bad download")
@@ -638,7 +701,7 @@ def test_stream_snapshot_deletes_corrupt_legacy_staged_file_and_redownloads(tmp_
     staged.parent.mkdir(parents=True)
     staged.write_bytes(b"xxxx")
 
-    def fake_stream_file_to_path(snapshot, item, destination):
+    def fake_stream_file_to_path(snapshot, item, destination, **kwargs):
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(payload)
         return file_hashes(destination)
@@ -664,10 +727,31 @@ def test_stream_file_to_path_promotes_complete_incomplete_file(tmp_path, monkeyp
 
     monkeypatch.setattr(hub_module, "hf_transport_metadata", fail_transport)
 
-    hashes = hub_module.stream_file_to_path(snapshot, item, destination)
+    recorder = ProgressRecorder(tmp_path, min_interval_seconds=0, min_bytes=1)
+    progress = recorder.track(item.path, total=item.size, stage="starting")
+    hashes = hub_module.stream_file_to_path(snapshot, item, destination, progress=progress)
 
     assert destination.read_bytes() == payload
     assert not partial.exists()
+    assert hashes.sha256 == sha256(payload)
+    assert progress_snapshot(tmp_path).entries[0].stage == "verifying-partial"
+
+
+def test_stream_file_to_path_promotes_complete_incomplete_file_without_progress(tmp_path, monkeypatch):
+    payload = b"abcdef"
+    snapshot = HubSnapshot("org/model", "model", "main", "commit123", [])
+    item = HubFile("file.bin", len(payload), lfs_sha256=sha256(payload), blob_id="pointer")
+    destination = tmp_path / "file.bin"
+    hub_module.incomplete_path_for(destination).write_bytes(payload)
+
+    def fail_transport(snapshot, item):
+        raise AssertionError("complete partial should not fetch metadata")
+
+    monkeypatch.setattr(hub_module, "hf_transport_metadata", fail_transport)
+
+    hashes = hub_module.stream_file_to_path(snapshot, item, destination)
+
+    assert destination.read_bytes() == payload
     assert hashes.sha256 == sha256(payload)
 
 
@@ -702,7 +786,7 @@ def test_stream_file_to_path_rejects_short_download(tmp_path, monkeypatch):
         lambda snapshot, item: (SimpleNamespace(size=len(payload), xet_file_data=object()), {}, "unused"),
     )
 
-    def short_xet(xet_file_data, headers, writer, expected_size, rel, resume_size):
+    def short_xet(xet_file_data, headers, writer, expected_size, rel, resume_size, **kwargs):
         writer.write(b"ab")
 
     monkeypatch.setattr(hub_module, "stream_xet_file", short_xet)
@@ -724,17 +808,20 @@ def test_stream_file_to_path_uses_http_when_xet_metadata_is_absent(tmp_path, mon
         lambda snapshot, item: (SimpleNamespace(size=len(payload), xet_file_data=None), {"h": "v"}, "https://cdn/file"),
     )
 
-    def fake_stream_http_file(url, headers, writer, expected_size, rel, resume_size):
+    def fake_stream_http_file(url, headers, writer, expected_size, rel, resume_size, **kwargs):
         calls.append((url, headers, expected_size, rel, resume_size))
         writer.write(payload)
 
     monkeypatch.setattr(hub_module, "stream_http_file", fake_stream_http_file)
 
-    hashes = hub_module.stream_file_to_path(snapshot, item, destination)
+    recorder = ProgressRecorder(tmp_path, min_interval_seconds=0, min_bytes=1)
+    progress = recorder.track(item.path, total=item.size, stage="starting")
+    hashes = hub_module.stream_file_to_path(snapshot, item, destination, progress=progress)
 
     assert calls == [("https://cdn/file", {"h": "v"}, len(payload), "file.bin", 0)]
     assert destination.read_bytes() == payload
     assert hashes.sha256 == sha256(payload)
+    assert progress_snapshot(tmp_path).entries[0].stage == "verifying"
 
 
 def test_resumable_prefix_size_handles_missing_and_oversized_partials(tmp_path):
@@ -882,6 +969,7 @@ def test_stream_xet_file_writes_ordered_chunks(monkeypatch, tmp_path):
             6,
             "file.bin",
             3,
+            stall_timeout_seconds=0,
         )
 
     assert path.read_bytes() == b"abc"
@@ -915,9 +1003,133 @@ def test_stream_xet_file_aborts_on_keyboard_interrupt(monkeypatch, tmp_path):
     with (tmp_path / "out.bin").open("wb") as raw:
         writer = HashingWriter(raw, expected_size=1)
         with pytest.raises(KeyboardInterrupt):
-            hub_module.stream_xet_file(SimpleNamespace(refresh_route="refresh", file_hash="hash"), {}, writer, 1, "file.bin", 0)
+            hub_module.stream_xet_file(
+                SimpleNamespace(refresh_route="refresh", file_hash="hash"),
+                {},
+                writer,
+                1,
+                "file.bin",
+                0,
+                stall_timeout_seconds=0,
+            )
 
     assert aborted == [True]
+
+
+def test_stream_xet_file_converts_watchdog_abort_to_stall(monkeypatch, tmp_path):
+    import huggingface_hub.utils._xet as xet_utils
+    from model_mirror.checksums import HashingWriter
+
+    class RaisingStream:
+        def __iter__(self):
+            raise RuntimeError("aborted")
+
+    class FakeGroup:
+        def download_stream(self, file_info, start=None):
+            return RaisingStream()
+
+    class FakeSession:
+        def new_download_stream_group(self, **kwargs):
+            return FakeGroup()
+
+    class FakeWatchdog:
+        stalled = True
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def progress(self):
+            pass
+
+        def raise_if_stalled(self):
+            pass
+
+    monkeypatch.setattr(xet_utils, "get_xet_session", lambda: FakeSession())
+    monkeypatch.setattr(xet_utils, "xet_headers_without_auth", lambda headers: {})
+    monkeypatch.setattr(hub_module, "StallWatchdog", FakeWatchdog)
+    with (tmp_path / "out.bin").open("wb") as raw:
+        writer = HashingWriter(raw, expected_size=1)
+        with pytest.raises(StallTimeoutError, match="stalled download"):
+            hub_module.stream_xet_file(
+                SimpleNamespace(refresh_route="refresh", file_hash="hash"),
+                {},
+                writer,
+                1,
+                "file.bin",
+                0,
+                stall_timeout_seconds=1,
+            )
+
+
+def test_stream_xet_file_reraises_non_stall_errors(monkeypatch, tmp_path):
+    import huggingface_hub.utils._xet as xet_utils
+    from model_mirror.checksums import HashingWriter
+
+    class RaisingStream:
+        def __iter__(self):
+            raise RuntimeError("not stalled")
+
+    class FakeGroup:
+        def download_stream(self, file_info, start=None):
+            return RaisingStream()
+
+    class FakeSession:
+        def new_download_stream_group(self, **kwargs):
+            return FakeGroup()
+
+    monkeypatch.setattr(xet_utils, "get_xet_session", lambda: FakeSession())
+    monkeypatch.setattr(xet_utils, "xet_headers_without_auth", lambda headers: {})
+    with (tmp_path / "out.bin").open("wb") as raw:
+        writer = HashingWriter(raw, expected_size=1)
+        with pytest.raises(RuntimeError, match="not stalled"):
+            hub_module.stream_xet_file(
+                SimpleNamespace(refresh_route="refresh", file_hash="hash"),
+                {},
+                writer,
+                1,
+                "file.bin",
+                0,
+                stall_timeout_seconds=0,
+            )
+
+
+def test_stall_watchdog_calls_abort_callback():
+    aborted = []
+
+    with hub_module.StallWatchdog(0.01, "file.bin", abort_callback=lambda: aborted.append(True)) as watchdog:
+        time.sleep(0.05)
+
+    assert aborted == [True]
+    assert watchdog.stalled is True
+    with pytest.raises(StallTimeoutError, match="stalled download"):
+        watchdog.raise_if_stalled()
+
+
+def test_stall_watchdog_can_be_disabled_and_refreshed():
+    with hub_module.StallWatchdog(0, "file.bin") as disabled:
+        disabled.progress()
+
+    assert disabled.stalled is False
+
+    with hub_module.StallWatchdog(0.05, "file.bin") as watchdog:
+        time.sleep(0.01)
+        watchdog.progress()
+        time.sleep(0.01)
+
+    assert watchdog.stalled is False
+
+
+def test_stall_watchdog_stalls_without_abort_callback():
+    with hub_module.StallWatchdog(0.01, "file.bin") as watchdog:
+        time.sleep(0.05)
+
+    assert watchdog.stalled is True
 
 
 def test_stream_http_file_delegates_resume_to_huggingface(monkeypatch, tmp_path):
@@ -934,13 +1146,73 @@ def test_stream_http_file_delegates_resume_to_huggingface(monkeypatch, tmp_path)
     with (tmp_path / "out.bin").open("wb") as raw:
         writer = HashingWriter(raw, expected_size=3)
         writer.write(b"a")
-        hub_module.stream_http_file("https://cdn/file", {"h": "v"}, writer, 3, "file.bin", 1)
+        hub_module.stream_http_file(
+            "https://cdn/file",
+            {"h": "v"},
+            writer,
+            3,
+            "file.bin",
+            1,
+            stall_timeout_seconds=0,
+        )
 
     assert calls[0]["url"] == "https://cdn/file"
     assert calls[0]["headers"] == {"h": "v"}
     assert calls[0]["resume_size"] == 1
     assert calls[0]["displayed_filename"] == "file.bin"
     assert (tmp_path / "out.bin").read_bytes() == b"abc"
+
+
+def test_stream_http_file_converts_download_timeout(monkeypatch, tmp_path):
+    import huggingface_hub.file_download as file_download_module
+    from huggingface_hub import constants
+    from model_mirror.checksums import HashingWriter
+
+    class ReadTimeout(Exception):
+        pass
+
+    previous_timeout = constants.HF_HUB_DOWNLOAD_TIMEOUT
+
+    def fake_http_get(**kwargs):
+        raise ReadTimeout("timed out")
+
+    monkeypatch.setattr(file_download_module, "http_get", fake_http_get)
+    with (tmp_path / "out.bin").open("wb") as raw:
+        writer = HashingWriter(raw, expected_size=3)
+        with pytest.raises(StallTimeoutError, match="stalled HTTP download"):
+            hub_module.stream_http_file(
+                "https://cdn/file",
+                {"h": "v"},
+                writer,
+                3,
+                "file.bin",
+                1,
+                stall_timeout_seconds=2,
+            )
+
+    assert constants.HF_HUB_DOWNLOAD_TIMEOUT == previous_timeout
+
+
+def test_stream_http_file_reraises_non_timeout_errors(monkeypatch, tmp_path):
+    import huggingface_hub.file_download as file_download_module
+    from model_mirror.checksums import HashingWriter
+
+    def fake_http_get(**kwargs):
+        raise ValueError("not a timeout")
+
+    monkeypatch.setattr(file_download_module, "http_get", fake_http_get)
+    with (tmp_path / "out.bin").open("wb") as raw:
+        writer = HashingWriter(raw, expected_size=3)
+        with pytest.raises(ValueError, match="not a timeout"):
+            hub_module.stream_http_file(
+                "https://cdn/file",
+                {"h": "v"},
+                writer,
+                3,
+                "file.bin",
+                1,
+                stall_timeout_seconds=2,
+            )
 
 
 def test_ensure_hashes_match_rejects_size_blob_and_missing_metadata(tmp_path):

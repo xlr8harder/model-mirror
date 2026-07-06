@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import yaml
 import pytest
+import argparse
 
 import model_mirror.checksums as checksums_module
 import model_mirror.cli as cli_module
@@ -24,6 +25,7 @@ from model_mirror.cli import (
 from model_mirror.config import Config
 from model_mirror.hub import HubSnapshot
 from model_mirror.lock import ModelLock
+from model_mirror.progress import ProgressEntry, ProgressSnapshot, progress_path
 from model_mirror.state import VerificationState, read_verification_state, write_verification_state
 
 
@@ -88,6 +90,30 @@ class MissingStoredCommitHub:
             resolved_commit="newcommit",
             files=[FakeFile("file.bin", 3)],
         )
+
+
+class ModernDownloadHub(FakeHub):
+    def __init__(self, metadata):
+        super().__init__(metadata)
+        self.stall_timeouts = []
+
+    def snapshot(self, repo_id, repo_type, revision):
+        return HubSnapshot(
+            repo_id=repo_id,
+            repo_type=repo_type,
+            requested_revision=revision,
+            resolved_commit=revision,
+            files=self.metadata,
+        )
+
+    def download_snapshot(self, snapshot, local_dir, allow_patterns=None, stall_timeout_seconds=None):
+        self.downloads.append(snapshot.repo_id)
+        self.stall_timeouts.append(stall_timeout_seconds)
+        for item in self.metadata:
+            path = local_dir / item.path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"x" * item.size)
+        return local_dir
 
 
 def test_config_directory_command_writes_config(tmp_path, capsys):
@@ -155,6 +181,17 @@ def test_mirror_command_accepts_commit_option(tmp_path):
     assert state.resolved_commit == "abc123"
 
 
+def test_mirror_command_accepts_stall_timeout_override(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    hub = ModernDownloadHub([FakeFile("file.bin", 3)])
+
+    rc = main(["--config", str(config_path), "mirror", "--no-verify", "--stall-timeout", "0", "org/model"], hub=hub)
+
+    assert rc == 0
+    assert hub.stall_timeouts == [0]
+
+
 def test_mirror_command_returns_failure_when_post_verify_is_dirty(tmp_path, capsys):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
@@ -216,6 +253,8 @@ def test_config_show_and_directory_getter(tmp_path, capsys):
     show_output = capsys.readouterr().out
     assert "directory:" in show_output
     assert "download_workers: 1" in show_output
+    assert "stall_timeout_seconds: 600" in show_output
+    assert "stall_retries: 3" in show_output
     assert str(token_path) in show_output
 
     assert main(["--config", str(config_path), "config", "directory"]) == 0
@@ -249,6 +288,10 @@ def test_config_options_describes_supported_keys(tmp_path, capsys):
     assert "MODEL_MIRROR_CHECKSUM_WORKERS" in output
     assert "download_workers:" in output
     assert "MODEL_MIRROR_DOWNLOAD_WORKERS" in output
+    assert "stall_timeout_seconds:" in output
+    assert "MODEL_MIRROR_STALL_TIMEOUT" in output
+    assert "stall_retries:" in output
+    assert "MODEL_MIRROR_STALL_RETRIES" in output
     assert "64 GB RAM" in output
     assert "hf_xet_reconstruct_write_sequentially:" in output
     assert "HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY" in output
@@ -324,6 +367,9 @@ def test_config_without_subcommand_defaults_to_options(tmp_path, capsys):
         ("checksum", "false", "checksum", False),
         ("checksum-workers", "2", "checksum_workers", 2),
         ("download-workers", "4", "download_workers", 4),
+        ("stall-timeout", "0", "stall_timeout_seconds", 0),
+        ("stall-timeout-seconds", "0", "stall_timeout_seconds", 0),
+        ("stall-retries", "5", "stall_retries", 5),
         ("verify-after-mirror", "false", "verify_after_mirror", False),
         ("hf-xet-high-performance", "true", "hf_xet_high_performance", True),
         ("hf-xet-reconstruct-write-sequentially", "true", "hf_xet_reconstruct_write_sequentially", True),
@@ -819,6 +865,43 @@ def test_list_command_prints_busy_lock(tmp_path, capsys):
     assert "started_at_utc=" in output
 
 
+def test_list_command_prints_stalled_progress(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    write_verification_state(archive, VerificationState(status="in_progress", repo_id="org/model"))
+    path = progress_path(archive)
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        """{
+  "schema": "model-mirror-progress",
+  "version": 1,
+  "active_files": {
+    "file.bin": {
+      "path": "file.bin",
+      "stage": "downloading",
+      "bytes_done": 5,
+      "bytes_total": 10,
+      "updated_at_utc": "2000-01-01T00:00:00+00:00",
+      "rate_bytes_per_second": 2
+    }
+  }
+}
+""",
+        encoding="utf-8",
+    )
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path), "stall_timeout_seconds": 600}), encoding="utf-8")
+
+    with ModelLock(archive, "mirror", "org/model"):
+        rc = main(["--config", str(config_path), "list"])
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "state=in-progress,busy,stalled" in output
+    assert "progress: active=1 path=file.bin stage=downloading bytes=5 B/10 B(50.0%) rate=2 B/s" in output
+    assert "stalled=1" in output
+
+
 def test_list_state_tags_cover_multi_tag_states():
     tags = cli_module.list_state_tags(
         VerificationState(
@@ -864,6 +947,43 @@ def test_list_format_helpers_cover_display_branches():
     assert cli_module.primary_state_tag(VerificationState(status="dirty", repo_id="org/model")) == "dirty"
     assert cli_module.primary_state_tag(VerificationState(status="in_progress", repo_id="org/model")) == "in-progress"
     assert cli_module.primary_state_tag(VerificationState(status="", repo_id="org/model")) == "unknown"
+
+    assert cli_module.parse_nonnegative_int_arg("0") == 0
+    with pytest.raises(argparse.ArgumentTypeError):
+        cli_module.parse_nonnegative_int_arg("-1")
+
+    assert cli_module.format_progress_detail(ProgressSnapshot(entries=[], source="heartbeat")) is None
+    long_path = "nested/" + ("x" * 80) + ".bin"
+    detail = cli_module.format_progress_detail(
+        ProgressSnapshot(
+            entries=[
+                ProgressEntry(
+                    path=long_path,
+                    stage="partial",
+                    bytes_done=5,
+                    bytes_total=None,
+                    updated_at_utc="",
+                    idle_seconds=None,
+                    stalled=False,
+                    source="partial-file",
+                    rate_bytes_per_second=None,
+                )
+            ],
+            source="partial-file",
+        )
+    )
+    assert "bytes=5 B" in detail
+    assert "source=partial-file" in detail
+    assert "rate=" not in detail
+    assert "path=..." in detail
+
+    selected = cli_module.selected_progress_entry(
+        [
+            ProgressEntry("b.bin", "downloading", 1, 2, "", 0, False, "heartbeat"),
+            ProgressEntry("a.bin", "downloading", 1, 2, "", 0, False, "heartbeat"),
+        ]
+    )
+    assert selected.path == "a.bin"
 
 
 def test_verify_writes_dirty_verification_state(tmp_path, capsys):

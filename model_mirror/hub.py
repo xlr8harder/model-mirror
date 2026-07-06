@@ -7,6 +7,8 @@ import os
 import re
 import shutil
 import sys
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +26,7 @@ from .checksums import (
     write_manifest,
 )
 from .config import Config, TOKEN_SETUP_HINT, apply_hf_environment, hf_token_available
+from .progress import DEFAULT_STALL_RETRIES, ProgressRecorder
 from .verify import metadata_blob_id, metadata_lfs_sha256, metadata_path
 
 
@@ -45,6 +48,10 @@ class HubSnapshot:
 
 
 class DownloadIntegrityError(RuntimeError):
+    pass
+
+
+class StallTimeoutError(TimeoutError):
     pass
 
 
@@ -83,16 +90,23 @@ class HuggingFaceHub:
         revision: str,
         local_dir: Path,
         allow_patterns: list[str] | None = None,
+        stall_timeout_seconds: int | None = None,
     ) -> Path:
         local_dir.mkdir(parents=True, exist_ok=True)
         snapshot = self.snapshot(repo_id, repo_type, revision)
-        return self.download_snapshot(snapshot, local_dir, allow_patterns=allow_patterns)
+        return self.download_snapshot(
+            snapshot,
+            local_dir,
+            allow_patterns=allow_patterns,
+            stall_timeout_seconds=stall_timeout_seconds,
+        )
 
     def download_snapshot(
         self,
         snapshot: HubSnapshot,
         local_dir: Path,
         allow_patterns: list[str] | None = None,
+        stall_timeout_seconds: int | None = None,
     ) -> Path:
         local_dir.mkdir(parents=True, exist_ok=True)
         staging_dir = download_staging_dir(
@@ -112,6 +126,10 @@ class HuggingFaceHub:
                 staging_dir,
                 allow_patterns=allow_patterns,
                 download_workers=self.config.download_workers,
+                stall_timeout_seconds=(
+                    self.config.stall_timeout_seconds if stall_timeout_seconds is None else stall_timeout_seconds
+                ),
+                stall_retries=self.config.stall_retries,
             )
         shutil.rmtree(staging_dir)
         return local_dir
@@ -248,9 +266,12 @@ def stream_snapshot(
     *,
     allow_patterns: list[str] | None,
     download_workers: int = 1,
+    stall_timeout_seconds: int = 600,
+    stall_retries: int = DEFAULT_STALL_RETRIES,
 ) -> None:
     manifest = load_manifest(local_dir)
     selected_files = filtered_snapshot_files(snapshot.files, allow_patterns)
+    progress_recorder = ProgressRecorder(local_dir)
     work = []
     for item in selected_files:
         destination = local_dir / item.path
@@ -264,13 +285,33 @@ def stream_snapshot(
     workers = max(1, download_workers)
     if workers == 1:
         for item in work:
-            row = stream_snapshot_file(snapshot, local_dir, staging_dir, item)
+            row = stream_snapshot_file(
+                snapshot,
+                local_dir,
+                staging_dir,
+                item,
+                progress_recorder=progress_recorder,
+                stall_timeout_seconds=stall_timeout_seconds,
+                stall_retries=stall_retries,
+            )
             manifest[row["path"]] = row
             write_manifest(local_dir, manifest)
         return
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = [executor.submit(stream_snapshot_file, snapshot, local_dir, staging_dir, item) for item in work]
+        futures = [
+            executor.submit(
+                stream_snapshot_file,
+                snapshot,
+                local_dir,
+                staging_dir,
+                item,
+                progress_recorder=progress_recorder,
+                stall_timeout_seconds=stall_timeout_seconds,
+                stall_retries=stall_retries,
+            )
+            for item in work
+        ]
         errors = []
         for future in as_completed(futures):
             try:
@@ -289,20 +330,40 @@ def stream_snapshot_file(
     local_dir: Path,
     staging_dir: Path,
     item: HubFile,
+    *,
+    progress_recorder: ProgressRecorder,
+    stall_timeout_seconds: int,
+    stall_retries: int,
 ) -> dict:
     destination = local_dir / item.path
-    if destination.exists() and destination.is_file():
-        row = hash_existing_file(local_dir, destination, item)
+    progress = progress_recorder.track(item.path, total=item.size, stage="starting")
+    completed = False
+    try:
+        if destination.exists() and destination.is_file():
+            row = hash_existing_file(local_dir, destination, item, progress=progress)
+            if row is not None:
+                completed = True
+                return row
+            destination.unlink()
+
+        row = promote_legacy_staged_file(local_dir, staging_dir, item, progress=progress)
         if row is not None:
+            completed = True
             return row
-        destination.unlink()
 
-    row = promote_legacy_staged_file(local_dir, staging_dir, item)
-    if row is not None:
-        return row
-
-    hashes = stream_file_to_path(snapshot, item, destination)
-    return checksum_row_from_hashes(local_dir, destination, hashes)
+        hashes = stream_file_to_path(
+            snapshot,
+            item,
+            destination,
+            progress=progress,
+            stall_timeout_seconds=stall_timeout_seconds,
+            stall_retries=stall_retries,
+        )
+        completed = True
+        return checksum_row_from_hashes(local_dir, destination, hashes)
+    finally:
+        if completed:
+            progress.finish()
 
 
 def filtered_snapshot_files(files: list[HubFile], allow_patterns: list[str] | None) -> list[HubFile]:
@@ -345,8 +406,11 @@ def hash_existing_file(
     root: Path,
     path: Path,
     item: HubFile,
+    *,
+    progress,
 ) -> dict | None:
-    hashes = file_hashes(path)
+    progress.update(0, stage="hashing-final", force=True)
+    hashes = file_hashes(path, on_progress=lambda done: progress.update(done, stage="hashing-final"))
     try:
         ensure_hashes_match(item, path, hashes)
     except DownloadIntegrityError:
@@ -358,11 +422,14 @@ def promote_legacy_staged_file(
     root: Path,
     staging_dir: Path,
     item: HubFile,
+    *,
+    progress,
 ) -> dict | None:
     staged_path = staging_dir / item.path
     if not staged_path.exists() or not staged_path.is_file():
         return None
-    hashes = file_hashes(staged_path)
+    progress.update(0, stage="hashing-staged", force=True)
+    hashes = file_hashes(staged_path, on_progress=lambda done: progress.update(done, stage="hashing-staged"))
     try:
         ensure_hashes_match(item, staged_path, hashes)
     except DownloadIntegrityError:
@@ -370,17 +437,50 @@ def promote_legacy_staged_file(
         return None
     destination = root / item.path
     destination.parent.mkdir(parents=True, exist_ok=True)
+    progress.update(staged_path.stat().st_size, stage="promoting-staged", force=True)
     staged_path.replace(destination)
     return checksum_row_from_hashes(root, destination, hashes)
 
 
-def stream_file_to_path(snapshot: HubSnapshot, item: HubFile, destination: Path) -> FileHashes:
-    try:
-        return stream_file_to_path_once(snapshot, item, destination, allow_resume=True)
-    except DownloadIntegrityError:
-        incomplete_path_for(destination).unlink(missing_ok=True)
-        destination.unlink(missing_ok=True)
-        return stream_file_to_path_once(snapshot, item, destination, allow_resume=False)
+def stream_file_to_path(
+    snapshot: HubSnapshot,
+    item: HubFile,
+    destination: Path,
+    *,
+    progress=None,
+    stall_timeout_seconds: int = 600,
+    stall_retries: int = DEFAULT_STALL_RETRIES,
+) -> FileHashes:
+    integrity_retry_used = False
+    stall_retry_count = 0
+    allow_resume = True
+    while True:
+        try:
+            return stream_file_to_path_once(
+                snapshot,
+                item,
+                destination,
+                allow_resume=allow_resume,
+                progress=progress,
+                stall_timeout_seconds=stall_timeout_seconds,
+            )
+        except StallTimeoutError:
+            if stall_retry_count >= stall_retries:
+                raise
+            stall_retry_count += 1
+            allow_resume = True
+            partial = incomplete_path_for(destination)
+            current_size = partial.stat().st_size if partial.exists() else 0
+            if progress is not None:
+                progress.update(current_size, stage=f"retrying-stall-{stall_retry_count}", force=True)
+            continue
+        except DownloadIntegrityError:
+            if integrity_retry_used:
+                raise
+            integrity_retry_used = True
+            allow_resume = False
+            incomplete_path_for(destination).unlink(missing_ok=True)
+            destination.unlink(missing_ok=True)
 
 
 def stream_file_to_path_once(
@@ -389,6 +489,8 @@ def stream_file_to_path_once(
     destination: Path,
     *,
     allow_resume: bool,
+    progress=None,
+    stall_timeout_seconds: int = 600,
 ) -> FileHashes:
     expected_size = require_expected_size(item)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -396,8 +498,21 @@ def stream_file_to_path_once(
     if not allow_resume:
         tmp_path.unlink(missing_ok=True)
     resume_size = resumable_prefix_size(tmp_path, expected_size) if allow_resume else 0
-    hash_state = hash_file_prefix(tmp_path, total_size=expected_size, prefix_size=resume_size) if resume_size else None
+    hash_state = (
+        hash_file_prefix(
+            tmp_path,
+            total_size=expected_size,
+            prefix_size=resume_size,
+            on_progress=(
+                (lambda done: progress.update(done, stage="hashing-partial")) if progress is not None else None
+            ),
+        )
+        if resume_size
+        else None
+    )
     if resume_size == expected_size:
+        if progress is not None:
+            progress.update(resume_size, stage="verifying-partial", force=True)
         hashes = hash_state.hashes if hash_state is not None else file_hashes(tmp_path)
         ensure_hashes_match(item, tmp_path, hashes)
         tmp_path.replace(destination)
@@ -411,11 +526,36 @@ def stream_file_to_path_once(
         mode = "r+b" if tmp_path.exists() else "wb"
         with tmp_path.open(mode) as raw:
             raw.seek(resume_size)
-            writer = HashingWriter(raw, expected_size=expected_size, hash_state=hash_state)
+            if progress is not None:
+                progress.update(resume_size, stage="downloading", force=True)
+            writer = HashingWriter(
+                raw,
+                expected_size=expected_size,
+                hash_state=hash_state,
+                on_progress=(
+                    (lambda done: progress.update(done, stage="downloading")) if progress is not None else None
+                ),
+            )
             if metadata.xet_file_data is not None:
-                stream_xet_file(metadata.xet_file_data, headers, writer, expected_size, item.path, resume_size)
+                stream_xet_file(
+                    metadata.xet_file_data,
+                    headers,
+                    writer,
+                    expected_size,
+                    item.path,
+                    resume_size,
+                    stall_timeout_seconds=stall_timeout_seconds,
+                )
             else:
-                stream_http_file(url_to_download, headers, writer, expected_size, item.path, resume_size)
+                stream_http_file(
+                    url_to_download,
+                    headers,
+                    writer,
+                    expected_size,
+                    item.path,
+                    resume_size,
+                    stall_timeout_seconds=stall_timeout_seconds,
+                )
             raw.flush()
             os.fsync(raw.fileno())
             hashes = writer.hashes
@@ -423,11 +563,13 @@ def stream_file_to_path_once(
             raise DownloadIntegrityError(
                 f"downloaded size mismatch for {item.path}: expected {expected_size}, got {tmp_path.stat().st_size}"
             )
+        if progress is not None:
+            progress.update(expected_size, stage="verifying", force=True)
         ensure_hashes_match(item, tmp_path, hashes)
         tmp_path.replace(destination)
         return hashes
-    except Exception:
-        if not allow_resume:
+    except Exception as exc:
+        if not allow_resume and not isinstance(exc, StallTimeoutError):
             tmp_path.unlink(missing_ok=True)
         raise
 
@@ -478,6 +620,8 @@ def stream_xet_file(
     expected_size: int,
     rel: str,
     resume_size: int,
+    *,
+    stall_timeout_seconds: int,
 ) -> None:
     from hf_xet import XetFileInfo
     from huggingface_hub.utils._xet import abort_xet_session, get_xet_session, xet_headers_without_auth
@@ -485,28 +629,40 @@ def stream_xet_file(
 
     session = get_xet_session()
     xet_headers = xet_headers_without_auth(headers)
+    watchdog = StallWatchdog(
+        stall_timeout_seconds,
+        rel,
+        abort_callback=abort_xet_session if stall_timeout_seconds > 0 else None,
+    )
     try:
-        group = session.new_download_stream_group(
-            token_refresh_url=xet_file_data.refresh_route,
-            token_refresh_headers=headers,
-            custom_headers=xet_headers,
-        )
-        stream = group.download_stream(XetFileInfo(xet_file_data.file_hash, expected_size), start=resume_size)
-        display = rel if len(rel) <= 40 else f"(…){rel[-40:]}"
-        with tqdm(
-            total=expected_size,
-            initial=resume_size,
-            unit="B",
-            unit_scale=True,
-            desc=display,
-            leave=False,
-        ) as progress:
-            for chunk in stream:
-                if chunk:
-                    writer.write(chunk)
-                    progress.update(len(chunk))
+        with watchdog:
+            group = session.new_download_stream_group(
+                token_refresh_url=xet_file_data.refresh_route,
+                token_refresh_headers=headers,
+                custom_headers=xet_headers,
+            )
+            stream = group.download_stream(XetFileInfo(xet_file_data.file_hash, expected_size), start=resume_size)
+            display = rel if len(rel) <= 40 else f"(…){rel[-40:]}"
+            with tqdm(
+                total=expected_size,
+                initial=resume_size,
+                unit="B",
+                unit_scale=True,
+                desc=display,
+                leave=False,
+            ) as progress:
+                for chunk in stream:
+                    if chunk:
+                        writer.write(chunk)
+                        watchdog.progress()
+                        progress.update(len(chunk))
+            watchdog.raise_if_stalled()
     except KeyboardInterrupt:
         abort_xet_session()
+        raise
+    except Exception as exc:
+        if watchdog.stalled:
+            raise StallTimeoutError(f"stalled download for {rel} after {stall_timeout_seconds}s") from exc
         raise
 
 
@@ -517,17 +673,74 @@ def stream_http_file(
     expected_size: int,
     rel: str,
     resume_size: int,
+    *,
+    stall_timeout_seconds: int,
 ) -> None:
     from huggingface_hub.file_download import http_get
+    from huggingface_hub import constants
 
-    http_get(
-        url=url,
-        temp_file=writer,
-        resume_size=resume_size,
-        headers=headers,
-        expected_size=expected_size,
-        displayed_filename=rel,
-    )
+    previous_timeout = constants.HF_HUB_DOWNLOAD_TIMEOUT
+    if stall_timeout_seconds > 0:
+        constants.HF_HUB_DOWNLOAD_TIMEOUT = stall_timeout_seconds
+    try:
+        http_get(
+            url=url,
+            temp_file=writer,
+            resume_size=resume_size,
+            headers=headers,
+            expected_size=expected_size,
+            displayed_filename=rel,
+            _nb_retries=0 if stall_timeout_seconds > 0 else 5,
+        )
+    except Exception as exc:
+        if stall_timeout_seconds > 0 and is_timeout_exception(exc):
+            raise StallTimeoutError(f"stalled HTTP download for {rel} after {stall_timeout_seconds}s") from exc
+        raise
+    finally:
+        constants.HF_HUB_DOWNLOAD_TIMEOUT = previous_timeout
+
+
+def is_timeout_exception(exc: Exception) -> bool:
+    return isinstance(exc, TimeoutError) or exc.__class__.__name__ in {"Timeout", "ReadTimeout", "ReadTimeoutError"}
+
+
+class StallWatchdog:
+    def __init__(self, timeout_seconds: int, rel: str, *, abort_callback=None):
+        self.timeout_seconds = timeout_seconds
+        self.rel = rel
+        self.abort_callback = abort_callback
+        self.stalled = False
+        self._last_progress = time.monotonic()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self):
+        if self.timeout_seconds > 0:
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1)
+        return False
+
+    def progress(self) -> None:
+        self._last_progress = time.monotonic()
+
+    def raise_if_stalled(self) -> None:
+        if self.stalled:
+            raise StallTimeoutError(f"stalled download for {self.rel} after {self.timeout_seconds}s")
+
+    def _run(self) -> None:
+        while not self._stop.wait(min(1.0, max(0.01, self.timeout_seconds / 10))):
+            if time.monotonic() - self._last_progress < self.timeout_seconds:
+                continue
+            self.stalled = True
+            if self.abort_callback is not None:
+                self.abort_callback()
+            return
 
 
 def ensure_hashes_match(item: HubFile, path: Path, hashes: FileHashes) -> None:

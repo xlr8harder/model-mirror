@@ -28,6 +28,7 @@ def mirror(
     revision: str | None = None,
     force: bool = False,
     verify_after: bool = True,
+    stall_timeout_seconds: int | None = None,
 ) -> MirrorResult:
     selected_type = repo_type or config.repo_type
     selected_revision = revision or config.revision
@@ -56,6 +57,7 @@ def mirror(
             existing_state=existing_state,
             force=force,
             verify_after=verify_after,
+            stall_timeout_seconds=stall_timeout_seconds,
         )
 
 
@@ -70,6 +72,7 @@ def mirror_locked(
     existing_state: VerificationState | None,
     force: bool,
     verify_after: bool,
+    stall_timeout_seconds: int | None,
 ) -> MirrorResult:
     snapshot = select_mirror_snapshot(
         selected_hub,
@@ -124,7 +127,7 @@ def mirror_locked(
     )
     destination.mkdir(parents=True, exist_ok=True)
     write_snapshot_plan(destination, snapshot)
-    download_snapshot(selected_hub, snapshot, destination)
+    download_snapshot(selected_hub, snapshot, destination, stall_timeout_seconds=stall_timeout_seconds)
     checksums_written = cached_manifest_verifies(destination, metadata)
     if config.checksum and not checksums_written:
         write_checksums(destination, max_workers=config.checksum_workers)
@@ -181,8 +184,8 @@ def select_mirror_snapshot(
     return get_snapshot(selected_hub, repo_id, selected_type, selected_revision)
 
 
-def download_snapshot(selected_hub, snapshot, destination: Path) -> None:
+def download_snapshot(selected_hub, snapshot, destination: Path, *, stall_timeout_seconds: int | None = None) -> None:
     if hasattr(selected_hub, "download_snapshot"):
-        selected_hub.download_snapshot(snapshot, destination)
+        selected_hub.download_snapshot(snapshot, destination, stall_timeout_seconds=stall_timeout_seconds)
         return
     selected_hub.snapshot_download(snapshot.repo_id, snapshot.repo_type, snapshot.resolved_commit, destination)

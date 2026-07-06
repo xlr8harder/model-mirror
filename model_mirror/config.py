@@ -25,6 +25,8 @@ class Config:
     checksum: bool = True
     checksum_workers: int = 1
     download_workers: int = 1
+    stall_timeout_seconds: int = 600
+    stall_retries: int = 3
     verify_after_mirror: bool = True
     hf_xet_high_performance: bool = False
     hf_xet_reconstruct_write_sequentially: bool = False
@@ -71,6 +73,8 @@ def load_config(path: Path | str | None = None, environ: Mapping[str, str] | Non
         checksum=parse_bool(data.get("checksum", True)),
         checksum_workers=parse_positive_int(data.get("checksum_workers", 1), default=1),
         download_workers=parse_positive_int(data.get("download_workers", 1), default=1),
+        stall_timeout_seconds=parse_nonnegative_int(data.get("stall_timeout_seconds", 600), default=600),
+        stall_retries=parse_nonnegative_int(data.get("stall_retries", 3), default=3),
         verify_after_mirror=parse_bool(
             data.get("verify_after_mirror", data.get("audit_after_mirror", True))
         ),
@@ -108,6 +112,10 @@ def load_config(path: Path | str | None = None, environ: Mapping[str, str] | Non
         config.checksum_workers = parse_positive_int(environ["MODEL_MIRROR_CHECKSUM_WORKERS"], default=1)
     if environ.get("MODEL_MIRROR_DOWNLOAD_WORKERS"):
         config.download_workers = parse_positive_int(environ["MODEL_MIRROR_DOWNLOAD_WORKERS"], default=1)
+    if environ.get("MODEL_MIRROR_STALL_TIMEOUT"):
+        config.stall_timeout_seconds = parse_nonnegative_int(environ["MODEL_MIRROR_STALL_TIMEOUT"], default=600)
+    if environ.get("MODEL_MIRROR_STALL_RETRIES"):
+        config.stall_retries = parse_nonnegative_int(environ["MODEL_MIRROR_STALL_RETRIES"], default=3)
 
     return config
 
@@ -118,6 +126,15 @@ def parse_positive_int(value: object, *, default: int) -> int:
     parsed = int(value)
     if parsed < 1:
         raise ValueError("value must be a positive integer")
+    return parsed
+
+
+def parse_nonnegative_int(value: object, *, default: int) -> int:
+    if value in {None, ""}:
+        return default
+    parsed = int(value)
+    if parsed < 0:
+        raise ValueError("value must be zero or a positive integer")
     return parsed
 
 
@@ -192,6 +209,8 @@ def save_config(config: Config, path: Path | str | None = None) -> None:
         "checksum": config.checksum,
         "checksum_workers": config.checksum_workers,
         "download_workers": config.download_workers,
+        "stall_timeout_seconds": config.stall_timeout_seconds,
+        "stall_retries": config.stall_retries,
         "verify_after_mirror": config.verify_after_mirror,
         "hf_xet_high_performance": config.hf_xet_high_performance,
         "hf_xet_reconstruct_write_sequentially": config.hf_xet_reconstruct_write_sequentially,
