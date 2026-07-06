@@ -24,6 +24,7 @@ class Config:
     revision: str = "main"
     checksum: bool = True
     checksum_workers: int = 1
+    download_workers: int = 1
     verify_after_mirror: bool = True
     hf_xet_high_performance: bool = False
     hf_xet_reconstruct_write_sequentially: bool = False
@@ -69,6 +70,7 @@ def load_config(path: Path | str | None = None, environ: Mapping[str, str] | Non
         revision=data.get("revision", "main"),
         checksum=parse_bool(data.get("checksum", True)),
         checksum_workers=parse_positive_int(data.get("checksum_workers", 1), default=1),
+        download_workers=parse_positive_int(data.get("download_workers", 1), default=1),
         verify_after_mirror=parse_bool(
             data.get("verify_after_mirror", data.get("audit_after_mirror", True))
         ),
@@ -104,6 +106,8 @@ def load_config(path: Path | str | None = None, environ: Mapping[str, str] | Non
         )
     if environ.get("MODEL_MIRROR_CHECKSUM_WORKERS"):
         config.checksum_workers = parse_positive_int(environ["MODEL_MIRROR_CHECKSUM_WORKERS"], default=1)
+    if environ.get("MODEL_MIRROR_DOWNLOAD_WORKERS"):
+        config.download_workers = parse_positive_int(environ["MODEL_MIRROR_DOWNLOAD_WORKERS"], default=1)
 
     return config
 
@@ -187,6 +191,7 @@ def save_config(config: Config, path: Path | str | None = None) -> None:
         "revision": config.revision,
         "checksum": config.checksum,
         "checksum_workers": config.checksum_workers,
+        "download_workers": config.download_workers,
         "verify_after_mirror": config.verify_after_mirror,
         "hf_xet_high_performance": config.hf_xet_high_performance,
         "hf_xet_reconstruct_write_sequentially": config.hf_xet_reconstruct_write_sequentially,
@@ -225,7 +230,7 @@ def apply_hf_environment(config: Config, environ: Mapping[str, str] | None = Non
     token_path = detect_token_path(config, base_env)
     env = dict(base_env)
     cache_dir = config.cache_dir or Path(config.directory) / ".cache"
-    tmp_dir = config.tmp_dir or Path(config.directory) / "tmp"
+    tmp_dir = config.tmp_dir or Path(config.directory) / ".tmp"
 
     env["HF_HOME"] = str(cache_dir)
     env["HF_HUB_CACHE"] = str(cache_dir / "hub")

@@ -82,7 +82,7 @@ def read_active_lock(root: Path) -> dict | None:
     path = lock_path(root)
     if not path.exists():
         return None
-    with path.open("a+", encoding="utf-8") as handle:
+    with path.open("r", encoding="utf-8") as handle:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:

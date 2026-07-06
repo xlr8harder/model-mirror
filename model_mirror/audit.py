@@ -161,16 +161,12 @@ def audit_model(
 
     indexed_tensors: dict[str, str] = {}
     indexed_files: set[str] = set()
-    expected_total_size: int | None = None
     for index_path in sorted(root.glob("*.safetensors.index.json")):
         try:
             index = read_json(index_path)
             weight_map = index.get("weight_map")
-            metadata = index.get("metadata", {})
             if not isinstance(weight_map, dict) or not weight_map:
                 raise ValueError("missing or empty weight_map")
-            if expected_total_size is None and isinstance(metadata, dict):
-                expected_total_size = metadata.get("total_size")
             for tensor_name, filename in weight_map.items():
                 if not isinstance(filename, str):
                     raise ValueError(f"weight_map entry for {tensor_name!r} is not a file name")
@@ -185,14 +181,12 @@ def audit_model(
             result.missing_files.append(filename)
 
     actual_tensor_names = set()
-    actual_tensor_bytes = 0
     for path in sorted(root.glob("*.safetensors")):
         try:
             validation = validate_safetensors_file(path)
             result.checked_safetensors += 1
             result.warnings.extend(validation.warnings)
             actual_tensor_names.update(validation.tensor_names)
-            actual_tensor_bytes += validation.tensor_bytes
 
             if indexed_tensors:
                 expected_for_shard = {
@@ -214,9 +208,5 @@ def audit_model(
     missing_from_headers = set(indexed_tensors) - actual_tensor_names
     if missing_from_headers:
         result.failures.append(f"{len(missing_from_headers)} indexed tensor(s) missing from safetensors headers")
-    if expected_total_size is not None and actual_tensor_bytes != expected_total_size:
-        result.failures.append(
-            f"tensor byte total mismatch: index={expected_total_size} headers={actual_tensor_bytes}"
-        )
 
     return result

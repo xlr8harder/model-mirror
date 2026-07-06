@@ -14,6 +14,7 @@ def test_model_lock_exit_without_handle_is_noop(tmp_path):
 
 def test_read_active_lock_returns_none_for_missing_or_unlocked_lock(tmp_path):
     assert read_active_lock(tmp_path) is None
+    assert not (tmp_path / ".verification.lock").exists()
 
     (tmp_path / ".verification.lock").write_text("", encoding="utf-8")
 

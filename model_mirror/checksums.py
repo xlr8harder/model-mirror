@@ -49,6 +49,78 @@ class FileHashes:
     git_blob_sha1: str
 
 
+@dataclass(slots=True)
+class FileHashState:
+    sha256: object
+    git_blob_sha1: object
+    bytes_hashed: int = 0
+
+    @property
+    def hashes(self) -> FileHashes:
+        return FileHashes(sha256=self.sha256.hexdigest(), git_blob_sha1=self.git_blob_sha1.hexdigest())
+
+
+class HashingWriter:
+    def __init__(self, handle, *, expected_size: int, hash_state: FileHashState | None = None):
+        self._handle = handle
+        self._expected_size = expected_size
+        self._hash_state = hash_state or new_hash_state(expected_size)
+
+    def write(self, data: bytes) -> int:
+        written = self._handle.write(data)
+        chunk = data if written == len(data) else data[:written]
+        self._hash_state.sha256.update(chunk)
+        self._hash_state.git_blob_sha1.update(chunk)
+        self._hash_state.bytes_hashed += written
+        return written
+
+    def tell(self) -> int:
+        return self._handle.tell()
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        return self._handle.seek(offset, whence)
+
+    def truncate(self, size: int | None = None) -> int:
+        truncated = self._handle.truncate(size)
+        if truncated == 0:
+            self._hash_state = new_hash_state(self._expected_size)
+        elif truncated != self._hash_state.bytes_hashed:
+            raise OSError("cannot preserve streaming hash state after non-zero truncate")
+        return truncated
+
+    def flush(self) -> None:
+        self._handle.flush()
+
+    def fileno(self) -> int:
+        return self._handle.fileno()
+
+    @property
+    def hashes(self) -> FileHashes:
+        return self._hash_state.hashes
+
+
+def new_hash_state(expected_size: int) -> FileHashState:
+    sha256 = hashlib.sha256()
+    git_blob_sha1 = hashlib.sha1()
+    git_blob_sha1.update(f"blob {expected_size}\0".encode("ascii"))
+    return FileHashState(sha256=sha256, git_blob_sha1=git_blob_sha1)
+
+
+def hash_file_prefix(path: Path, *, total_size: int, prefix_size: int) -> FileHashState:
+    state = new_hash_state(total_size)
+    remaining = prefix_size
+    with path.open("rb") as handle:
+        while remaining > 0:
+            chunk = handle.read(min(16 * 1024 * 1024, remaining))
+            if not chunk:
+                raise OSError(f"short read while hashing prefix: {path}")
+            state.sha256.update(chunk)
+            state.git_blob_sha1.update(chunk)
+            state.bytes_hashed += len(chunk)
+            remaining -= len(chunk)
+    return state
+
+
 def iter_payload_files(root: Path):
     for path in sorted(root.rglob("*")):
         if not path.is_file():
@@ -129,6 +201,10 @@ def record_is_current(row: dict | None, size: int, mtime_ns: int) -> bool:
 
 def checksum_row(root: Path, path: Path) -> dict:
     hashes = file_hashes(path)
+    return checksum_row_from_hashes(root, path, hashes)
+
+
+def checksum_row_from_hashes(root: Path, path: Path, hashes: FileHashes) -> dict:
     stat = path.stat()
     return {
         "path": path.relative_to(root).as_posix(),

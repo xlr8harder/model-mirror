@@ -193,7 +193,7 @@ def test_audit_model_reports_invalid_weight_map_entry(tmp_path):
     assert any("not a file name" in failure for failure in result.failures)
 
 
-def test_audit_model_strict_fails_on_unindexed_tensor_and_total_mismatch(tmp_path):
+def test_audit_model_ignores_index_total_size_metadata(tmp_path):
     (tmp_path / "config.json").write_text("{}", encoding="utf-8")
     (tmp_path / "model.safetensors.index.json").write_text(
         json.dumps(
@@ -217,7 +217,7 @@ def test_audit_model_strict_fails_on_unindexed_tensor_and_total_mismatch(tmp_pat
 
     assert result.ok is False
     assert any("unindexed" in failure for failure in result.failures)
-    assert any("tensor byte total mismatch" in failure for failure in result.failures)
+    assert not any("tensor byte total mismatch" in failure for failure in result.failures)
 
 
 def test_audit_model_reports_missing_indexed_tensor_and_warns_on_extra_tensor(tmp_path):

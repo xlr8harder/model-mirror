@@ -6,9 +6,11 @@ import pytest
 import model_mirror.checksums as checksums_module
 from model_mirror.checksums import (
     FileHashes,
+    HashingWriter,
     MANIFEST_SCHEMA,
     MANIFEST_VERSION,
     file_hashes,
+    hash_file_prefix,
     load_manifest,
     record_is_current,
     update_checksums,
@@ -60,6 +62,42 @@ def test_file_hashes_computes_sha256_and_git_blob_sha1_in_one_call(tmp_path):
 
     assert hashes.sha256 == hashlib.sha256(payload).hexdigest()
     assert hashes.git_blob_sha1 == git_blob_sha1(payload)
+
+
+def test_hashing_writer_resets_hashes_when_http_retry_truncates(tmp_path):
+    path = tmp_path / "file.bin"
+    with path.open("wb") as raw:
+        writer = HashingWriter(raw, expected_size=3)
+        writer.write(b"bad")
+        writer.seek(0)
+        writer.truncate()
+        writer.write(b"abc")
+        hashes = writer.hashes
+
+    assert path.read_bytes() == b"abc"
+    assert hashes.sha256 == hashlib.sha256(b"abc").hexdigest()
+    assert hashes.git_blob_sha1 == git_blob_sha1(b"abc")
+
+
+def test_hashing_writer_delegates_file_methods_and_rejects_nonzero_truncate(tmp_path):
+    path = tmp_path / "file.bin"
+    with path.open("wb") as raw:
+        writer = HashingWriter(raw, expected_size=4)
+        writer.write(b"abcd")
+        assert writer.tell() == 4
+        writer.flush()
+        assert writer.fileno() == raw.fileno()
+        assert writer.truncate(4) == 4
+        with pytest.raises(OSError, match="non-zero truncate"):
+            writer.truncate(2)
+
+
+def test_hash_file_prefix_rejects_short_read(tmp_path):
+    path = tmp_path / "file.bin"
+    path.write_bytes(b"abc")
+
+    with pytest.raises(OSError, match="short read"):
+        hash_file_prefix(path, total_size=4, prefix_size=4)
 
 
 def test_write_checksums_skips_current_manifest_records(tmp_path, monkeypatch):

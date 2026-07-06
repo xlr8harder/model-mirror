@@ -128,6 +128,19 @@ def test_mirror_command_uses_injected_hub(tmp_path, capsys):
     assert "downloaded" in capsys.readouterr().out
 
 
+def test_card_command_uses_injected_hub_for_dataset(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    hub = FakeHub([FakeFile("README.md", 2), FakeFile("data.bin", 3)])
+
+    rc = main(["--config", str(config_path), "card", "--repo-type", "dataset", "org/data"], hub=hub)
+
+    assert rc == 0
+    assert hub.downloads == ["org/data", "org/data"]
+    assert "downloaded: org/data" in capsys.readouterr().out
+    assert (tmp_path / "datasets" / "org" / "data" / "README.md").exists()
+
+
 def test_mirror_command_accepts_commit_option(tmp_path):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
@@ -202,6 +215,7 @@ def test_config_show_and_directory_getter(tmp_path, capsys):
     assert main(["--config", str(config_path), "config", "show"]) == 0
     show_output = capsys.readouterr().out
     assert "directory:" in show_output
+    assert "download_workers: 1" in show_output
     assert str(token_path) in show_output
 
     assert main(["--config", str(config_path), "config", "directory"]) == 0
@@ -233,6 +247,8 @@ def test_config_options_describes_supported_keys(tmp_path, capsys):
     assert "Archive root" in output
     assert "checksum_workers:" in output
     assert "MODEL_MIRROR_CHECKSUM_WORKERS" in output
+    assert "download_workers:" in output
+    assert "MODEL_MIRROR_DOWNLOAD_WORKERS" in output
     assert "64 GB RAM" in output
     assert "hf_xet_reconstruct_write_sequentially:" in output
     assert "HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY" in output
@@ -307,6 +323,7 @@ def test_config_without_subcommand_defaults_to_options(tmp_path, capsys):
         ("revision", "rev", "revision", "rev"),
         ("checksum", "false", "checksum", False),
         ("checksum-workers", "2", "checksum_workers", 2),
+        ("download-workers", "4", "download_workers", 4),
         ("verify-after-mirror", "false", "verify_after_mirror", False),
         ("hf-xet-high-performance", "true", "hf_xet_high_performance", True),
         ("hf-xet-reconstruct-write-sequentially", "true", "hf_xet_reconstruct_write_sequentially", True),
@@ -656,11 +673,131 @@ def test_list_command_prints_verification_status_and_age(tmp_path, capsys):
     assert f"archive root: {tmp_path}" in output
     assert f"models root: {tmp_path / 'models'}" in output
     assert "mirrors: 1" in output
+    assert "cache: total=0 B  archive=0 B  tmp=0 B  mirror_metadata=0 B" in output
     assert "size=2 B" in output
     assert "state=clean" in output
     assert "last_check=3h" in output
     assert "verification=" not in output
     assert "payload_files" not in output
+
+
+def test_list_command_excludes_huggingface_local_cache_from_size(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    (archive / "file.bin").write_bytes(b"xx")
+    cache_blob = archive / ".cache" / "huggingface" / "download"
+    cache_blob.parent.mkdir(parents=True)
+    cache_blob.write_bytes(b"x" * 100)
+    write_verification_state(archive, VerificationState(status="clean", repo_id="org/model"))
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+
+    rc = main(["--config", str(config_path), "list"])
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "models/org/model" in output
+    assert "cache: total=100 B  archive=0 B  tmp=0 B  mirror_metadata=100 B" in output
+    assert "size=2 B" in output
+    assert "102 B" not in output
+
+
+def test_status_command_prints_list_summary_with_cache_usage(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    (tmp_path / ".cache" / "hub").mkdir(parents=True)
+    (tmp_path / ".cache" / "hub" / "blob").write_bytes(b"x" * 5)
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+
+    rc = main(["--config", str(config_path), "status"])
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert f"archive root: {tmp_path}" in output
+    assert "mirrors: 0" in output
+    assert "cache: total=5 B  archive=5 B  tmp=0 B  mirror_metadata=0 B" in output
+
+
+def test_clean_cache_dry_run_reports_reclaimable_space_without_deleting(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    (tmp_path / ".cache" / "hub").mkdir(parents=True)
+    (tmp_path / ".cache" / "hub" / "blob").write_bytes(b"x" * 5)
+    (tmp_path / ".tmp").mkdir()
+    (tmp_path / ".tmp" / "partial").write_bytes(b"x" * 7)
+    mirror = tmp_path / "models" / "org" / "model"
+    mirror.mkdir(parents=True)
+    (mirror / "file.bin").write_bytes(b"xx")
+    (mirror / ".cache" / "huggingface").mkdir(parents=True)
+    (mirror / ".cache" / "huggingface" / "meta").write_bytes(b"x" * 3)
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+
+    rc = main(["--config", str(config_path), "clean-cache"])
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "cleanup mode: dry-run" in output
+    assert "reclaimable=15 B" in output
+    assert "would-remove: archive-cache" in output
+    assert "would-remove: archive-tmp" in output
+    assert "would-remove: mirror-cache" in output
+    assert (tmp_path / ".cache").exists()
+    assert (tmp_path / ".tmp").exists()
+    assert (mirror / ".cache").exists()
+    assert (mirror / "file.bin").exists()
+
+
+def test_clean_cache_force_removes_cache_and_tmp_but_keeps_payload(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    (tmp_path / ".cache" / "hub").mkdir(parents=True)
+    (tmp_path / ".cache" / "hub" / "blob").write_bytes(b"x" * 5)
+    (tmp_path / ".tmp").mkdir()
+    (tmp_path / ".tmp" / "partial").write_bytes(b"x" * 7)
+    mirror = tmp_path / "models" / "org" / "model"
+    mirror.mkdir(parents=True)
+    (mirror / "file.bin").write_bytes(b"xx")
+    (mirror / ".cache" / "huggingface").mkdir(parents=True)
+    (mirror / ".cache" / "huggingface" / "meta").write_bytes(b"x" * 3)
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+
+    rc = main(["--config", str(config_path), "clean-cache", "--force"])
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "cleanup mode: force" in output
+    assert "removed: archive-cache" in output
+    assert "removed: archive-tmp" in output
+    assert "removed: mirror-cache" in output
+    assert not (tmp_path / ".cache").exists()
+    assert not (tmp_path / ".tmp").exists()
+    assert not (mirror / ".cache").exists()
+    assert (mirror / "file.bin").read_bytes() == b"xx"
+
+
+def test_clean_cache_refuses_unsafe_configured_targets(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    outside_tmp = tmp_path.parent / f"{tmp_path.name}-outside" / ".tmp"
+    (tmp_path / "payload.bin").write_bytes(b"xx")
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "directory": str(tmp_path),
+                "cache_dir": str(tmp_path),
+                "tmp_dir": str(outside_tmp),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rc = main(["--config", str(config_path), "clean-cache", "--force"])
+
+    assert rc == 1
+    output = capsys.readouterr().out
+    assert f"refusing unsafe cleanup target: {tmp_path}" in output
+    assert f"refusing unsafe cleanup target: {outside_tmp}" in output
+    assert (tmp_path / "payload.bin").exists()
+
+
+def test_directory_size_returns_zero_for_missing_path(tmp_path):
+    assert cli_module.directory_size(tmp_path / "missing") == 0
 
 
 def test_list_command_prints_busy_lock(tmp_path, capsys):

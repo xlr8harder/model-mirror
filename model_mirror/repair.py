@@ -6,7 +6,7 @@ from pathlib import Path
 from .audit import audit_model
 from .checksums import load_manifest, update_checksums, write_checksums
 from .config import Config, archive_path
-from .hub import HuggingFaceHub, HubSnapshot, get_snapshot
+from .hub import HuggingFaceHub, HubSnapshot, cached_manifest_verifies, get_snapshot
 from .lock import ModelLock
 from .state import AuditState, read_audit_state, state_from_results, write_audit_state
 from .verify import current_manifest_hash, metadata_blob_id, metadata_lfs_sha256, metadata_path, metadata_size, verify_remote
@@ -99,9 +99,9 @@ def repair_locked(
         if target.exists() and target.is_file():
             target.unlink()
 
-    selected_hub.snapshot_download(repo_id, selected_type, target_revision, root, allow_patterns=paths)
-    checksums_available = False
-    if config.checksum:
+    download_snapshot(selected_hub, snapshot, root, allow_patterns=paths)
+    checksums_available = cached_manifest_verifies(root, snapshot.files)
+    if config.checksum and not checksums_available:
         update_checksums(root, paths, max_workers=config.checksum_workers)
         checksums_available = True
 
@@ -146,11 +146,12 @@ def update_to_upstream(
     requested_revision = state.requested_revision or selected_revision
     target_revision = state.upstream_commit
     root.mkdir(parents=True, exist_ok=True)
-    selected_hub.snapshot_download(repo_id, selected_type, target_revision, root)
-    checksums_available = False
-    if config.checksum:
+    snapshot = get_snapshot(selected_hub, repo_id, selected_type, target_revision)
+    download_snapshot(selected_hub, snapshot, root)
+    checksums_available = cached_manifest_verifies(root, snapshot.files)
+    if config.checksum and not checksums_available:
         write_checksums(root, max_workers=config.checksum_workers)
-        checksums_available = True
+        checksums_available = cached_manifest_verifies(root, snapshot.files)
     final_state = derive_state(
         config,
         repo_id,
@@ -158,9 +159,10 @@ def update_to_upstream(
         selected_type,
         requested_revision,
         root,
+        snapshot=snapshot,
         resolved_commit=target_revision,
         upstream_commit=target_revision,
-        cached=False,
+        cached=checksums_available,
         from_manifest=checksums_available,
     )
     write_audit_state(root, final_state)
@@ -174,6 +176,19 @@ def repair_status(state: AuditState, *, success: str) -> str:
     if state.status == "incomplete":
         return "verification-incomplete"
     return "incomplete"
+
+
+def download_snapshot(selected_hub, snapshot: HubSnapshot, root: Path, *, allow_patterns: list[str] | None = None) -> None:
+    if hasattr(selected_hub, "download_snapshot"):
+        selected_hub.download_snapshot(snapshot, root, allow_patterns=allow_patterns)
+        return
+    selected_hub.snapshot_download(
+        snapshot.repo_id,
+        snapshot.repo_type,
+        snapshot.resolved_commit,
+        root,
+        allow_patterns=allow_patterns,
+    )
 
 
 def missing_manifest_paths(root: Path, metadata, *, ignored_paths: set[str]) -> list[str]:

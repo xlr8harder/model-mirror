@@ -28,6 +28,7 @@ def test_load_config_defaults_are_safe(tmp_path, monkeypatch):
     assert config.revision == "main"
     assert config.checksum is True
     assert config.checksum_workers == 1
+    assert config.download_workers == 1
     assert config.verify_after_mirror is True
     assert config.hf_xet_high_performance is False
     assert config.hf_xet_reconstruct_write_sequentially is False
@@ -43,6 +44,7 @@ def test_load_config_file_and_environment_override(tmp_path, monkeypatch):
                 "directory": str(tmp_path / "from-file"),
                 "revision": "abc123",
                 "checksum_workers": 2,
+                "download_workers": 3,
                 "hf_xet_high_performance": True,
                 "hf_xet_reconstruct_write_sequentially": True,
                 "hf_xet_num_concurrent_range_gets": 8,
@@ -58,6 +60,7 @@ def test_load_config_file_and_environment_override(tmp_path, monkeypatch):
     assert config.directory == tmp_path / "from-env"
     assert config.revision == "abc123"
     assert config.checksum_workers == 2
+    assert config.download_workers == 3
     assert config.hf_xet_high_performance is True
     assert config.hf_xet_reconstruct_write_sequentially is True
     assert config.hf_xet_num_concurrent_range_gets == 8
@@ -105,6 +108,7 @@ def test_load_config_environment_overrides_more_fields(tmp_path):
             "MODEL_MIRROR_HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY": "yes",
             "MODEL_MIRROR_HF_XET_NUM_CONCURRENT_RANGE_GETS": "12",
             "MODEL_MIRROR_CHECKSUM_WORKERS": "3",
+            "MODEL_MIRROR_DOWNLOAD_WORKERS": "4",
         },
     )
 
@@ -115,6 +119,7 @@ def test_load_config_environment_overrides_more_fields(tmp_path):
     assert config.hf_xet_reconstruct_write_sequentially is True
     assert config.hf_xet_num_concurrent_range_gets == 12
     assert config.checksum_workers == 3
+    assert config.download_workers == 4
 
 
 def test_save_config_writes_yaml_without_secret_values(tmp_path):
@@ -126,6 +131,7 @@ def test_save_config_writes_yaml_without_secret_values(tmp_path):
         hf_xet_reconstruct_write_sequentially=True,
         hf_xet_num_concurrent_range_gets=4,
         checksum_workers=2,
+        download_workers=3,
     )
 
     save_config(config, config_path)
@@ -136,6 +142,7 @@ def test_save_config_writes_yaml_without_secret_values(tmp_path):
     assert data["hf_xet_reconstruct_write_sequentially"] is True
     assert data["hf_xet_num_concurrent_range_gets"] == 4
     assert data["checksum_workers"] == 2
+    assert data["download_workers"] == 3
     assert "token" not in data
 
 
@@ -193,7 +200,7 @@ def test_apply_hf_environment_keeps_all_cache_state_under_archive(tmp_path, monk
     assert env["HF_HUB_CACHE"] == str(tmp_path / ".cache" / "hub")
     assert env["HF_ASSETS_CACHE"] == str(tmp_path / ".cache" / "assets")
     assert env["HF_XET_CACHE"] == str(tmp_path / ".cache" / "xet")
-    assert env["TMPDIR"] == str(tmp_path / "tmp")
+    assert env["TMPDIR"] == str(tmp_path / ".tmp")
     assert env["HF_TOKEN_PATH"] == str(tmp_path / "token")
     assert env["HF_XET_HIGH_PERFORMANCE"] == "1"
     assert env["HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY"] == "1"
@@ -223,7 +230,7 @@ def test_apply_hf_environment_overrides_inherited_cache_paths(tmp_path):
     assert env["HF_XET_CACHE"] == str(tmp_path / ".cache" / "xet")
     assert env["TRANSFORMERS_CACHE"] == str(tmp_path / ".cache" / "transformers")
     assert env["XDG_CACHE_HOME"] == str(tmp_path / ".cache" / "xdg")
-    assert env["TMPDIR"] == str(tmp_path / "tmp")
+    assert env["TMPDIR"] == str(tmp_path / ".tmp")
     assert env["HF_TOKEN"] == "hf_secret"
     assert "HF_XET_HIGH_PERFORMANCE" not in env
     assert "HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY" not in env

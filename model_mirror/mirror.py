@@ -5,7 +5,7 @@ from pathlib import Path
 
 from .checksums import write_checksums
 from .config import Config, archive_path
-from .hub import HuggingFaceHub, get_snapshot
+from .hub import HuggingFaceHub, cached_manifest_verifies, compatible_snapshot_plan, get_snapshot, write_snapshot_plan
 from .lock import ModelLock
 from .repair import derive_state
 from .state import VerificationState, read_verification_state, write_verification_state
@@ -71,7 +71,15 @@ def mirror_locked(
     force: bool,
     verify_after: bool,
 ) -> MirrorResult:
-    snapshot = get_snapshot(selected_hub, repo_id, selected_type, selected_revision)
+    snapshot = select_mirror_snapshot(
+        selected_hub,
+        repo_id,
+        selected_type,
+        selected_revision,
+        destination,
+        existing_state=existing_state,
+        force=force,
+    )
     metadata = snapshot.files
 
     if not force and verify_remote(destination, metadata, check_hashes=False).ok:
@@ -83,8 +91,8 @@ def mirror_locked(
             and existing_state.resolved_commit == snapshot.resolved_commit
         ):
             return MirrorResult("complete", destination, len(metadata))
-        checksums_written = False
-        if config.checksum:
+        checksums_written = cached_manifest_verifies(destination, metadata)
+        if config.checksum and not checksums_written:
             write_checksums(destination, max_workers=config.checksum_workers)
             checksums_written = True
         state = derive_state(
@@ -115,9 +123,10 @@ def mirror_locked(
         ),
     )
     destination.mkdir(parents=True, exist_ok=True)
-    selected_hub.snapshot_download(repo_id, selected_type, snapshot.resolved_commit, destination)
-    checksums_written = False
-    if config.checksum:
+    write_snapshot_plan(destination, snapshot)
+    download_snapshot(selected_hub, snapshot, destination)
+    checksums_written = cached_manifest_verifies(destination, metadata)
+    if config.checksum and not checksums_written:
         write_checksums(destination, max_workers=config.checksum_workers)
         checksums_written = True
     if verify_after:
@@ -148,3 +157,32 @@ def mirror_locked(
         ),
     )
     return MirrorResult("downloaded", destination, len(metadata))
+
+
+def select_mirror_snapshot(
+    selected_hub,
+    repo_id: str,
+    selected_type: str,
+    selected_revision: str,
+    destination: Path,
+    *,
+    existing_state: VerificationState | None,
+    force: bool,
+):
+    if not force and existing_state is not None and existing_state.status == "in_progress":
+        frozen = compatible_snapshot_plan(
+            destination,
+            repo_id=repo_id,
+            repo_type=selected_type,
+            requested_revision=selected_revision,
+        )
+        if frozen is not None:
+            return frozen
+    return get_snapshot(selected_hub, repo_id, selected_type, selected_revision)
+
+
+def download_snapshot(selected_hub, snapshot, destination: Path) -> None:
+    if hasattr(selected_hub, "download_snapshot"):
+        selected_hub.download_snapshot(snapshot, destination)
+        return
+    selected_hub.snapshot_download(snapshot.repo_id, snapshot.repo_type, snapshot.resolved_commit, destination)

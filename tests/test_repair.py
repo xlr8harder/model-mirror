@@ -1,7 +1,9 @@
 from dataclasses import dataclass
 
+from model_mirror.hub import HubSnapshot, cached_manifest_verifies
+import model_mirror.repair as repair_module
 from model_mirror.config import Config
-from model_mirror.checksums import load_manifest, write_checksums
+from model_mirror.checksums import checksum_row_from_hashes, file_hashes, load_manifest, write_checksums
 from model_mirror.repair import missing_manifest_paths, repair
 from model_mirror.state import VerificationState, read_verification_state, write_verification_state
 
@@ -34,6 +36,11 @@ class FakeHub:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"{}" if item.path == "config.json" else b"x" * item.size)
         return local_dir
+
+
+class StreamingFakeHub(FakeHub):
+    def download_snapshot(self, snapshot, root, allow_patterns=None):
+        self.downloads.append((snapshot.repo_id, snapshot.repo_type, snapshot.resolved_commit, root, allow_patterns))
 
 
 def test_repair_uses_local_verification_state_without_reverifying_first(tmp_path):
@@ -100,6 +107,59 @@ def test_repair_requires_verification_state(tmp_path):
 
     assert result.status == "verify-required"
     assert hub.downloads == []
+
+
+def test_repair_download_snapshot_falls_back_to_snapshot_download(tmp_path):
+    hub = FakeHub([FakeFile("file.bin", 3)])
+    snapshot = HubSnapshot("org/model", "model", "main", "abc123", [FakeFile("file.bin", 3)])
+
+    repair_module.download_snapshot(hub, snapshot, tmp_path, allow_patterns=["file.bin"])
+
+    assert hub.downloads == [("org/model", "model", "abc123", tmp_path, ["file.bin"])]
+
+
+def test_repair_download_snapshot_uses_streaming_adapter(tmp_path):
+    hub = StreamingFakeHub([FakeFile("file.bin", 3)])
+    snapshot = HubSnapshot("org/model", "model", "main", "abc123", [FakeFile("file.bin", 3)])
+
+    repair_module.download_snapshot(hub, snapshot, tmp_path, allow_patterns=["file.bin"])
+
+    assert hub.downloads == [("org/model", "model", "abc123", tmp_path, ["file.bin"])]
+
+
+def test_derive_state_fetches_snapshot_when_not_supplied(tmp_path):
+    root = tmp_path / "datasets" / "org" / "data"
+    root.mkdir(parents=True)
+    (root / "file.bin").write_bytes(b"xxx")
+    hub = FakeHub([FakeFile("file.bin", 3)])
+
+    state = repair_module.derive_state(
+        Config(directory=tmp_path),
+        "org/data",
+        hub,
+        "dataset",
+        "main",
+        root,
+    )
+
+    assert state.status == "clean"
+    assert state.resolved_commit == "main"
+
+
+def test_repair_cached_manifest_verifies_rejects_missing_and_wrong_rows(tmp_path):
+    metadata = [FakeFile("file.bin", 3, lfs_sha256="sha")]
+    assert cached_manifest_verifies(tmp_path, metadata) is False
+
+    path = tmp_path / "file.bin"
+    path.write_bytes(b"abc")
+    assert cached_manifest_verifies(tmp_path, metadata) is False
+
+    row = checksum_row_from_hashes(tmp_path, path, file_hashes(path))
+    row["sha256"] = "wrong"
+    from model_mirror.checksums import write_manifest
+
+    write_manifest(tmp_path, {"file.bin": row})
+    assert cached_manifest_verifies(tmp_path, metadata) is False
 
 
 def test_repair_refuses_offline_only_state(tmp_path):
