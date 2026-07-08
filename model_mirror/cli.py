@@ -388,6 +388,7 @@ def supervise_child(
     retry_counts: dict[str, int],
 ) -> tuple[bool, int]:
     started = time.monotonic()
+    started_at_utc = datetime.now(timezone.utc)
     poll_interval = min(30.0, max(1.0, timeout / 10))
     while True:
         returncode = child.poll()
@@ -395,8 +396,10 @@ def supervise_child(
             return False, returncode
 
         snapshot = progress_snapshot(root, stall_timeout_seconds=timeout)
-        if snapshot.any_stalled:
-            entry = selected_progress_entry(snapshot.entries)
+        fresh_entries = fresh_progress_entries(snapshot.entries, started_at_utc)
+        stalled_entries = [entry for entry in fresh_entries if entry.stalled]
+        if stalled_entries:
+            entry = selected_progress_entry(stalled_entries)
             path = entry.path
             retry_counts[path] = retry_counts.get(path, 0) + 1
             if retry_counts[path] > retry_limit:
@@ -413,7 +416,7 @@ def supervise_child(
             terminate_child(child)
             return True, 0
 
-        if not snapshot.active and time.monotonic() - started >= timeout:
+        if not fresh_entries and time.monotonic() - started >= timeout:
             retry_counts["<no-progress>"] = retry_counts.get("<no-progress>", 0) + 1
             if retry_counts["<no-progress>"] > retry_limit:
                 print("stall retry limit exceeded before progress was reported; terminating mirror child")
@@ -427,6 +430,20 @@ def supervise_child(
             return True, 0
 
         time.sleep(poll_interval)
+
+
+def fresh_progress_entries(entries: list[ProgressEntry], started_at_utc: datetime) -> list[ProgressEntry]:
+    return [entry for entry in entries if progress_entry_updated_after(entry, started_at_utc)]
+
+
+def progress_entry_updated_after(entry: ProgressEntry, cutoff: datetime) -> bool:
+    try:
+        updated = datetime.fromisoformat(entry.updated_at_utc)
+    except ValueError:
+        return False
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=timezone.utc)
+    return updated >= cutoff
 
 
 def terminate_child(child) -> None:

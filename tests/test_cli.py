@@ -1044,7 +1044,7 @@ class FakeChild:
         self.returncode = -9
 
 
-def stalled_snapshot(path="file.bin", idle_seconds=601):
+def stalled_snapshot(path="file.bin", idle_seconds=601, updated_at_utc=None):
     return ProgressSnapshot(
         entries=[
             ProgressEntry(
@@ -1052,7 +1052,7 @@ def stalled_snapshot(path="file.bin", idle_seconds=601):
                 stage="downloading",
                 bytes_done=1,
                 bytes_total=2,
-                updated_at_utc="",
+                updated_at_utc=updated_at_utc or datetime.now(timezone.utc).isoformat(),
                 idle_seconds=idle_seconds,
                 stalled=True,
                 source="heartbeat",
@@ -1086,6 +1086,39 @@ def test_supervise_child_fails_when_stall_retry_limit_is_exceeded(tmp_path, monk
     assert rc == 1
     assert child.terminated is True
     assert "stall retry limit exceeded for file.bin" in output
+
+
+def test_supervise_child_waits_for_fresh_progress_when_existing_status_is_stale(tmp_path, monkeypatch, capsys):
+    child = FakeChild()
+    times = iter([0.0, 601.0])
+    monkeypatch.setattr(cli_module.time, "monotonic", lambda: next(times))
+    monkeypatch.setattr(
+        cli_module,
+        "progress_snapshot",
+        lambda root, stall_timeout_seconds: stalled_snapshot(updated_at_utc="2000-01-01T00:00:00+00:00"),
+    )
+
+    restart, rc = cli_module.supervise_child(child, tmp_path, 600, 3, {})
+
+    output = capsys.readouterr().out
+    assert restart is True
+    assert rc == 0
+    assert child.terminated is True
+    assert "stall detected before progress was reported" in output
+
+
+def test_fresh_progress_entries_handles_invalid_and_naive_timestamps():
+    cutoff = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    entries = [
+        ProgressEntry("invalid.bin", "downloading", 0, 1, "not-a-date", 0, False, "heartbeat"),
+        ProgressEntry("old.bin", "downloading", 0, 1, "2025-12-31T23:59:59", 0, False, "heartbeat"),
+        ProgressEntry("fresh.bin", "downloading", 0, 1, "2026-01-01T00:00:00", 0, False, "heartbeat"),
+    ]
+
+    fresh = cli_module.fresh_progress_entries(entries, cutoff)
+
+    assert [entry.path for entry in fresh] == ["fresh.bin"]
 
 
 def test_supervise_child_restarts_when_no_progress_is_reported(tmp_path, monkeypatch, capsys):
