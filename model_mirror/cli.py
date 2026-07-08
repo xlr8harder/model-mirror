@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
+import subprocess
+import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -281,8 +285,9 @@ def selected_revision_arg(args) -> str | None:
 
 
 def main(argv: list[str] | None = None, *, hub=None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw_argv)
     if args.command is None:
         parser.print_help()
         return 0
@@ -290,6 +295,9 @@ def main(argv: list[str] | None = None, *, hub=None) -> int:
         return handle_help(parser, args.topic)
     config_path = Path(args.config).expanduser() if args.config else None
     config = load_config(config_path)
+
+    if should_supervise_mirror(args, config, hub):
+        return run_supervised_mirror(raw_argv, args, config)
 
     try:
         if args.command == "config":
@@ -337,6 +345,97 @@ def main(argv: list[str] | None = None, *, hub=None) -> int:
 
     parser.error(f"Unhandled command: {args.command}")
     return 2
+
+
+def should_supervise_mirror(args, config: Config, hub) -> bool:
+    if args.command != "mirror":
+        return False
+    if hub is not None:
+        return False
+    if os.environ.get("MODEL_MIRROR_SUPERVISED_CHILD") == "1":
+        return False
+    return effective_stall_timeout(args, config) > 0
+
+
+def effective_stall_timeout(args, config: Config) -> int:
+    selected = getattr(args, "stall_timeout", None)
+    return config.stall_timeout_seconds if selected is None else selected
+
+
+def run_supervised_mirror(raw_argv: list[str], args, config: Config) -> int:
+    repo_type = args.repo_type or config.repo_type
+    root = archive_path(config, args.model, repo_type)
+    timeout = effective_stall_timeout(args, config)
+    retry_limit = config.stall_retries
+    retry_counts: dict[str, int] = {}
+    command = [sys.executable, "-m", "model_mirror.cli", *raw_argv]
+    env = dict(os.environ)
+    env["MODEL_MIRROR_SUPERVISED_CHILD"] = "1"
+
+    while True:
+        child = subprocess.Popen(command, env=env)
+        restart, returncode = supervise_child(child, root, timeout, retry_limit, retry_counts)
+        if restart:
+            continue
+        return returncode
+
+
+def supervise_child(
+    child,
+    root: Path,
+    timeout: int,
+    retry_limit: int,
+    retry_counts: dict[str, int],
+) -> tuple[bool, int]:
+    started = time.monotonic()
+    poll_interval = min(30.0, max(1.0, timeout / 10))
+    while True:
+        returncode = child.poll()
+        if returncode is not None:
+            return False, returncode
+
+        snapshot = progress_snapshot(root, stall_timeout_seconds=timeout)
+        if snapshot.any_stalled:
+            entry = selected_progress_entry(snapshot.entries)
+            path = entry.path
+            retry_counts[path] = retry_counts.get(path, 0) + 1
+            if retry_counts[path] > retry_limit:
+                print(
+                    f"stall retry limit exceeded for {path}: "
+                    f"{retry_counts[path] - 1}/{retry_limit}; terminating mirror child"
+                )
+                terminate_child(child)
+                return False, 1
+            print(
+                f"stall detected for {path}: idle={format_age_seconds(entry.idle_seconds)}; "
+                f"restarting mirror child ({retry_counts[path]}/{retry_limit})"
+            )
+            terminate_child(child)
+            return True, 0
+
+        if not snapshot.active and time.monotonic() - started >= timeout:
+            retry_counts["<no-progress>"] = retry_counts.get("<no-progress>", 0) + 1
+            if retry_counts["<no-progress>"] > retry_limit:
+                print("stall retry limit exceeded before progress was reported; terminating mirror child")
+                terminate_child(child)
+                return False, 1
+            print(
+                "stall detected before progress was reported; "
+                f"restarting mirror child ({retry_counts['<no-progress>']}/{retry_limit})"
+            )
+            terminate_child(child)
+            return True, 0
+
+        time.sleep(poll_interval)
+
+
+def terminate_child(child) -> None:
+    child.terminate()
+    try:
+        child.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        child.kill()
+        child.wait(timeout=30)
 
 
 def handle_help(parser: argparse.ArgumentParser, topic: str | None) -> int:

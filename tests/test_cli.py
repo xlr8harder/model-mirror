@@ -192,6 +192,43 @@ def test_mirror_command_accepts_stall_timeout_override(tmp_path):
     assert hub.stall_timeouts == [0]
 
 
+def test_mirror_command_uses_process_supervisor_without_injected_hub(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    captured = {}
+
+    def fake_supervisor(raw_argv, args, config):
+        captured["raw_argv"] = raw_argv
+        captured["model"] = args.model
+        captured["directory"] = config.directory
+        return 7
+
+    monkeypatch.setattr(cli_module, "run_supervised_mirror", fake_supervisor)
+
+    rc = main(["--config", str(config_path), "mirror", "org/model"])
+
+    assert rc == 7
+    assert captured == {
+        "raw_argv": ["--config", str(config_path), "mirror", "org/model"],
+        "model": "org/model",
+        "directory": tmp_path,
+    }
+
+
+def test_should_supervise_mirror_respects_child_env_and_disabled_timeout(tmp_path, monkeypatch):
+    args = SimpleNamespace(command="mirror", stall_timeout=None)
+    config = Config(directory=tmp_path)
+
+    assert cli_module.should_supervise_mirror(args, config, hub=None) is True
+    assert cli_module.effective_stall_timeout(SimpleNamespace(stall_timeout=0), config) == 0
+
+    monkeypatch.setenv("MODEL_MIRROR_SUPERVISED_CHILD", "1")
+
+    assert cli_module.should_supervise_mirror(args, config, hub=None) is False
+    assert cli_module.should_supervise_mirror(args, config, hub=object()) is False
+    assert cli_module.should_supervise_mirror(SimpleNamespace(command="status"), config, hub=None) is False
+
+
 def test_mirror_command_returns_failure_when_post_verify_is_dirty(tmp_path, capsys):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
@@ -984,6 +1021,187 @@ def test_list_format_helpers_cover_display_branches():
         ]
     )
     assert selected.path == "a.bin"
+
+
+class FakeChild:
+    def __init__(self, returncode=None):
+        self.returncode = returncode
+        self.terminated = False
+        self.killed = False
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+        self.returncode = -15
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+
+def stalled_snapshot(path="file.bin", idle_seconds=601):
+    return ProgressSnapshot(
+        entries=[
+            ProgressEntry(
+                path=path,
+                stage="downloading",
+                bytes_done=1,
+                bytes_total=2,
+                updated_at_utc="",
+                idle_seconds=idle_seconds,
+                stalled=True,
+                source="heartbeat",
+            )
+        ],
+        source="heartbeat",
+    )
+
+
+def test_supervise_child_restarts_on_stalled_progress(tmp_path, monkeypatch, capsys):
+    child = FakeChild()
+    monkeypatch.setattr(cli_module, "progress_snapshot", lambda root, stall_timeout_seconds: stalled_snapshot())
+
+    restart, rc = cli_module.supervise_child(child, tmp_path, 600, 3, {})
+
+    output = capsys.readouterr().out
+    assert restart is True
+    assert rc == 0
+    assert child.terminated is True
+    assert "stall detected for file.bin" in output
+
+
+def test_supervise_child_fails_when_stall_retry_limit_is_exceeded(tmp_path, monkeypatch, capsys):
+    child = FakeChild()
+    monkeypatch.setattr(cli_module, "progress_snapshot", lambda root, stall_timeout_seconds: stalled_snapshot())
+
+    restart, rc = cli_module.supervise_child(child, tmp_path, 600, 0, {})
+
+    output = capsys.readouterr().out
+    assert restart is False
+    assert rc == 1
+    assert child.terminated is True
+    assert "stall retry limit exceeded for file.bin" in output
+
+
+def test_supervise_child_restarts_when_no_progress_is_reported(tmp_path, monkeypatch, capsys):
+    child = FakeChild()
+    times = iter([0.0, 601.0])
+    monkeypatch.setattr(cli_module.time, "monotonic", lambda: next(times))
+    monkeypatch.setattr(cli_module, "progress_snapshot", lambda root, stall_timeout_seconds: ProgressSnapshot([], "heartbeat"))
+
+    restart, rc = cli_module.supervise_child(child, tmp_path, 600, 3, {})
+
+    output = capsys.readouterr().out
+    assert restart is True
+    assert rc == 0
+    assert child.terminated is True
+    assert "stall detected before progress was reported" in output
+
+
+def test_supervise_child_fails_when_no_progress_retry_limit_is_exceeded(tmp_path, monkeypatch, capsys):
+    child = FakeChild()
+    times = iter([0.0, 601.0])
+    monkeypatch.setattr(cli_module.time, "monotonic", lambda: next(times))
+    monkeypatch.setattr(cli_module, "progress_snapshot", lambda root, stall_timeout_seconds: ProgressSnapshot([], "heartbeat"))
+
+    restart, rc = cli_module.supervise_child(child, tmp_path, 600, 0, {})
+
+    output = capsys.readouterr().out
+    assert restart is False
+    assert rc == 1
+    assert child.terminated is True
+    assert "stall retry limit exceeded before progress was reported" in output
+
+
+def test_supervise_child_sleeps_when_child_is_active_without_stall(tmp_path, monkeypatch):
+    child = FakeChild()
+    polls = iter([None, 0])
+    sleeps = []
+    child.poll = lambda: next(polls)
+    monkeypatch.setattr(cli_module, "progress_snapshot", lambda root, stall_timeout_seconds: ProgressSnapshot([], "heartbeat"))
+    monkeypatch.setattr(cli_module.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(cli_module.time, "sleep", sleeps.append)
+
+    restart, rc = cli_module.supervise_child(child, tmp_path, 600, 3, {})
+
+    assert restart is False
+    assert rc == 0
+    assert sleeps == [30.0]
+
+
+def test_supervise_child_returns_child_exit_code(tmp_path):
+    child = FakeChild(returncode=2)
+
+    restart, rc = cli_module.supervise_child(child, tmp_path, 600, 3, {})
+
+    assert restart is False
+    assert rc == 2
+
+
+def test_terminate_child_kills_after_timeout(monkeypatch):
+    child = FakeChild()
+
+    def raise_timeout(timeout=None):
+        if not child.killed:
+            raise cli_module.subprocess.TimeoutExpired("cmd", timeout)
+        return child.returncode
+
+    child.wait = raise_timeout
+
+    cli_module.terminate_child(child)
+
+    assert child.terminated is True
+    assert child.killed is True
+
+
+def test_run_supervised_mirror_spawns_child_with_env(tmp_path, monkeypatch):
+    spawned = {}
+    args = SimpleNamespace(model="org/model", repo_type=None, stall_timeout=None)
+    config = Config(directory=tmp_path, stall_timeout_seconds=600)
+
+    class FakePopenChild(FakeChild):
+        def __init__(self, command, env):
+            super().__init__(returncode=0)
+            spawned["command"] = command
+            spawned["env"] = env
+
+    monkeypatch.setattr(cli_module.subprocess, "Popen", FakePopenChild)
+    monkeypatch.setattr(cli_module, "supervise_child", lambda child, root, timeout, retry_limit, retry_counts: (False, 0))
+
+    rc = cli_module.run_supervised_mirror(["mirror", "org/model"], args, config)
+
+    assert rc == 0
+    assert spawned["command"][-2:] == ["mirror", "org/model"]
+    assert spawned["env"]["MODEL_MIRROR_SUPERVISED_CHILD"] == "1"
+
+
+def test_run_supervised_mirror_restarts_child(tmp_path, monkeypatch):
+    calls = []
+    args = SimpleNamespace(model="org/model", repo_type=None, stall_timeout=None)
+    config = Config(directory=tmp_path, stall_timeout_seconds=600)
+
+    class FakePopenChild(FakeChild):
+        def __init__(self, command, env):
+            super().__init__(returncode=0)
+            calls.append(command)
+
+    supervise_results = iter([(True, 0), (False, 0)])
+    monkeypatch.setattr(cli_module.subprocess, "Popen", FakePopenChild)
+    monkeypatch.setattr(
+        cli_module,
+        "supervise_child",
+        lambda child, root, timeout, retry_limit, retry_counts: next(supervise_results),
+    )
+
+    rc = cli_module.run_supervised_mirror(["mirror", "org/model"], args, config)
+
+    assert rc == 0
+    assert len(calls) == 2
 
 
 def test_verify_writes_dirty_verification_state(tmp_path, capsys):
