@@ -190,6 +190,7 @@ model-mirror config options
 model-mirror config directory /mnt/big-drive/huggingface
 model-mirror config set checksum-workers 1
 model-mirror config set hf-xet-reconstruct-write-sequentially true
+model-mirror config set hf-xet-num-concurrent-range-gets 1
 ```
 
 Important configuration options:
@@ -205,9 +206,11 @@ Important configuration options:
   `~/.huggingface/token`. If no token is found during Hub access,
   model-mirror warns and prints the config command to set this path. Token
   contents are never printed.
-- `hf_xet_reconstruct_write_sequentially`: sequential Xet writes for HDDs
-- `hf_xet_num_concurrent_range_gets`: Xet range-get concurrency; leave unset to
-  use Hugging Face's default of `16`
+- `hf_xet_reconstruct_write_sequentially`: HDD-friendly Xet reconstruction
+  writes; uses the current `HF_XET_RECONSTRUCTION_USE_VECTORED_WRITE=false`
+  knob when supported
+- `hf_xet_num_concurrent_range_gets`: Xet internal download concurrency.
+  Default `1` is HDD-friendly; increase for SSD/NVMe.
 - `hf_xet_high_performance`: enable Xet high-performance mode. This is off by
   default; use only on high-bandwidth machines with fast disks and ample memory,
   typically 64 GB RAM or more.

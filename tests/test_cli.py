@@ -312,6 +312,19 @@ def test_config_show_prints_optional_range_gets_without_token(tmp_path, capsys):
     assert "token_path:" not in output
 
 
+def test_config_show_omits_null_range_gets_escape_hatch(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump({"directory": str(tmp_path), "hf_xet_num_concurrent_range_gets": None}),
+        encoding="utf-8",
+    )
+
+    assert main(["--config", str(config_path), "config", "show"]) == 0
+
+    output = capsys.readouterr().out
+    assert "hf_xet_num_concurrent_range_gets:" not in output
+
+
 def test_config_options_describes_supported_keys(tmp_path, capsys):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")

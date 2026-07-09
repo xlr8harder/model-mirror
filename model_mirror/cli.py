@@ -78,12 +78,12 @@ CONFIG_OPTIONS = [
     (
         "hf_xet_reconstruct_write_sequentially",
         "MODEL_MIRROR_HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY",
-        "Sets HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY=1 for HDD-friendly Xet reconstruction writes.",
+        "Uses HDD-friendly Xet reconstruction writes by disabling vectored reconstruction writes where supported.",
     ),
     (
         "hf_xet_num_concurrent_range_gets",
         "MODEL_MIRROR_HF_XET_NUM_CONCURRENT_RANGE_GETS",
-        "Sets HF_XET_NUM_CONCURRENT_RANGE_GETS. Leave unset to use Hugging Face defaults.",
+        "Limits Xet internal download concurrency. Default 1 is HDD-friendly; increase for SSD/NVMe.",
     ),
     (
         "token_path",

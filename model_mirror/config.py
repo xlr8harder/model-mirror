@@ -30,7 +30,7 @@ class Config:
     verify_after_mirror: bool = True
     hf_xet_high_performance: bool = False
     hf_xet_reconstruct_write_sequentially: bool = False
-    hf_xet_num_concurrent_range_gets: int | None = None
+    hf_xet_num_concurrent_range_gets: int | None = 1
     token_path: Path | None = None
     cache_dir: Path | None = None
     tmp_dir: Path | None = None
@@ -83,7 +83,7 @@ def load_config(path: Path | str | None = None, environ: Mapping[str, str] | Non
             data.get("hf_xet_reconstruct_write_sequentially", False)
         ),
         hf_xet_num_concurrent_range_gets=parse_optional_positive_int(
-            data.get("hf_xet_num_concurrent_range_gets")
+            data.get("hf_xet_num_concurrent_range_gets", 1)
         ),
         token_path=_path_or_none(data.get("token_path")),
         cache_dir=_path_or_none(data.get("cache_dir")),
@@ -269,11 +269,15 @@ def apply_hf_environment(config: Config, environ: Mapping[str, str] | None = Non
         env.pop("HF_XET_HIGH_PERFORMANCE", None)
     if config.hf_xet_reconstruct_write_sequentially:
         env["HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY"] = "1"
+        env["HF_XET_RECONSTRUCTION_USE_VECTORED_WRITE"] = "false"
     else:
         env.pop("HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY", None)
+        env.pop("HF_XET_RECONSTRUCTION_USE_VECTORED_WRITE", None)
     if config.hf_xet_num_concurrent_range_gets is not None:
         env["HF_XET_NUM_CONCURRENT_RANGE_GETS"] = str(config.hf_xet_num_concurrent_range_gets)
+        env["HF_XET_FIXED_DOWNLOAD_CONCURRENCY"] = str(config.hf_xet_num_concurrent_range_gets)
     else:
         env.pop("HF_XET_NUM_CONCURRENT_RANGE_GETS", None)
+        env.pop("HF_XET_FIXED_DOWNLOAD_CONCURRENCY", None)
 
     return env

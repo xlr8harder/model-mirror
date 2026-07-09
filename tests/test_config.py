@@ -35,7 +35,7 @@ def test_load_config_defaults_are_safe(tmp_path, monkeypatch):
     assert config.verify_after_mirror is True
     assert config.hf_xet_high_performance is False
     assert config.hf_xet_reconstruct_write_sequentially is False
-    assert config.hf_xet_num_concurrent_range_gets is None
+    assert config.hf_xet_num_concurrent_range_gets == 1
     assert config.token_path is None
 
 
@@ -172,6 +172,23 @@ def test_save_config_includes_optional_cache_and_tmp_dirs(tmp_path):
     assert data["tmp_dir"] == str(tmp_path / "tmp")
 
 
+def test_null_xet_concurrency_uses_hf_defaults_escape_hatch(tmp_path):
+    inherited = {
+        "HF_XET_NUM_CONCURRENT_RANGE_GETS": "64",
+        "HF_XET_FIXED_DOWNLOAD_CONCURRENCY": "64",
+    }
+    config = Config(directory=tmp_path, hf_xet_num_concurrent_range_gets=None)
+    config_path = tmp_path / "config.yaml"
+
+    save_config(config, config_path)
+    env = apply_hf_environment(config, environ=inherited)
+
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert "hf_xet_num_concurrent_range_gets" not in data
+    assert "HF_XET_NUM_CONCURRENT_RANGE_GETS" not in env
+    assert "HF_XET_FIXED_DOWNLOAD_CONCURRENCY" not in env
+
+
 def test_safe_repo_path_rejects_path_traversal():
     assert safe_repo_path("org/model") == Path("org/model")
 
@@ -219,7 +236,9 @@ def test_apply_hf_environment_keeps_all_cache_state_under_archive(tmp_path, monk
     assert env["HF_TOKEN_PATH"] == str(tmp_path / "token")
     assert env["HF_XET_HIGH_PERFORMANCE"] == "1"
     assert env["HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY"] == "1"
+    assert env["HF_XET_RECONSTRUCTION_USE_VECTORED_WRITE"] == "false"
     assert env["HF_XET_NUM_CONCURRENT_RANGE_GETS"] == "6"
+    assert env["HF_XET_FIXED_DOWNLOAD_CONCURRENCY"] == "6"
 
 
 def test_apply_hf_environment_overrides_inherited_cache_paths(tmp_path):
@@ -230,7 +249,9 @@ def test_apply_hf_environment_overrides_inherited_cache_paths(tmp_path):
         "HF_XET_CACHE": "/small/cache/xet",
         "HF_XET_HIGH_PERFORMANCE": "1",
         "HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY": "1",
+        "HF_XET_RECONSTRUCTION_USE_VECTORED_WRITE": "false",
         "HF_XET_NUM_CONCURRENT_RANGE_GETS": "64",
+        "HF_XET_FIXED_DOWNLOAD_CONCURRENCY": "64",
         "TRANSFORMERS_CACHE": "/small/cache/transformers",
         "XDG_CACHE_HOME": "/small/cache/xdg",
         "TMPDIR": "/small/tmp",
@@ -249,7 +270,9 @@ def test_apply_hf_environment_overrides_inherited_cache_paths(tmp_path):
     assert env["HF_TOKEN"] == "hf_secret"
     assert "HF_XET_HIGH_PERFORMANCE" not in env
     assert "HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY" not in env
-    assert "HF_XET_NUM_CONCURRENT_RANGE_GETS" not in env
+    assert "HF_XET_RECONSTRUCTION_USE_VECTORED_WRITE" not in env
+    assert env["HF_XET_NUM_CONCURRENT_RANGE_GETS"] == "1"
+    assert env["HF_XET_FIXED_DOWNLOAD_CONCURRENCY"] == "1"
 
 
 def test_apply_hf_environment_uses_legacy_token_path_when_present(tmp_path, monkeypatch):
@@ -342,7 +365,9 @@ def test_apply_hf_environment_leaves_optional_token_and_xet_knobs_unset(tmp_path
     assert "HF_TOKEN_PATH" not in env
     assert "HF_XET_HIGH_PERFORMANCE" not in env
     assert "HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY" not in env
-    assert "HF_XET_NUM_CONCURRENT_RANGE_GETS" not in env
+    assert "HF_XET_RECONSTRUCTION_USE_VECTORED_WRITE" not in env
+    assert env["HF_XET_NUM_CONCURRENT_RANGE_GETS"] == "1"
+    assert env["HF_XET_FIXED_DOWNLOAD_CONCURRENCY"] == "1"
 
 
 def test_parse_bool_handles_common_values():
