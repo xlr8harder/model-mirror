@@ -136,11 +136,13 @@ def audit_model(
     skip_transformers: bool = False,
     trust_remote_code: bool = False,
     strict: bool = False,
+    require_config: bool = True,
 ) -> AuditResult:
     result = AuditResult()
     config_path = root / "config.json"
     if not config_path.exists():
-        result.missing_files.append("config.json")
+        if require_config:
+            result.missing_files.append("config.json")
     else:
         try:
             read_json(config_path)

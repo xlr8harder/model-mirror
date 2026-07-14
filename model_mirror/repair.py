@@ -250,7 +250,15 @@ def derive_state(
         snapshot = get_snapshot(hub, repo_id, repo_type, resolved_commit or requested_revision)
     metadata = snapshot.files
     remote_result = verify_remote(root, metadata, cached=cached, from_manifest=from_manifest)
-    audit_result = audit_model(root, skip_transformers=True) if repo_type == "model" else None
+    expected_paths = {metadata_path(item) for item in metadata}
+    gguf_only = "config.json" not in expected_paths and any(
+        path.lower().endswith(".gguf") for path in expected_paths
+    )
+    audit_result = (
+        audit_model(root, skip_transformers=True, require_config=not gguf_only)
+        if repo_type == "model"
+        else None
+    )
     state = state_from_results(
         repo_id,
         repo_type,

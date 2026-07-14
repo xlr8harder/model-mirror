@@ -171,6 +171,17 @@ def test_mirror_downloads_missing_archive_and_writes_checksums(tmp_path):
     assert read_snapshot_plan(result.path).resolved_commit == "main"
 
 
+def test_mirror_accepts_gguf_only_repo_without_transformers_config(tmp_path):
+    hub = FakeHub([FakeFile("model.gguf", 3)])
+
+    result = mirror(Config(directory=tmp_path), "org/gguf-model", hub=hub)
+
+    assert result.status == "downloaded"
+    state = read_verification_state(result.path)
+    assert state.status == "clean"
+    assert state.issues == []
+
+
 def test_mirror_does_not_rehash_after_streaming_download_manifest(tmp_path, monkeypatch):
     payload_hash = hashlib.sha256(b"xxx").hexdigest()
     hub = StreamingFakeHub([FakeFile("file.bin", 3, lfs_sha256=payload_hash)])
