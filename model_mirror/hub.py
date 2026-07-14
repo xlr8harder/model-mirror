@@ -797,7 +797,8 @@ def download_staging_dir(
     tmp_root = Path(config.tmp_dir) if config.tmp_dir is not None else Path(config.directory) / ".tmp"
     scope = "all" if allow_patterns is None else "allow-" + stable_digest("\n".join(sorted(allow_patterns)))[:16]
     slug = safe_slug(f"{repo_type}-{repo_id}-{revision}-{scope}")
-    return tmp_root / "downloads" / f"{slug}-{stable_digest(f'{repo_type}\n{repo_id}\n{revision}\n{scope}')[:16]}"
+    identity = "\n".join((repo_type, repo_id, revision, scope))
+    return tmp_root / "downloads" / f"{slug}-{stable_digest(identity)[:16]}"
 
 
 def download_environment(env: dict[str, str], staging_dir: Path) -> dict[str, str]:
