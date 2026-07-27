@@ -22,6 +22,12 @@ Each mirrored repo owns its state inside the repo directory:
   issues, repair paths
 - `.manifest`: versioned JSONL records with local size, mtime, SHA-256, and Git blob SHA-1
 - `.verification.lock`: advisory lock metadata while an operation is active
+- `.model-mirror/snapshot.json`: authoritative commit-pinned expected file list
+- `.model-mirror/torrent/coverage/`: atomic, resumable profile-specific piece
+  and Merkle hash coverage
+- `.model-mirror/torrent/publications/`: torrent artifacts, recovery records,
+  and durable publication/desired-seed state
+- `.model-mirror/torrent/fence.json`: the active commit update fence
 
 Deleting a model directory deletes its verification state with it. There is no
 global model state database.
@@ -50,10 +56,12 @@ not make Hugging Face/Xet's own transfer stage fully stream-verifiable.
 
 ## Locking
 
-`mirror`, `verify`, `repair`, `offline`, and `online` take an advisory lock on
-`.verification.lock` for the target repo. The first mirror operation writes
-`.verification` with `status: in_progress` before downloading. `list` does not
-block; it reports lock metadata when a repo is busy.
+Mutating mirror, verification, repair, upgrade, and torrent control-plane
+transitions take an advisory lock on `.verification.lock` for the target repo.
+The first mirror operation writes `.verification` with `status: in_progress`
+before downloading. The seeder acquires the lock only for short reconciliation
+transitions, never for its lifetime. `list` does not block; it reports lock
+metadata when a repo is busy.
 
 ## Hugging Face And Xet
 
@@ -65,8 +73,13 @@ for that feature are removed before importing or using `huggingface_hub`.
 The conservative default is:
 
 - high-performance Xet mode off
-- range-get concurrency unset, which leaves Hugging Face's default in place
+- range-get concurrency `1`
 - optional sequential reconstruction writes for HDD-backed archives
 
 This keeps the default path usable on lower-memory machines and lets power users
 tune throughput explicitly.
+
+## Design Documents
+
+- [Torrent Distribution And Archive Upgrade Requirements](docs/torrent-distribution-requirements.md)
+- [Torrent Backend Spike](docs/torrent-backend-spike.md)

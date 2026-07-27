@@ -7,7 +7,7 @@ from .audit import audit_model
 from .checksums import load_manifest, update_checksums, write_checksums
 from .config import Config, archive_path
 from .hub import HuggingFaceHub, HubSnapshot, cached_manifest_verifies, get_snapshot
-from .lock import ModelLock
+from .lock import ModelBusyError, ModelLock
 from .state import AuditState, read_audit_state, state_from_results, write_audit_state
 from .verify import current_manifest_hash, metadata_blob_id, metadata_lfs_sha256, metadata_path, metadata_size, verify_remote
 
@@ -36,17 +36,61 @@ def repair(
     selected_revision = revision or config.revision
     selected_hub = hub or HuggingFaceHub(config)
     root = archive_path(config, repo_id, selected_type)
-    with ModelLock(root, "repair", repo_id, selected_type):
-        return repair_locked(
-            config,
-            repo_id,
-            selected_hub,
-            selected_type,
-            selected_revision,
-            root,
-            update=update,
-            force_partial=force_partial,
-        )
+    initial_state = read_audit_state(root)
+    from .torrent_publication import (
+        assert_commit_update_allowed,
+        begin_maintenance,
+        finish_maintenance,
+        wait_for_maintenance_detach,
+    )
+
+    if (
+        update
+        and initial_state is not None
+        and initial_state.upstream_status == "changed"
+        and initial_state.upstream_commit
+    ):
+        assert_commit_update_allowed(root, initial_state.upstream_commit)
+
+    maintenance = False
+    if (
+        initial_state is not None
+        and not initial_state.clean
+        and bool(initial_state.repair_paths)
+        and not update
+    ):
+        with ModelLock(root, "torrent-maintenance", repo_id, selected_type):
+            maintenance = begin_maintenance(root) is not None
+        if maintenance:
+            wait_for_maintenance_detach(root)
+
+    result = None
+    try:
+        with ModelLock(root, "repair", repo_id, selected_type):
+            result = repair_locked(
+                config,
+                repo_id,
+                selected_hub,
+                selected_type,
+                selected_revision,
+                root,
+                update=update,
+                force_partial=force_partial,
+            )
+            if maintenance:
+                finish_maintenance(
+                    root,
+                    healthy=result.status in {"complete", "repaired"},
+                )
+            return result
+    except Exception:
+        if maintenance:
+            try:
+                with ModelLock(root, "torrent-maintenance-failed", repo_id, selected_type):
+                    finish_maintenance(root, healthy=False)
+            except ModelBusyError:
+                pass
+        raise
 
 
 def repair_locked(

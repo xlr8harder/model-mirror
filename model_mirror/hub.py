@@ -271,6 +271,7 @@ def stream_snapshot(
 ) -> None:
     manifest = load_manifest(local_dir)
     selected_files = filtered_snapshot_files(snapshot.files, allow_patterns)
+    coverage_recorder = torrent_coverage_recorder(local_dir, snapshot)
     progress_recorder = ProgressRecorder(local_dir)
     work = []
     for item in selected_files:
@@ -291,6 +292,7 @@ def stream_snapshot(
                 staging_dir,
                 item,
                 progress_recorder=progress_recorder,
+                coverage_recorder=coverage_recorder,
                 stall_timeout_seconds=stall_timeout_seconds,
                 stall_retries=stall_retries,
             )
@@ -307,6 +309,7 @@ def stream_snapshot(
                 staging_dir,
                 item,
                 progress_recorder=progress_recorder,
+                coverage_recorder=coverage_recorder,
                 stall_timeout_seconds=stall_timeout_seconds,
                 stall_retries=stall_retries,
             )
@@ -332,6 +335,7 @@ def stream_snapshot_file(
     item: HubFile,
     *,
     progress_recorder: ProgressRecorder,
+    coverage_recorder=None,
     stall_timeout_seconds: int,
     stall_retries: int,
 ) -> dict:
@@ -340,25 +344,46 @@ def stream_snapshot_file(
     completed = False
     try:
         if destination.exists() and destination.is_file():
-            row = hash_existing_file(local_dir, destination, item, progress=progress)
-            if row is not None:
+            accumulator = coverage_recorder.accumulator(item) if coverage_recorder is not None else None
+            existing = hash_existing_file(
+                local_dir,
+                destination,
+                item,
+                progress=progress,
+                torrent_accumulator=accumulator,
+            )
+            if existing is not None:
+                row, hashes = existing
+                record_torrent_coverage(coverage_recorder, item, destination, hashes, accumulator)
                 completed = True
                 return row
             destination.unlink()
 
-        row = promote_legacy_staged_file(local_dir, staging_dir, item, progress=progress)
-        if row is not None:
+        accumulator = coverage_recorder.accumulator(item) if coverage_recorder is not None else None
+        staged = promote_legacy_staged_file(
+            local_dir,
+            staging_dir,
+            item,
+            progress=progress,
+            torrent_accumulator=accumulator,
+        )
+        if staged is not None:
+            row, hashes = staged
+            record_torrent_coverage(coverage_recorder, item, destination, hashes, accumulator)
             completed = True
             return row
 
+        accumulator = coverage_recorder.accumulator(item) if coverage_recorder is not None else None
         hashes = stream_file_to_path(
             snapshot,
             item,
             destination,
+            torrent_accumulator=accumulator,
             progress=progress,
             stall_timeout_seconds=stall_timeout_seconds,
             stall_retries=stall_retries,
         )
+        record_torrent_coverage(coverage_recorder, item, destination, hashes, accumulator)
         completed = True
         return checksum_row_from_hashes(local_dir, destination, hashes)
     finally:
@@ -408,14 +433,19 @@ def hash_existing_file(
     item: HubFile,
     *,
     progress,
-) -> dict | None:
+    torrent_accumulator=None,
+) -> tuple[dict, FileHashes] | None:
     progress.update(0, stage="hashing-final", force=True)
-    hashes = file_hashes(path, on_progress=lambda done: progress.update(done, stage="hashing-final"))
+    hashes = file_hashes(
+        path,
+        accumulators=(torrent_accumulator,) if torrent_accumulator is not None else (),
+        on_progress=lambda done: progress.update(done, stage="hashing-final"),
+    )
     try:
         ensure_hashes_match(item, path, hashes)
     except DownloadIntegrityError:
         return None
-    return checksum_row_from_hashes(root, path, hashes)
+    return checksum_row_from_hashes(root, path, hashes), hashes
 
 
 def promote_legacy_staged_file(
@@ -424,12 +454,17 @@ def promote_legacy_staged_file(
     item: HubFile,
     *,
     progress,
-) -> dict | None:
+    torrent_accumulator=None,
+) -> tuple[dict, FileHashes] | None:
     staged_path = staging_dir / item.path
     if not staged_path.exists() or not staged_path.is_file():
         return None
     progress.update(0, stage="hashing-staged", force=True)
-    hashes = file_hashes(staged_path, on_progress=lambda done: progress.update(done, stage="hashing-staged"))
+    hashes = file_hashes(
+        staged_path,
+        accumulators=(torrent_accumulator,) if torrent_accumulator is not None else (),
+        on_progress=lambda done: progress.update(done, stage="hashing-staged"),
+    )
     try:
         ensure_hashes_match(item, staged_path, hashes)
     except DownloadIntegrityError:
@@ -439,7 +474,7 @@ def promote_legacy_staged_file(
     destination.parent.mkdir(parents=True, exist_ok=True)
     progress.update(staged_path.stat().st_size, stage="promoting-staged", force=True)
     staged_path.replace(destination)
-    return checksum_row_from_hashes(root, destination, hashes)
+    return checksum_row_from_hashes(root, destination, hashes), hashes
 
 
 def stream_file_to_path(
@@ -447,6 +482,7 @@ def stream_file_to_path(
     item: HubFile,
     destination: Path,
     *,
+    torrent_accumulator=None,
     progress=None,
     stall_timeout_seconds: int = 600,
     stall_retries: int = DEFAULT_STALL_RETRIES,
@@ -455,12 +491,15 @@ def stream_file_to_path(
     stall_retry_count = 0
     allow_resume = True
     while True:
+        if torrent_accumulator is not None:
+            torrent_accumulator.reset()
         try:
             return stream_file_to_path_once(
                 snapshot,
                 item,
                 destination,
                 allow_resume=allow_resume,
+                torrent_accumulator=torrent_accumulator,
                 progress=progress,
                 stall_timeout_seconds=stall_timeout_seconds,
             )
@@ -489,6 +528,7 @@ def stream_file_to_path_once(
     destination: Path,
     *,
     allow_resume: bool,
+    torrent_accumulator=None,
     progress=None,
     stall_timeout_seconds: int = 600,
 ) -> FileHashes:
@@ -503,6 +543,7 @@ def stream_file_to_path_once(
             tmp_path,
             total_size=expected_size,
             prefix_size=resume_size,
+            accumulators=(torrent_accumulator,) if torrent_accumulator is not None else (),
             on_progress=(
                 (lambda done: progress.update(done, stage="hashing-partial")) if progress is not None else None
             ),
@@ -513,7 +554,14 @@ def stream_file_to_path_once(
     if resume_size == expected_size:
         if progress is not None:
             progress.update(resume_size, stage="verifying-partial", force=True)
-        hashes = hash_state.hashes if hash_state is not None else file_hashes(tmp_path)
+        hashes = (
+            hash_state.hashes
+            if hash_state is not None
+            else file_hashes(
+                tmp_path,
+                accumulators=(torrent_accumulator,) if torrent_accumulator is not None else (),
+            )
+        )
         ensure_hashes_match(item, tmp_path, hashes)
         tmp_path.replace(destination)
         return hashes
@@ -532,6 +580,7 @@ def stream_file_to_path_once(
                 raw,
                 expected_size=expected_size,
                 hash_state=hash_state,
+                accumulators=(torrent_accumulator,) if torrent_accumulator is not None else (),
                 on_progress=(
                     (lambda done: progress.update(done, stage="downloading")) if progress is not None else None
                 ),
@@ -572,6 +621,28 @@ def stream_file_to_path_once(
         if not allow_resume and not isinstance(exc, StallTimeoutError):
             tmp_path.unlink(missing_ok=True)
         raise
+
+
+def torrent_coverage_recorder(root: Path, snapshot: HubSnapshot):
+    if not snapshot.files:
+        return None
+    for item in snapshot.files:
+        if item.size is None or (item.lfs_sha256 is None and item.blob_id is None):
+            return None
+    from .torrent_coverage import TorrentCoverageRecorder
+
+    return TorrentCoverageRecorder(root, snapshot)
+
+
+def record_torrent_coverage(coverage_recorder, item, path: Path, hashes: FileHashes, accumulator) -> None:
+    if coverage_recorder is None or accumulator is None:
+        return
+    if accumulator.bytes_hashed != path.stat().st_size:
+        accumulator.reset()
+        fallback_hashes = file_hashes(path, accumulators=(accumulator,))
+        if fallback_hashes != hashes:
+            raise DownloadIntegrityError(f"streamed hashes changed before torrent coverage for {item.path}")
+    coverage_recorder.record(item, path, hashes, accumulator.finalize())
 
 
 def incomplete_path_for(destination: Path) -> Path:

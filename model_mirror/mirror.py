@@ -83,6 +83,9 @@ def mirror_locked(
         existing_state=existing_state,
         force=force,
     )
+    from .torrent_publication import assert_commit_update_allowed, load_fenced_publication
+
+    assert_commit_update_allowed(destination, snapshot.resolved_commit)
     metadata = snapshot.files
 
     if not force and verify_remote(destination, metadata, check_hashes=False).ok:
@@ -111,6 +114,13 @@ def mirror_locked(
             from_manifest=checksums_written,
         )
         return MirrorResult("complete" if state.clean else "downloaded-unverified", destination, len(metadata))
+
+    fenced = load_fenced_publication(destination)
+    if fenced is not None:
+        raise RuntimeError(
+            f"published payload cannot be replaced by mirror: {fenced[0].publication_id}; "
+            "use same-commit repair or retire the publication"
+        )
 
     write_verification_state(
         destination,

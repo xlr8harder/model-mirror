@@ -5,7 +5,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Protocol
 
 
 CHECKSUMS = ".checksums"
@@ -61,6 +61,12 @@ class FileHashState:
         return FileHashes(sha256=self.sha256.hexdigest(), git_blob_sha1=self.git_blob_sha1.hexdigest())
 
 
+class StreamingAccumulator(Protocol):
+    def update(self, data: bytes) -> None: ...
+
+    def reset(self) -> None: ...
+
+
 class HashingWriter:
     def __init__(
         self,
@@ -68,11 +74,13 @@ class HashingWriter:
         *,
         expected_size: int,
         hash_state: FileHashState | None = None,
+        accumulators: tuple[StreamingAccumulator, ...] = (),
         on_progress: Callable[[int], None] | None = None,
     ):
         self._handle = handle
         self._expected_size = expected_size
         self._hash_state = hash_state or new_hash_state(expected_size)
+        self._accumulators = accumulators
         self._on_progress = on_progress
 
     def write(self, data: bytes) -> int:
@@ -80,6 +88,8 @@ class HashingWriter:
         chunk = data if written == len(data) else data[:written]
         self._hash_state.sha256.update(chunk)
         self._hash_state.git_blob_sha1.update(chunk)
+        for accumulator in self._accumulators:
+            accumulator.update(chunk)
         self._hash_state.bytes_hashed += written
         if self._on_progress is not None:
             self._on_progress(self._hash_state.bytes_hashed)
@@ -95,6 +105,8 @@ class HashingWriter:
         truncated = self._handle.truncate(size)
         if truncated == 0:
             self._hash_state = new_hash_state(self._expected_size)
+            for accumulator in self._accumulators:
+                accumulator.reset()
         elif truncated != self._hash_state.bytes_hashed:
             raise OSError("cannot preserve streaming hash state after non-zero truncate")
         return truncated
@@ -122,6 +134,7 @@ def hash_file_prefix(
     *,
     total_size: int,
     prefix_size: int,
+    accumulators: tuple[StreamingAccumulator, ...] = (),
     on_progress: Callable[[int], None] | None = None,
 ) -> FileHashState:
     state = new_hash_state(total_size)
@@ -133,6 +146,8 @@ def hash_file_prefix(
                 raise OSError(f"short read while hashing prefix: {path}")
             state.sha256.update(chunk)
             state.git_blob_sha1.update(chunk)
+            for accumulator in accumulators:
+                accumulator.update(chunk)
             state.bytes_hashed += len(chunk)
             if on_progress is not None:
                 on_progress(state.bytes_hashed)
@@ -152,7 +167,12 @@ def iter_payload_files(root: Path):
         yield path
 
 
-def file_hashes(path: Path, *, on_progress: Callable[[int], None] | None = None) -> FileHashes:
+def file_hashes(
+    path: Path,
+    *,
+    accumulators: tuple[StreamingAccumulator, ...] = (),
+    on_progress: Callable[[int], None] | None = None,
+) -> FileHashes:
     stat = path.stat()
     digest = hashlib.sha256()
     blob_digest = hashlib.sha1()
@@ -162,6 +182,8 @@ def file_hashes(path: Path, *, on_progress: Callable[[int], None] | None = None)
         for chunk in iter(lambda: handle.read(16 * 1024 * 1024), b""):
             digest.update(chunk)
             blob_digest.update(chunk)
+            for accumulator in accumulators:
+                accumulator.update(chunk)
             bytes_hashed += len(chunk)
             if on_progress is not None:
                 on_progress(bytes_hashed)

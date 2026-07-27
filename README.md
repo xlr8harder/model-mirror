@@ -124,6 +124,107 @@ An offline-only mirror cannot be repaired because there is no upstream source to
 repair against. A direct `repair org/model` exits non-zero with that explanation;
 `repair --all` logs a warning and skips offline-only mirrors.
 
+## Torrent Publishing And Recovery
+
+Torrent support is optional:
+
+```bash
+pip install 'model-mirror[torrent]'
+```
+
+Every torrent is an immutable publication of one resolved
+`repo@commit`. Publishing first requires a clean, pinned mirror. It completes
+any missing torrent hash coverage, writes an ordinary hybrid v1/v2 `.torrent`,
+prints a standard magnet URI and external-client data location, and creates a
+persistent fence that prevents the canonical archive from moving to another
+commit.
+
+```bash
+model-mirror upgrade org/model             # optional explicit precomputation
+model-mirror torrent create org/model      # artifacts and fence; no seed intent
+model-mirror torrent publish org/model     # artifacts, fence, and durable seed intent
+model-mirror torrent show org/model
+```
+
+Downloads and same-commit repairs accumulate reusable torrent hashes during
+their existing payload pass. `upgrade` is for older archives or incomplete
+coverage; it reads only files still missing the selected publication profile:
+
+```bash
+model-mirror upgrade org/model
+model-mirror upgrade --all --dry-run
+model-mirror upgrade --all
+```
+
+The managed backend is a replaceable long-running process:
+
+```bash
+model-mirror torrent serve
+```
+
+Run it under your normal service manager with restart-on-failure and
+restart-on-boot. Publication intent, verified file fingerprints, and the update
+fence are durable; a restarted backend reconciles desired seeds without an
+explicit reseed command or a payload-wide recheck. `model-mirror status` reports
+desired and observed torrent state. A minimal systemd service uses the same
+configured archive:
+
+```ini
+[Service]
+ExecStart=/path/to/model-mirror --config /path/to/config.yaml torrent serve
+Restart=always
+```
+
+The emitted `.torrent` and magnet are not tied to the managed backend. To use a
+preferred client, either add the printed torrent with its printed data location
+for seeding, or record external ownership explicitly:
+
+```bash
+model-mirror torrent publish --external org/model
+```
+
+Model-mirror does not control or infer the runtime health of an external
+client. Stop that client before modifying payload. `torrent stop` stops managed
+intent (or records that an external seed was stopped) but deliberately retains
+the update fence. Only explicit retirement releases it:
+
+```bash
+model-mirror torrent stop org/model
+model-mirror torrent retire org/model
+model-mirror repair --update org/model
+```
+
+Same-commit `repair` enters maintenance, waits for the managed backend to
+detach, repairs only recorded paths, refreshes their coverage, and resumes the
+same publication when verification succeeds. `repair --update` stays blocked
+until retirement.
+
+On another host, model-mirror can download natively or provide an exact
+standard-client handoff:
+
+```bash
+model-mirror torrent join /path/model@commit.torrent
+model-mirror torrent join 'magnet:?xt=...' --seed
+
+model-mirror torrent handoff /path/model@commit.torrent
+# Download with any standard client to the printed data location, then run:
+model-mirror torrent import /path/model@commit.torrent /printed/path/model
+```
+
+Import validates hostile paths, the commit-scoped descriptor, sizes, and
+content before atomically moving the staged payload into the normal archive
+layout. Native join reuses libtorrent's verified piece state and reconstructs
+coverage without rereading the payload. External-client import independently
+reads and hashes the downloaded files because model-mirror cannot assume that
+client's runtime state.
+
+A trusted torrent proves consistency with the supplied infohash; by itself it
+does not prove that the publisher's bytes were authentic Hugging Face content.
+Imported state therefore records `torrent-verified`,
+`trusted-infohash`, and `not-upstream-verified` separately. It remains usable
+when upstream has disappeared and can later be checked against upstream if it
+becomes available.
+
 ## Periodic Jobs
 
 For alert-only checks, run verification periodically and let its non-zero exit
@@ -153,16 +254,24 @@ specific Hub commit. The local mirror is tied to that commit.
 
 If `verify` sees that upstream `main` now points at a different commit, it marks
 the mirror with `upstream_status: changed` but does not overwrite local files.
-`repair` consumes that verification state, repairs the recorded commit, and
-reports that the upstream change was not applied. Updating is explicit:
+
+Repair and update are deliberately separate operations:
+
+- `repair` restores missing or damaged files from the mirror's currently
+  recorded commit. It never moves the mirror to a different commit, even when
+  `verify` has detected an upstream change.
+- `repair --update` explicitly moves the mirror to the changed upstream commit
+  recorded by `verify`.
+
+Updating one or all changed mirrors is therefore explicit:
 
 ```bash
 model-mirror repair --update org/model
 model-mirror repair --all --update
-model-mirror mirror --commit abc123 org/model
 ```
 
-Use `--commit` when you want a reproducible archive of an exact Hub revision.
+Use `model-mirror mirror --commit abc123 org/model` when you want a reproducible
+archive pinned to an exact Hub revision.
 
 ## Common Commands
 
@@ -177,6 +286,9 @@ model-mirror repair --update org/model     # apply a changed upstream commit rec
 model-mirror offline org/model             # local verification only; no Hub checks
 model-mirror online org/model              # re-enable Hub checks
 model-mirror list                          # show mirrors, state tags, and verification age
+model-mirror upgrade org/model             # fill missing torrent hash coverage
+model-mirror torrent publish org/model     # publish and request durable seeding
+model-mirror torrent join FILE_OR_MAGNET   # recover a normal local archive
 ```
 
 Datasets and Spaces are supported with `--repo-type dataset` or

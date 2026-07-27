@@ -23,7 +23,7 @@ from .config import (
     parse_positive_int,
     save_config,
 )
-from .hub import HuggingFaceHub, get_snapshot
+from .hub import HuggingFaceHub, get_snapshot, read_snapshot_plan
 from .lock import ModelBusyError, ModelLock, lock_label, read_active_lock
 from .mirror import mirror
 from .progress import ProgressEntry, ProgressSnapshot, progress_snapshot
@@ -203,6 +203,109 @@ def build_parser() -> argparse.ArgumentParser:
         "--repo-type", choices=["model", "dataset", "space"], default="model", help="repo kind to repair"
     )
 
+    upgrade_parser = add_command_parser(
+        "upgrade",
+        help="add complete torrent hash coverage to existing archives",
+        description=(
+            "Read only payload files missing reusable torrent hash coverage. "
+            "Payload bytes and the pinned resolved commit are not changed."
+        ),
+        epilog="Exit status: 0 when coverage is complete or the dry-run succeeds; 1 on an unreadable archive or busy model.",
+    )
+    upgrade_parser.add_argument("model", metavar="repo", nargs="?", help="repo id to upgrade unless --all is used")
+    upgrade_parser.add_argument("--all", action="store_true", help="upgrade every mirrored repository of this type")
+    upgrade_parser.add_argument("--dry-run", action="store_true", help="report required reads without changing metadata")
+    upgrade_parser.add_argument(
+        "--repo-type", choices=["model", "dataset", "space"], default="model", help="repo kind to upgrade"
+    )
+
+    torrent_parser = add_command_parser(
+        "torrent",
+        help="publish, seed, inspect, or retire commit-pinned torrents",
+        description="Manage client-independent torrent artifacts and model-mirror's durable seed intent.",
+    )
+    torrent_subparsers = torrent_parser.add_subparsers(dest="torrent_command")
+
+    def add_torrent_repo_command(name: str, help_text: str) -> argparse.ArgumentParser:
+        command = torrent_subparsers.add_parser(name, help=help_text)
+        command.add_argument("model", metavar="repo", help="repo id, e.g. org/model")
+        command.add_argument(
+            "--repo-type",
+            choices=["model", "dataset", "space"],
+            default="model",
+            help="repo kind",
+        )
+        return command
+
+    create_torrent_parser = add_torrent_repo_command(
+        "create",
+        "create an ordinary .torrent and recovery record without requesting managed seeding",
+    )
+    create_torrent_parser.add_argument(
+        "--external",
+        action="store_true",
+        help="record that runtime seeding is owned by an external client",
+    )
+    publish_torrent_parser = add_torrent_repo_command(
+        "publish",
+        "create or reuse a publication and request durable seeding",
+    )
+    publish_torrent_parser.add_argument(
+        "--external",
+        action="store_true",
+        help="emit external-client handoff instead of managed seed intent",
+    )
+    add_torrent_repo_command("show", "show publication, trust, fence, and backend state")
+    add_torrent_repo_command("stop", "stop desired managed seeding without releasing the update fence")
+    add_torrent_repo_command("retire", "remove desired seeding and release the update fence")
+    handoff_torrent_parser = torrent_subparsers.add_parser(
+        "handoff",
+        help="print a standard-client download destination and exact import command",
+    )
+    handoff_torrent_parser.add_argument("torrent_file", type=Path, help="model-mirror .torrent file")
+    import_torrent_parser = torrent_subparsers.add_parser(
+        "import",
+        help="validate and atomically finalize payload downloaded by an external client",
+    )
+    import_torrent_parser.add_argument("torrent_file", type=Path, help="model-mirror .torrent file")
+    import_torrent_parser.add_argument("payload_root", type=Path, help="downloaded torrent root directory")
+    import_torrent_parser.add_argument(
+        "--seed",
+        action="store_true",
+        help="request managed seeding after successful import",
+    )
+    join_torrent_parser = torrent_subparsers.add_parser(
+        "join",
+        help="download a model-mirror torrent or magnet and finalize it as a local archive",
+    )
+    join_torrent_parser.add_argument("source", help="path to a .torrent file or a magnet URI")
+    join_torrent_parser.add_argument(
+        "--seed",
+        action="store_true",
+        help="request managed seeding after successful join",
+    )
+    join_torrent_parser.add_argument(
+        "--metadata-timeout",
+        type=float,
+        default=120.0,
+        help="seconds to wait for magnet metadata; default 120",
+    )
+    serve_torrent_parser = torrent_subparsers.add_parser(
+        "serve",
+        help="run the managed libtorrent backend and reconcile durable seed intent",
+    )
+    serve_torrent_parser.add_argument(
+        "--poll-seconds",
+        type=float,
+        default=2.0,
+        help="desired-state reconciliation interval; default 2 seconds",
+    )
+    serve_torrent_parser.add_argument(
+        "--once",
+        action="store_true",
+        help="perform one reconciliation pass and stop (diagnostic)",
+    )
+
     offline_parser = add_command_parser(
         "offline",
         help="mark a mirror offline-only",
@@ -335,6 +438,10 @@ def main(argv: list[str] | None = None, *, hub=None) -> int:
             return handle_verify(args, config, hub=hub)
         if args.command == "repair":
             return handle_repair(args, config, hub=hub)
+        if args.command == "upgrade":
+            return handle_upgrade(args, config)
+        if args.command == "torrent":
+            return handle_torrent(args, config)
         if args.command == "offline":
             return handle_offline_mode(args, config, offline_only=True)
         if args.command == "online":
@@ -619,6 +726,9 @@ def handle_list(config: Config) -> int:
             )
         else:
             fields.extend(["state=unverified", "last_check=unknown"])
+        torrent_status = list_torrent_status(model)
+        if torrent_status is not None:
+            fields.append(f"torrent={torrent_status}")
         print("  ".join(fields))
         if active_lock is not None:
             print(f"  lock: {format_lock_detail(active_lock)}")
@@ -626,6 +736,40 @@ def handle_list(config: Config) -> int:
         if progress_detail is not None:
             print(f"  progress: {progress_detail}")
     return 0
+
+
+def list_torrent_status(root: Path) -> str | None:
+    from .torrent_publication import load_fenced_publication
+
+    try:
+        fenced = load_fenced_publication(root)
+    except (OSError, ValueError):
+        return "metadata-error"
+    if fenced is None:
+        return None
+    record = fenced[0]
+    parts = [record.lifecycle, record.client_mode]
+    parts.append(f"desired={'seeding' if record.desired_seed else 'stopped'}")
+    parts.append(f"observed={record.observed_backend}")
+    state = read_verification_state(root)
+    if state is not None and state.upstream_status == "changed":
+        parts.append("update-available")
+    try:
+        coverage_status = torrent_coverage_status(root)
+    except (OSError, ValueError, RuntimeError):
+        coverage_status = "metadata-error"
+    parts.append(f"coverage={coverage_status}")
+    return ",".join(parts)
+
+
+def torrent_coverage_status(root: Path) -> str:
+    snapshot = read_snapshot_plan(root)
+    if snapshot is None:
+        return "unavailable"
+    from .torrent_coverage import TorrentCoverageRecorder
+
+    recorder = TorrentCoverageRecorder(root, snapshot)
+    return "complete" if recorder.complete else "partial"
 
 
 def archive_cache_usage(config: Config) -> CacheUsage:
@@ -880,6 +1024,245 @@ def handle_repair(args, config: Config, *, hub=None) -> int:
     if not args.model:
         raise SystemExit("repair requires a model id unless --all is used")
     return repair_one(config, args.model, args, hub=hub)
+
+
+def handle_upgrade(args, config: Config) -> int:
+    if args.all and args.model:
+        raise SystemExit("upgrade accepts a model id or --all, not both")
+    if not args.all and not args.model:
+        raise SystemExit("upgrade requires a model id unless --all is used")
+    repo_ids = list_repo_ids(config, args.repo_type) if args.all else [args.model]
+    failures = 0
+    for repo_id in repo_ids:
+        root = archive_path(config, repo_id, args.repo_type)
+        try:
+            with ModelLock(root, "upgrade", repo_id, args.repo_type):
+                snapshot = read_snapshot_plan(root)
+                if snapshot is None:
+                    print(
+                        f"upgrade unavailable: {repo_id} has no pinned snapshot description; "
+                        f"run model-mirror verify {repo_id}"
+                    )
+                    failures += 1
+                    continue
+                from .torrent_coverage import upgrade_coverage
+
+                result = upgrade_coverage(
+                    root,
+                    snapshot,
+                    dry_run=args.dry_run,
+                    on_progress=lambda rel, done, total: print_upgrade_progress(
+                        repo_id,
+                        rel,
+                        done,
+                        total,
+                    ),
+                )
+        except (OSError, ValueError, RuntimeError) as exc:
+            print(f"upgrade failed: {repo_id} -> {exc}")
+            failures += 1
+            continue
+        action = "would-hash" if args.dry_run else "hashed"
+        print(
+            f"{'upgrade dry-run' if args.dry_run else 'upgraded'}: {repo_id} "
+            f"coverage={result.covered_files}/{result.total_files} "
+            f"{action}_files={result.hashed_files} {action}_bytes={format_bytes(result.hashed_bytes)} "
+            f"path={result.path}"
+        )
+        if not result.complete and not args.dry_run:
+            failures += 1
+    return 1 if failures else 0
+
+
+def print_upgrade_progress(repo_id: str, rel: str, done: int, total: int) -> None:
+    if done == total:
+        print(f"hashed: {repo_id}:{rel} {format_bytes(total)}")
+
+
+def handle_torrent(args, config: Config) -> int:
+    if args.torrent_command is None:
+        print("torrent requires a subcommand; run model-mirror help torrent")
+        return 2
+    if args.torrent_command == "serve":
+        from .torrent_seed import serve
+
+        print(
+            f"managed torrent backend: {'single reconciliation' if args.once else 'serving'} "
+            f"archive={config.directory}"
+        )
+        try:
+            serve(config, poll_seconds=args.poll_seconds, once=args.once)
+        except (OSError, ValueError, RuntimeError) as exc:
+            print(f"managed torrent backend failed: {exc}")
+            return 1
+        return 0
+    if args.torrent_command in {"handoff", "import", "join"}:
+        return handle_torrent_receive(args, config)
+
+    root = archive_path(config, args.model, args.repo_type)
+    if args.torrent_command == "retire":
+        return handle_torrent_retire(args, root)
+    try:
+        with ModelLock(root, f"torrent-{args.torrent_command}", args.model, args.repo_type):
+            return handle_torrent_locked(args, root)
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f"torrent {args.torrent_command} failed: {args.model} -> {exc}")
+        return 1
+
+
+def handle_torrent_locked(args, root: Path) -> int:
+    from .torrent_publication import (
+        create_publication,
+        load_fenced_publication,
+        set_seed_desired,
+    )
+
+    if args.torrent_command in {"create", "publish"}:
+        external = bool(args.external)
+        result = create_publication(
+            root,
+            repo_id=args.model,
+            repo_type=args.repo_type,
+            desired_seed=args.torrent_command == "publish" and not external,
+            client_mode="external" if external else "managed",
+        )
+        action = "created" if result.created else "reused"
+        print(
+            f"torrent {action}: {result.record.publication_id} "
+            f"coverage_hashed_files={result.coverage_hashed_files} "
+            f"coverage_hashed_bytes={format_bytes(result.coverage_hashed_bytes)}"
+        )
+        print_torrent_handoff(result.record, root)
+        if args.torrent_command == "publish" and not external:
+            print("desired seed: enabled; model-mirror torrent serve reconciles it now and after restart")
+        elif external:
+            print("client mode: external; model-mirror records the fence but does not manage client runtime")
+        return 0
+    if args.torrent_command == "show":
+        fenced = load_fenced_publication(root)
+        if fenced is None:
+            print(f"unpublished: {args.model}")
+            return 0
+        print_torrent_status(fenced[0], root)
+        return 0
+    if args.torrent_command == "stop":
+        record = set_seed_desired(root, desired=False)
+        print(f"torrent stopping: {record.publication_id}; publication fence retained")
+        return 0
+    raise ValueError(f"unsupported torrent command: {args.torrent_command}")
+
+
+def handle_torrent_retire(args, root: Path) -> int:
+    from .torrent_publication import (
+        retire_publication,
+        set_seed_desired,
+        wait_for_maintenance_detach,
+    )
+
+    try:
+        with ModelLock(root, "torrent-retire-stop", args.model, args.repo_type):
+            set_seed_desired(root, desired=False)
+        wait_for_maintenance_detach(root)
+        with ModelLock(root, "torrent-retire", args.model, args.repo_type):
+            record = retire_publication(root)
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f"torrent retire failed: {args.model} -> {exc}")
+        return 1
+    print(
+        f"torrent retired: {record.publication_id}; local update fence released. "
+        "Already distributed torrent metadata cannot be revoked."
+    )
+    return 0
+
+
+def print_torrent_handoff(record, root: Path) -> None:
+    print(f"torrent: {root / record.torrent_path}")
+    print(f"recovery: {root / record.recovery_path}")
+    print(f"magnet: {record.magnet_uri}")
+    print(f"external client data location: {root.parent}")
+
+
+def handle_torrent_receive(args, config: Config) -> int:
+    from .torrent_import import (
+        external_handoff,
+        import_external_payload,
+        join_torrent,
+        parse_publication_metainfo,
+    )
+
+    try:
+        if args.torrent_command == "handoff":
+            metainfo = args.torrent_file.read_bytes()
+            parsed = parse_publication_metainfo(metainfo)
+            destination, command = external_handoff(config, parsed, args.torrent_file)
+            print(f"publication: huggingface:{parsed.descriptor.repo_type}:{parsed.descriptor.repo_id}@{parsed.descriptor.resolved_commit}")
+            print(f"external client data location: {destination}")
+            print(f"after download: {command}")
+            return 0
+        if args.torrent_command == "import":
+            result = import_external_payload(
+                config,
+                metainfo=args.torrent_file.read_bytes(),
+                payload_root=args.payload_root,
+                seed=args.seed,
+            )
+        else:
+            result = join_torrent(
+                config,
+                args.source,
+                seed=args.seed,
+                metadata_timeout_seconds=args.metadata_timeout,
+                on_progress=print_join_progress,
+            )
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f"torrent {args.torrent_command} failed: {exc}")
+        return 1
+    print(
+        f"torrent imported: {result.publication.publication_id} -> {result.path} "
+        f"reread_files={result.reread_files} reread_bytes={format_bytes(result.reread_bytes)}"
+    )
+    print(
+        "content=torrent-verified publication_trust=trusted-infohash "
+        "upstream_provenance=not-upstream-verified upstream_availability=unknown"
+    )
+    print_torrent_handoff(result.publication, result.path)
+    if result.publication.desired_seed:
+        print("desired seed: enabled; model-mirror torrent serve will reconcile it")
+    return 0
+
+
+def print_join_progress(status) -> None:
+    print(
+        f"torrent download: {status.name} {status.progress * 100:.1f}% "
+        f"rate={format_bytes(int(status.download_payload_rate))}/s peers={status.num_peers}"
+    )
+
+
+def print_torrent_status(record, root: Path) -> None:
+    print(f"publication: {record.publication_id}")
+    print(f"lifecycle: {record.lifecycle}")
+    print(f"resolved_commit: {record.resolved_commit}")
+    print(f"profile: {record.profile}")
+    print(f"content_verification: {record.content_verification}")
+    print(f"publication_trust: {record.publication_trust}")
+    print(f"upstream_provenance: {record.upstream_provenance}")
+    print(f"upstream_availability: {record.upstream_availability}")
+    state = read_verification_state(root)
+    print(
+        f"update_available: "
+        f"{str(state is not None and state.upstream_status == 'changed').lower()}"
+    )
+    print("archive_schema: model-mirror-snapshot/1")
+    print(f"coverage_profile: {record.profile}")
+    print(f"coverage_state: {torrent_coverage_status(root)}")
+    print(f"client_mode: {record.client_mode}")
+    print(f"desired_seed: {str(record.desired_seed).lower()}")
+    print(f"observed_backend: {record.observed_backend}")
+    if record.observed_detail:
+        print(f"observed_detail: {record.observed_detail}")
+    print(f"infohash_v1: {record.infohash_v1}")
+    print(f"infohash_v2: {record.infohash_v2}")
+    print_torrent_handoff(record, root)
 
 
 def state_has_cached_hash_missing(state) -> bool:
@@ -1154,13 +1537,17 @@ def handle_offline_mode(args, config: Config, *, offline_only: bool) -> int:
 
 
 def list_model_ids(config: Config) -> list[str]:
-    models_root = Path(config.directory) / "models"
-    if not models_root.exists():
+    return list_repo_ids(config, "model")
+
+
+def list_repo_ids(config: Config, repo_type: str) -> list[str]:
+    repos_root = Path(config.directory) / REPO_TYPE_DIRS[repo_type]
+    if not repos_root.exists():
         return []
     result = []
-    for owner in sorted(path for path in models_root.iterdir() if path.is_dir()):
-        for model in sorted(path for path in owner.iterdir() if path.is_dir()):
-            result.append(f"{owner.name}/{model.name}")
+    for owner in sorted(path for path in repos_root.iterdir() if path.is_dir()):
+        for repo in sorted(path for path in owner.iterdir() if path.is_dir()):
+            result.append(f"{owner.name}/{repo.name}")
     return result
 
 

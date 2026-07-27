@@ -83,6 +83,47 @@ def test_file_hashing_progress_callbacks_report_bytes(tmp_path):
     assert writer_progress == [len(payload)]
 
 
+def test_streaming_accumulators_follow_prefix_writes_and_reset(tmp_path):
+    class RecordingAccumulator:
+        def __init__(self):
+            self.payload = bytearray()
+            self.resets = 0
+
+        def update(self, data):
+            self.payload.extend(data)
+
+        def reset(self):
+            self.payload.clear()
+            self.resets += 1
+
+    prefix_path = tmp_path / "prefix.bin"
+    prefix_path.write_bytes(b"prefix")
+    prefix_accumulator = RecordingAccumulator()
+    hash_file_prefix(
+        prefix_path,
+        total_size=6,
+        prefix_size=6,
+        accumulators=(prefix_accumulator,),
+    )
+    assert prefix_accumulator.payload == b"prefix"
+
+    output_accumulator = RecordingAccumulator()
+    with (tmp_path / "out.bin").open("wb") as raw:
+        writer = HashingWriter(
+            raw,
+            expected_size=3,
+            accumulators=(output_accumulator,),
+        )
+        writer.write(b"bad")
+        assert output_accumulator.payload == b"bad"
+        writer.seek(0)
+        writer.truncate()
+        writer.write(b"abc")
+
+    assert output_accumulator.resets == 1
+    assert output_accumulator.payload == b"abc"
+
+
 def test_hashing_writer_resets_hashes_when_http_retry_truncates(tmp_path):
     path = tmp_path / "file.bin"
     with path.open("wb") as raw:

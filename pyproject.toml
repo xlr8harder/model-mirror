@@ -13,10 +13,16 @@ dependencies = [
   "PyYAML>=6.0",
 ]
 
+[project.optional-dependencies]
+torrent = [
+  "libtorrent>=2.0.10,<2.1",
+]
+
 [dependency-groups]
 dev = [
   "pytest>=8.0",
   "coverage>=7.0",
+  "libtorrent>=2.0.10,<2.1",
 ]
 
 [project.scripts]
