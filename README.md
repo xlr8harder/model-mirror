@@ -124,9 +124,12 @@ An offline-only mirror cannot be repaired because there is no upstream source to
 repair against. A direct `repair org/model` exits non-zero with that explanation;
 `repair --all` logs a warning and skips offline-only mirrors.
 
-## Torrent Publishing And Recovery
+## Experimental Torrent Publishing And Recovery
 
-Torrent support is optional:
+Torrent support is optional and experimental. The `upgrade` and `torrent`
+commands, their behavior, and the torrent-specific metadata formats may change
+before stabilization. Ordinary mirror, verify, and repair workflows remain
+stable and do not require the torrent extra:
 
 ```bash
 pip install 'model-mirror[torrent]'

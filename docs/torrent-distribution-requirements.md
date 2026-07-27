@@ -1,6 +1,11 @@
 # Torrent Distribution And Archive Upgrade Requirements
 
-Status: Normative baseline; initial implementation completed 2026-07-27.
+Status: Experimental normative baseline; initial implementation completed
+2026-07-27.
+
+The torrent CLI, managed backend, and torrent-specific metadata formats are
+experimental. This document defines the current contract, but compatibility is
+not promised until the feature is stabilized.
 
 ## Purpose
 

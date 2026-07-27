@@ -38,6 +38,11 @@ from .state import (
 from .verify import RemoteVerifyResult, merge_checksum_result, verify_remote
 
 
+TORRENT_EXPERIMENTAL_NOTICE = (
+    "EXPERIMENTAL: torrent interfaces and metadata formats may change before stabilization."
+)
+
+
 CONFIG_OPTIONS = [
     (
         "directory",
@@ -205,8 +210,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     upgrade_parser = add_command_parser(
         "upgrade",
-        help="add complete torrent hash coverage to existing archives",
+        help="EXPERIMENTAL: add complete torrent hash coverage to existing archives",
         description=(
+            f"{TORRENT_EXPERIMENTAL_NOTICE} "
             "Read only payload files missing reusable torrent hash coverage. "
             "Payload bytes and the pinned resolved commit are not changed."
         ),
@@ -221,13 +227,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     torrent_parser = add_command_parser(
         "torrent",
-        help="publish, seed, inspect, or retire commit-pinned torrents",
-        description="Manage client-independent torrent artifacts and model-mirror's durable seed intent.",
+        help="EXPERIMENTAL: publish, seed, inspect, or retire commit-pinned torrents",
+        description=(
+            f"{TORRENT_EXPERIMENTAL_NOTICE} "
+            "Manage client-independent torrent artifacts and model-mirror's durable seed intent."
+        ),
     )
     torrent_subparsers = torrent_parser.add_subparsers(dest="torrent_command")
 
     def add_torrent_repo_command(name: str, help_text: str) -> argparse.ArgumentParser:
-        command = torrent_subparsers.add_parser(name, help=help_text)
+        command = torrent_subparsers.add_parser(
+            name,
+            help=help_text,
+            description=f"{TORRENT_EXPERIMENTAL_NOTICE} {help_text.capitalize()}.",
+        )
         command.add_argument("model", metavar="repo", help="repo id, e.g. org/model")
         command.add_argument(
             "--repo-type",
@@ -261,11 +274,19 @@ def build_parser() -> argparse.ArgumentParser:
     handoff_torrent_parser = torrent_subparsers.add_parser(
         "handoff",
         help="print a standard-client download destination and exact import command",
+        description=(
+            f"{TORRENT_EXPERIMENTAL_NOTICE} "
+            "Print a standard-client download destination and exact import command."
+        ),
     )
     handoff_torrent_parser.add_argument("torrent_file", type=Path, help="model-mirror .torrent file")
     import_torrent_parser = torrent_subparsers.add_parser(
         "import",
         help="validate and atomically finalize payload downloaded by an external client",
+        description=(
+            f"{TORRENT_EXPERIMENTAL_NOTICE} "
+            "Validate and atomically finalize payload downloaded by an external client."
+        ),
     )
     import_torrent_parser.add_argument("torrent_file", type=Path, help="model-mirror .torrent file")
     import_torrent_parser.add_argument("payload_root", type=Path, help="downloaded torrent root directory")
@@ -277,6 +298,10 @@ def build_parser() -> argparse.ArgumentParser:
     join_torrent_parser = torrent_subparsers.add_parser(
         "join",
         help="download a model-mirror torrent or magnet and finalize it as a local archive",
+        description=(
+            f"{TORRENT_EXPERIMENTAL_NOTICE} "
+            "Download a model-mirror torrent or magnet and finalize it as a local archive."
+        ),
     )
     join_torrent_parser.add_argument("source", help="path to a .torrent file or a magnet URI")
     join_torrent_parser.add_argument(
@@ -293,6 +318,10 @@ def build_parser() -> argparse.ArgumentParser:
     serve_torrent_parser = torrent_subparsers.add_parser(
         "serve",
         help="run the managed libtorrent backend and reconcile durable seed intent",
+        description=(
+            f"{TORRENT_EXPERIMENTAL_NOTICE} "
+            "Run the managed libtorrent backend and reconcile durable seed intent."
+        ),
     )
     serve_torrent_parser.add_argument(
         "--poll-seconds",
@@ -1239,6 +1268,7 @@ def print_join_progress(status) -> None:
 
 
 def print_torrent_status(record, root: Path) -> None:
+    print("feature_stability: experimental")
     print(f"publication: {record.publication_id}")
     print(f"lifecycle: {record.lifecycle}")
     print(f"resolved_commit: {record.resolved_commit}")

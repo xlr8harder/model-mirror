@@ -11,6 +11,7 @@ import model_mirror.torrent_seed as seed_module
 import model_mirror.torrent_coverage as coverage_module
 from model_mirror.checksums import write_checksums
 from model_mirror.cli import (
+    build_parser,
     handle_torrent_locked,
     list_torrent_status,
     main,
@@ -26,6 +27,24 @@ from model_mirror.torrent_publication import create_publication, update_observed
 
 
 COMMIT = "a" * 40
+
+
+def test_torrent_and_upgrade_help_are_experimental(capsys):
+    parser = build_parser()
+    parser.print_help()
+    main_help = capsys.readouterr().out
+    assert "EXPERIMENTAL: add complete torrent hash coverage" in main_help
+    assert "EXPERIMENTAL: publish, seed, inspect" in main_help
+
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args(["upgrade", "--help"])
+    assert exc.value.code == 0
+    assert "EXPERIMENTAL: torrent interfaces and metadata formats" in capsys.readouterr().out
+
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args(["torrent", "join", "--help"])
+    assert exc.value.code == 0
+    assert "EXPERIMENTAL: torrent interfaces and metadata formats" in capsys.readouterr().out
 
 
 def archive(tmp_path, *, repo_id="org/model"):
@@ -110,6 +129,7 @@ def test_torrent_create_publish_show_stop_retire_and_errors(tmp_path, capsys):
     assert "torrent=published,managed" in capsys.readouterr().out
     assert main(["--config", str(config), "torrent", "show", "org/model"]) == 0
     output = capsys.readouterr().out
+    assert "feature_stability: experimental" in output
     assert "desired_seed: false" in output and "upstream_provenance: upstream-verified" in output
 
     update_observed_backend(root, state="error", detail="backend detail")

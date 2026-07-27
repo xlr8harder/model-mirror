@@ -1,6 +1,7 @@
 # Torrent Backend Spike
 
-Status: Direct libtorrent selected and integrated as the managed backend.
+Status: Experimental; direct libtorrent selected and integrated as the managed
+backend.
 
 Date: 2026-07-27.
 
@@ -9,7 +10,8 @@ Date: 2026-07-27.
 Use libtorrent 2.0.x directly for model-mirror's managed torrent backend.
 Continue to emit ordinary `.torrent` and magnet artifacts so users can seed or
 download with another client. Treat those external clients as unmanaged rather
-than attempting client-specific lifecycle control.
+than attempting client-specific lifecycle control. The managed interface and
+torrent-specific metadata formats remain experimental.
 
 The Python binding is an optional runtime extra:
 
