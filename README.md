@@ -59,12 +59,27 @@ reference. Run `model-mirror config options` for every supported config key.
 Commands exit non-zero for dirty, incomplete, busy, or invalid states where that
 matters; see each subcommand's help for exact exit-status behavior.
 
-`model-mirror status` gives an archive-wide operational view: configured
-archive roots, mirror count and payload size, cache and temporary usage, and
-each repository's size, verification state, last check, active lock, and live
-file progress. Torrent state is included when present. `model-mirror list` is
-currently an alias for the same output. State tags include values such as
-`offline` and `needs-repair`.
+Without a repository argument, `model-mirror status` prints a compact
+archive-wide table with repository type and ID, file count, payload size,
+abbreviated resolved commit, last-check age, and exceptional state. A healthy
+row uses `-` in `EXCEPTIONS` instead of repeating `clean`. Torrent and live
+activity columns appear only when relevant. `model-mirror list` is currently an
+alias for the same output.
+
+Pass a repository ID for a detailed, strictly local last-known report without
+contacting the Hub:
+
+```bash
+model-mirror status org/model
+model-mirror list org/model                 # same detailed view
+model-mirror status --repo-type dataset org/data
+```
+
+The detailed view includes the explicit status, full resolved and upstream
+commits, snapshot commit, requested revision, exact payload bytes, payload and
+expected-file counts, verification timestamp, issues, repair paths, lock,
+progress, and torrent state. A mismatch between verification and snapshot
+commits is reported as `snapshot-stale`.
 
 ## Verification
 
@@ -320,6 +335,7 @@ model-mirror offline org/model             # local verification only; no Hub che
 model-mirror online org/model              # re-enable Hub checks
 model-mirror list                          # show mirrors, state tags, and verification age
 model-mirror status                        # archive sizes, cache use, locks, progress, and torrent state
+model-mirror status org/model              # detailed last-known local repository state
 model-mirror upgrade org/model             # fill missing torrent hash coverage
 model-mirror torrent publish org/model     # publish and request durable seeding
 model-mirror torrent join FILE_OR_MAGNET   # recover a normal local archive

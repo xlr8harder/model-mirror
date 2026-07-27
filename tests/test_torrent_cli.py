@@ -126,7 +126,9 @@ def test_torrent_create_publish_show_stop_retire_and_errors(tmp_path, capsys):
     assert torrent_coverage_status(root) == "complete"
     assert torrent_coverage_status(tmp_path / "missing") == "unavailable"
     assert main(["--config", str(config), "status"]) == 0
-    assert "torrent=published,managed" in capsys.readouterr().out
+    status_output = capsys.readouterr().out
+    assert "TORRENT" in status_output
+    assert "published,managed" in status_output
     assert main(["--config", str(config), "torrent", "show", "org/model"]) == 0
     output = capsys.readouterr().out
     assert "feature_stability: experimental" in output
