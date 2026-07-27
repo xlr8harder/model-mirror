@@ -51,8 +51,9 @@ Manifest writes are incremental. After each file is hashed, `.manifest` is
 atomically rewritten with a schema/version header and one record per payload
 file. Each file is read once while both SHA-256 and Git blob SHA-1 are computed.
 Later runs skip files whose size, mtime, and hash fields match the manifest
-record. This makes interrupted verification cheaper to resume, although it does
-not make Hugging Face/Xet's own transfer stage fully stream-verifiable.
+record. Downloads accumulate these hashes and any enabled torrent coverage
+while streaming into the destination's `.incomplete` file. This makes an
+interrupted download resumable without a mandatory second full-file hash pass.
 
 ## Locking
 
@@ -65,10 +66,11 @@ metadata when a repo is busy.
 
 ## Hugging Face And Xet
 
-`model-mirror` delegates transfer to `huggingface_hub.snapshot_download`.
+`model-mirror` uses `huggingface_hub` to resolve pinned metadata and transport
+URLs, then streams HTTP or Xet bytes into its own resumable hashing writer.
 Environment setup is derived from model-mirror config and is intentionally
-authoritative: if a config boolean is false, inherited Xet environment variables
-for that feature are removed before importing or using `huggingface_hub`.
+authoritative: if a config boolean is false, inherited Xet environment
+variables for that feature are removed before importing or using the transport.
 
 The conservative default is:
 

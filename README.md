@@ -17,25 +17,33 @@ change without modifying local files.
 
 ## Quick Start
 
+`model-mirror` is not currently published on PyPI. Install it from a source
+checkout with [uv](https://docs.astral.sh/uv/) (Python 3.11 or newer):
+
 ```bash
-uv sync
+git clone https://github.com/xlr8harder/model-mirror.git
+cd model-mirror
+uv tool install .
 
-uv run model-mirror config directory /mnt/big-drive/huggingface
-uv run model-mirror config set hf-xet-reconstruct-write-sequentially true  # useful for HDDs
+model-mirror config directory /mnt/big-drive/huggingface
+model-mirror config set hf-xet-reconstruct-write-sequentially true  # useful for HDDs
 # Optional if token autodetection does not find your Hugging Face token:
-uv run model-mirror config set token-path ~/.cache/huggingface/token
+model-mirror config set token-path ~/.cache/huggingface/token
 
-uv run model-mirror mirror org/model
-uv run model-mirror list
-uv run model-mirror verify org/model
-uv run model-mirror repair org/model  # if verify reports repair paths
+model-mirror mirror org/model
+model-mirror status
+model-mirror verify org/model
+model-mirror repair org/model  # if verify reports repair paths
 ```
+
+For development inside the checkout, use `uv sync` and prefix commands with
+`uv run`. The rest of this README assumes the tool installation above.
 
 For periodic maintenance of the whole archive:
 
 ```bash
-uv run model-mirror verify --all --max-age 30d || true
-uv run model-mirror repair --all
+model-mirror verify --all --max-age 30d || true
+model-mirror repair --all
 ```
 
 Mirrors are stored by repo type:
@@ -51,8 +59,12 @@ reference. Run `model-mirror config options` for every supported config key.
 Commands exit non-zero for dirty, incomplete, busy, or invalid states where that
 matters; see each subcommand's help for exact exit-status behavior.
 
-`model-mirror list` summarizes mirrors with tags such as
-`state=[offline,needs-repair]`.
+`model-mirror status` gives an archive-wide operational view: configured
+archive roots, mirror count and payload size, cache and temporary usage, and
+each repository's size, verification state, last check, active lock, and live
+file progress. Torrent state is included when present. `model-mirror list` is
+currently an alias for the same output. State tags include values such as
+`offline` and `needs-repair`.
 
 ## Verification
 
@@ -65,12 +77,18 @@ matters; see each subcommand's help for exact exit-status behavior.
 - regular Git files compared with Hub Git blob ids
 - `.verification` with `status: clean`
 
+By default, verification ignores unexpected payload files, so they do not make
+an otherwise correct mirror dirty. Use `verify --strict` to report unexpected
+files and make verification fail. Model-mirror's own state and cache paths are
+not treated as payload extras.
+
 Useful verification commands:
 
 ```bash
 model-mirror verify org/model
 model-mirror verify --cached org/model
 model-mirror verify --offline org/model
+model-mirror verify --strict org/model
 model-mirror verify --all
 model-mirror verify --all --max-age 7d
 ```
@@ -132,7 +150,11 @@ before stabilization. Ordinary mirror, verify, and repair workflows remain
 stable and do not require the torrent extra:
 
 ```bash
-pip install 'model-mirror[torrent]'
+# Reinstall the source checkout as a uv tool with torrent support:
+uv tool install --force '.[torrent]'
+
+# Or add the extra to the checkout's development environment:
+uv sync --extra torrent
 ```
 
 Every torrent is an immutable publication of one resolved
@@ -151,13 +173,21 @@ model-mirror torrent show org/model
 
 Downloads and same-commit repairs accumulate reusable torrent hashes during
 their existing payload pass. `upgrade` is for older archives or incomplete
-coverage; it reads only files still missing the selected publication profile:
+coverage; it reads only files still missing hashes for the current publication
+profile:
 
 ```bash
 model-mirror upgrade org/model
 model-mirror upgrade --all --dry-run
 model-mirror upgrade --all
 ```
+
+The publication profile is the versioned, deterministic set of rules that fixes
+file order, piece sizing, padding, descriptor encoding, and therefore torrent
+identity. The current and only profile is `hybrid-v1-v2-1`; model-mirror selects
+it automatically. There is no user-selectable profile option yet. A future
+identity-affecting algorithm change will use a new profile name rather than
+silently changing an existing swarm.
 
 The managed backend is a replaceable long-running process:
 
@@ -289,6 +319,7 @@ model-mirror repair --update org/model     # apply a changed upstream commit rec
 model-mirror offline org/model             # local verification only; no Hub checks
 model-mirror online org/model              # re-enable Hub checks
 model-mirror list                          # show mirrors, state tags, and verification age
+model-mirror status                        # archive sizes, cache use, locks, progress, and torrent state
 model-mirror upgrade org/model             # fill missing torrent hash coverage
 model-mirror torrent publish org/model     # publish and request durable seeding
 model-mirror torrent join FILE_OR_MAGNET   # recover a normal local archive
@@ -307,6 +338,12 @@ model-mirror config set checksum-workers 1
 model-mirror config set hf-xet-reconstruct-write-sequentially true
 model-mirror config set hf-xet-num-concurrent-range-gets 1
 ```
+
+`config set` accepts either kebab-case or snake_case keys; the saved YAML and
+`config options` use canonical snake_case. `config directory PATH` is a
+convenience form for the most common setting and creates `PATH` immediately.
+`config set directory PATH` saves the same value without creating the directory
+until it is needed.
 
 Important configuration options:
 
@@ -330,12 +367,68 @@ Important configuration options:
   default; use only on high-bandwidth machines with fast disks and ample memory,
   typically 64 GB RAM or more.
 
+## Disk Space During Transfers
+
+Model-mirror does not stage a second complete snapshot. Each file is streamed
+through the HTTP or Xet transport into a sibling `NAME.incomplete` file while
+its integrity hashes are accumulated, then atomically renamed to `NAME`. The
+partial file is the eventual payload allocation rather than an additional full
+copy. With the default `download_workers: 1`, only one payload file is
+incomplete at a time. Same-commit repair removes a damaged file before
+redownloading it, so it likewise does not retain both the damaged and repaired
+copy.
+
+Allow space for the final snapshot, active partial files, and auxiliary
+transport cache under `DIRECTORY/.tmp/downloads`. The auxiliary cache is not
+specified as a fixed percentage and can vary with the HTTP/Xet implementation,
+but model-mirror does not intentionally reconstruct a second full payload
+there. Interrupted partial files and staging cache are retained for resume.
+`model-mirror status` reports cache and temporary usage, and
+`model-mirror clean-cache` previews reclaimable cache space before
+`clean-cache --force` removes it without deleting mirrored payloads. Do not run
+forced cache cleanup while `status` shows an active download or repair.
+
+## Locking And Interrupted Commands
+
+Repository operations use an advisory kernel `flock` on
+`.verification.lock`. `mirror`, `card`, `verify`, `repair`, `offline`, `online`,
+`upgrade`, and torrent control-plane transitions take this per-repository lock;
+the managed seeder holds it only during short reconciliation transitions.
+`list` and `status` remain non-blocking and report the command, PID, host, and
+start time for a lock that is actually held.
+
+The kernel releases the lock automatically when a process exits or the host
+restarts. The `.verification.lock` file may remain after a crash, but its
+presence alone does not mean the repository is locked; model-mirror probes the
+lock itself and ignores stale contents. Do not delete the file to override a
+genuinely running operation. After a killed download, rerun the same `mirror`
+command to resume its pinned snapshot.
+
+## Removing A Mirror
+
+There is no `remove` command or global repository database. A repository and
+all of its model-mirror state live in one directory, so removal is an explicit
+filesystem operation:
+
+```bash
+model-mirror status
+# For a published torrent, stop external seeding if applicable, then:
+model-mirror torrent retire org/model
+rm -r -- /mnt/big-drive/huggingface/models/org/model
+```
+
+Do not remove a repository reported as busy. For datasets or Spaces, use the
+corresponding path below `datasets/` or `spaces/`. Torrent retirement releases
+local managed seed intent and the update fence, but cannot revoke torrent
+metadata already shared with other peers. Removing a repository does not remove
+archive-wide cache; inspect that separately with `model-mirror clean-cache`.
+
 ## Notes
 
-`model-mirror` uses `huggingface_hub` snapshot downloads, so Hugging Face Xet is
-used automatically when available. `model-mirror` keeps Hugging Face cache and
-temporary directories under the configured archive root so large downloads do
-not spill into your default home cache.
+Model-mirror uses Hugging Face metadata and the HTTP/Xet transports, selecting
+Xet automatically when available. It keeps Hugging Face cache and temporary
+directories under the configured archive root so large downloads do not spill
+into the default home cache.
 
 See [CONTRIBUTORS.md](CONTRIBUTORS.md) for implementation details, testing, and
 future design notes.
