@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
+import json
+from pathlib import Path
 import runpy
 import sys
 from types import SimpleNamespace
@@ -364,6 +366,14 @@ def test_main_without_command_prints_full_help(capsys):
     assert "help" in output
 
 
+def test_version_uses_package_metadata(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["--version"])
+
+    assert exc.value.code == 0
+    assert capsys.readouterr().out == "model-mirror 0.2.0\n"
+
+
 def test_help_command_prints_full_help(capsys):
     assert main(["help"]) == 0
 
@@ -448,7 +458,7 @@ def test_list_command_prints_summary_when_directory_missing(tmp_path, capsys):
 
     assert main(["--config", str(config_path), "list"]) == 0
     output = capsys.readouterr().out
-    assert f"archive: {archive}  mirrors=0  payload=0 B" in output
+    assert f"archive: {archive}  mirrors=0  recorded_payload=0 B" in output
     assert "TYPE  REPOSITORY  FILES  SIZE  COMMIT  CHECKED  EXCEPTIONS" in output
 
 
@@ -746,14 +756,17 @@ def test_list_command_prints_verification_status_and_age(tmp_path, capsys):
             checked_at_utc=(datetime.now(timezone.utc) - timedelta(hours=3)).isoformat(timespec="seconds"),
         ),
     )
+    write_snapshot_plan(
+        archive,
+        HubSnapshot("org/model", "model", "main", "a" * 40, [HubFile("config.json", 2)]),
+    )
     config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
 
     rc = main(["--config", str(config_path), "list"])
 
     assert rc == 0
     output = capsys.readouterr().out
-    assert f"archive: {tmp_path}  mirrors=1  payload=2 B" in output
-    assert "cache: 0 B (archive=0 B, tmp=0 B, mirror=0 B)" in output
+    assert f"archive: {tmp_path}  mirrors=1  recorded_payload=2 B" in output
     assert "TYPE   REPOSITORY" in output
     assert "model  org/model" in output
     assert "2 B" in output
@@ -761,7 +774,7 @@ def test_list_command_prints_verification_status_and_age(tmp_path, capsys):
     assert "clean" not in output
 
 
-def test_list_command_excludes_huggingface_local_cache_from_size(tmp_path, capsys):
+def test_list_command_uses_recorded_payload_and_does_not_report_cache_size(tmp_path, capsys):
     config_path = tmp_path / "config.yaml"
     archive = tmp_path / "models" / "org" / "model"
     archive.mkdir(parents=True)
@@ -770,6 +783,10 @@ def test_list_command_excludes_huggingface_local_cache_from_size(tmp_path, capsy
     cache_blob.parent.mkdir(parents=True)
     cache_blob.write_bytes(b"x" * 100)
     write_verification_state(archive, VerificationState(status="clean", repo_id="org/model"))
+    write_snapshot_plan(
+        archive,
+        HubSnapshot("org/model", "model", "main", "a" * 40, [HubFile("file.bin", 2)]),
+    )
     config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
 
     rc = main(["--config", str(config_path), "list"])
@@ -777,23 +794,22 @@ def test_list_command_excludes_huggingface_local_cache_from_size(tmp_path, capsy
     assert rc == 0
     output = capsys.readouterr().out
     assert "model  org/model" in output
-    assert "cache: 100 B (archive=0 B, tmp=0 B, mirror=100 B)" in output
     assert "2 B" in output
-    assert "102 B" not in output
+    assert "cache:" not in output
 
 
-def test_status_command_prints_list_summary_with_cache_usage(tmp_path, capsys):
+def test_status_command_does_not_scan_or_report_cache_usage(tmp_path, capsys):
     config_path = tmp_path / "config.yaml"
-    (tmp_path / ".cache" / "hub").mkdir(parents=True)
-    (tmp_path / ".cache" / "hub" / "blob").write_bytes(b"x" * 5)
+    (tmp_path / ".model-mirror" / "cache" / "hub").mkdir(parents=True)
+    (tmp_path / ".model-mirror" / "cache" / "hub" / "blob").write_bytes(b"x" * 5)
     config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
 
     rc = main(["--config", str(config_path), "status"])
 
     assert rc == 0
     output = capsys.readouterr().out
-    assert f"archive: {tmp_path}  mirrors=0  payload=0 B" in output
-    assert "cache: 5 B (archive=5 B, tmp=0 B, mirror=0 B)" in output
+    assert f"archive: {tmp_path}  mirrors=0  recorded_payload=0 B" in output
+    assert "cache:" not in output
 
 
 def test_status_and_list_repo_print_detailed_last_known_state(tmp_path, capsys):
@@ -822,6 +838,16 @@ def test_status_and_list_repo_print_detailed_last_known_state(tmp_path, capsys):
 
     assert main(["--config", str(config_path), "status", "org/model"]) == 0
     output = capsys.readouterr().out
+    assert output.startswith("org/model\n")
+    assert "Verification  clean" in output
+    assert "Commit        aaaaaaaaaaaa · main" in output
+    assert "Payload       1 file · 3 B" in output
+    assert "Upstream      current when last checked" in output
+    assert "Torrent       not published" in output
+    assert "resolved_commit:" not in output
+
+    assert main(["--config", str(config_path), "status", "--verbose", "org/model"]) == 0
+    output = capsys.readouterr().out
     assert "repository: org/model" in output
     assert "repo_type: model" in output
     assert f"path: {root}" in output
@@ -836,7 +862,8 @@ def test_status_and_list_repo_print_detailed_last_known_state(tmp_path, capsys):
     assert "offline_only: false" in output
     assert "payload_files: 1" in output
     assert "payload_size: 3 B (3 bytes)" in output
-    assert "expected_files: 1/1 present" in output
+    assert "payload_source: snapshot" in output
+    assert "expected_files: 1 recorded" in output
     assert "lock: none" in output
     assert "progress: none" in output
     assert "torrent: none" in output
@@ -844,7 +871,217 @@ def test_status_and_list_repo_print_detailed_last_known_state(tmp_path, capsys):
     assert "issues: none" in output
 
     assert main(["--config", str(config_path), "list", "org/model"]) == 0
-    assert "repository: org/model" in capsys.readouterr().out
+    assert capsys.readouterr().out.startswith("org/model\n")
+
+
+def test_status_json_is_complete_and_verbose_is_a_noop(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    root = tmp_path / "models" / "org" / "model"
+    root.mkdir(parents=True)
+    commit = "a" * 40
+    write_snapshot_plan(
+        root,
+        HubSnapshot("org/model", "model", "main", commit, [HubFile("file.bin", 3)]),
+    )
+    write_verification_state(
+        root,
+        VerificationState(
+            status="clean",
+            repo_id="org/model",
+            resolved_commit=commit,
+            upstream_commit=commit,
+            upstream_status="current",
+            checked_at_utc="2026-01-01T00:00:00+00:00",
+        ),
+    )
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+
+    assert main(["--config", str(config_path), "status", "--json", "--verbose", "org/model"]) == 0
+    document = json.loads(capsys.readouterr().out)
+
+    assert document["schema"] == "model-mirror-status"
+    assert document["version"] == 1
+    assert document["errors"] == []
+    assert len(document["repositories"]) == 1
+    record = document["repositories"][0]
+    assert record["repo_id"] == "org/model"
+    assert record["resolved_commit"] == commit
+    assert record["last_verification"]["status"] == "clean"
+    assert record["payload"] == {"bytes": 3, "files": 1, "source": "snapshot"}
+    assert record["snapshot"] == {
+        "commit": commit,
+        "expected_files": 1,
+        "stale": False,
+    }
+    assert record["upstream"]["recorded"] == {"commit": commit, "status": "current"}
+    assert record["upstream"]["live"] is None
+
+
+def test_status_check_upstream_is_live_and_does_not_write_metadata(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    root = tmp_path / "models" / "org" / "model"
+    root.mkdir(parents=True)
+    old_commit = "oldcommit"
+    write_snapshot_plan(
+        root,
+        HubSnapshot("org/model", "model", "main", old_commit, [HubFile("file.bin", 3)]),
+    )
+    write_verification_state(
+        root,
+        VerificationState(
+            status="clean",
+            repo_id="org/model",
+            requested_revision="main",
+            resolved_commit=old_commit,
+            upstream_commit=old_commit,
+            upstream_status="current",
+            checked_at_utc="2026-01-01T00:00:00+00:00",
+        ),
+    )
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    state_path = root / ".verification"
+    snapshot_path = root / ".model-mirror" / "snapshot.json"
+    before = {
+        state_path: (state_path.read_bytes(), state_path.stat().st_mtime_ns),
+        snapshot_path: (snapshot_path.read_bytes(), snapshot_path.stat().st_mtime_ns),
+    }
+
+    hub = MovingBranchHub([FakeFile("file.bin", 3)])
+    assert main(
+        ["--config", str(config_path), "status", "--check-upstream", "--json", "org/model"],
+        hub=hub,
+    ) == 0
+    document = json.loads(capsys.readouterr().out)
+
+    live = document["repositories"][0]["upstream"]["live"]
+    assert live["status"] == "changed"
+    assert live["commit"] == "newcommit"
+    assert live["observed_at"]
+    assert live["error"] is None
+    for path, (contents, modified) in before.items():
+        assert path.read_bytes() == contents
+        assert path.stat().st_mtime_ns == modified
+
+
+def test_status_archive_live_table_and_json_modes(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    root = tmp_path / "models" / "org" / "model"
+    root.mkdir(parents=True)
+    write_snapshot_plan(
+        root,
+        HubSnapshot("org/model", "model", "main", "oldcommit", [HubFile("file.bin", 3)]),
+    )
+    write_verification_state(
+        root,
+        VerificationState(
+            status="clean",
+            repo_id="org/model",
+            requested_revision="main",
+            resolved_commit="oldcommit",
+        ),
+    )
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    hub = MovingBranchHub([FakeFile("file.bin", 3)])
+
+    assert main(["--config", str(config_path), "status", "--check-upstream"], hub=hub) == 0
+    output = capsys.readouterr().out
+    assert "UPSTREAM NOW" in output
+    assert "changed:newcommit" in output
+
+    assert main(["--config", str(config_path), "list", "--check-upstream", "--json"], hub=hub) == 0
+    document = json.loads(capsys.readouterr().out)
+    assert document["repositories"][0]["upstream"]["live"]["status"] == "changed"
+
+
+def test_status_live_upstream_available_current_and_unavailable_human_output(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    root = tmp_path / "models" / "org" / "model"
+    root.mkdir(parents=True)
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+
+    hub = MovingBranchHub([FakeFile("file.bin", 3)])
+    assert main(
+        ["--config", str(config_path), "status", "--check-upstream", "org/model"],
+        hub=hub,
+    ) == 0
+    assert "Upstream      available now · newcommit" in capsys.readouterr().out
+
+    write_verification_state(
+        root,
+        VerificationState(status="clean", repo_id="org/model", resolved_commit="newcommit"),
+    )
+    assert main(
+        ["--config", str(config_path), "status", "--check-upstream", "org/model"],
+        hub=hub,
+    ) == 0
+    assert "Upstream      current now · newcommit" in capsys.readouterr().out
+
+    assert main(
+        [
+            "--config",
+            str(config_path),
+            "status",
+            "--check-upstream",
+            "--verbose",
+            "org/model",
+        ],
+        hub=hub,
+    ) == 0
+    assert "live_upstream: current commit=newcommit" in capsys.readouterr().out
+
+    assert main(
+        ["--config", str(config_path), "status", "--check-upstream", "org/model"],
+        hub=UnavailableHub(),
+    ) == 0
+    output = capsys.readouterr().out
+    assert "Upstream      unavailable now · repository not found" in output
+
+    assert main(
+        [
+            "--config",
+            str(config_path),
+            "status",
+            "--check-upstream",
+            "--verbose",
+            "org/model",
+        ],
+        hub=UnavailableHub(),
+    ) == 0
+    output = capsys.readouterr().out
+    assert "live_upstream: unavailable commit=unknown" in output
+    assert "error=repository not found" in output
+
+
+def test_status_never_uses_recursive_filesystem_scans(tmp_path, monkeypatch, capsys):
+    config_path = tmp_path / "config.yaml"
+    root = tmp_path / "models" / "org" / "model"
+    root.mkdir(parents=True)
+    write_snapshot_plan(
+        root,
+        HubSnapshot("org/model", "model", "main", "a" * 40, [HubFile("file.bin", 3)]),
+    )
+    write_verification_state(root, VerificationState(status="clean", repo_id="org/model"))
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+
+    def fail_rglob(*_args, **_kwargs):
+        raise AssertionError("status must not recursively scan the archive")
+
+    monkeypatch.setattr(Path, "rglob", fail_rglob)
+
+    assert main(["--config", str(config_path), "status"]) == 0
+    assert "org/model" in capsys.readouterr().out
+
+
+def test_status_json_reports_missing_repository_as_structured_error(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+
+    assert main(["--config", str(config_path), "status", "--json", "org/missing"]) == 1
+    document = json.loads(capsys.readouterr().out)
+
+    assert document["repositories"] == []
+    assert document["errors"][0]["code"] == "mirror-not-found"
+    assert document["errors"][0]["repo_id"] == "org/missing"
 
 
 def test_status_repo_reports_unverified_and_missing_repositories(tmp_path, capsys):
@@ -856,20 +1093,52 @@ def test_status_repo_reports_unverified_and_missing_repositories(tmp_path, capsy
 
     assert main(["--config", str(config_path), "status", "org/unverified"]) == 0
     output = capsys.readouterr().out
-    assert "status: unverified" in output
-    assert "exceptions: unverified" in output
-    assert "last_checked: unknown" in output
-    assert "last_check_age: unknown" in output
-    assert "requested_revision: unknown" in output
-    assert "resolved_commit: unknown" in output
-    assert "snapshot_commit: unknown" in output
-    assert "upstream_commit: unknown" in output
-    assert "upstream_status: unknown" in output
-    assert "offline_only: unknown" in output
-    assert "expected_files: unknown" in output
+    assert "Verification  unverified" in output
+    assert "Commit        unknown · unknown" in output
+    assert "Payload       unknown" in output
+    assert "Attention     unverified" in output
+    assert "Next          model-mirror verify org/unverified" in output
+
+    assert main(["--config", str(config_path), "status", "--verbose", "org/unverified"]) == 0
+    verbose = capsys.readouterr().out
+    assert "payload_size: unknown" in verbose
+    assert "expected_files: unknown" in verbose
 
     assert main(["--config", str(config_path), "status", "org/missing"]) == 1
     assert "mirror not found: model:org/missing" in capsys.readouterr().out
+
+
+def test_status_recommends_update_or_verify_from_recorded_state(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    root = tmp_path / "models" / "org" / "model"
+    root.mkdir(parents=True)
+    write_verification_state(
+        root,
+        VerificationState(
+            status="dirty",
+            repo_id="org/model",
+            upstream_status="changed",
+        ),
+    )
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+
+    assert main(["--config", str(config_path), "status", "org/model"]) == 0
+    output = capsys.readouterr().out
+    assert "model-mirror repair --update org/model" in output
+
+    write_verification_state(
+        root,
+        VerificationState(
+            status="dirty",
+            repo_id="org/model",
+            issues=["verification skipped"],
+            upstream_status="changed",
+        ),
+    )
+    assert main(["--config", str(config_path), "status", "org/model"]) == 0
+    output = capsys.readouterr().out
+    assert "model-mirror verify org/model" in output
+    assert "repair --update" not in output
 
 
 def test_status_repo_surfaces_stale_snapshot_issues_lock_and_progress(tmp_path, capsys):
@@ -921,22 +1190,27 @@ def test_status_repo_surfaces_stale_snapshot_issues_lock_and_progress(tmp_path, 
     with ModelLock(root, "repair", "org/model"):
         assert main(["--config", str(config_path), "status", "org/model"]) == 0
         detail = capsys.readouterr().out
-        assert "exceptions: needs-repair,busy,stalled,snapshot-stale" in detail
-        assert f"resolved_commit: {new_commit}" in detail
-        assert f"snapshot_commit: {old_commit}" in detail
-        assert "payload_files: 2" in detail
-        assert "expected_files: 1/1 present (snapshot stale)" in detail
-        assert "lock: command=repair" in detail
-        assert "progress: active=1 path=bad.bin" in detail
-        assert "repair_paths:\n  - bad.bin" in detail
-        assert "issues:\n  - missing: bad.bin" in detail
+        assert "Attention     needs-repair, busy, stalled, snapshot-stale" in detail
+        assert "Commit        bbbbbbbbbbbb · main" in detail
+        assert "Payload       unknown" in detail
+        assert "Lock          command=repair" in detail
+        assert "Activity      active=1 path=bad.bin" in detail
+        assert "Repair paths\n  bad.bin" in detail
+        assert "Issues\n  missing: bad.bin" in detail
 
         assert main(["--config", str(config_path), "list"]) == 0
         table = capsys.readouterr().out
         row = next(line for line in table.splitlines() if "org/model" in line)
         assert "snapshot-stale" in row
         assert "needs-repair,busy,stalled" in row
-        assert " 2 " in row
+        assert " ? " in row
+
+        assert main(["--config", str(config_path), "status", "--json", "org/model"]) == 0
+        document = json.loads(capsys.readouterr().out)
+        activity = document["repositories"][0]["activity"]
+        assert activity[0]["path"] == "bad.bin"
+        assert activity[0]["bytes_done"] == 1
+        assert activity[0]["stalled"] is True
 
 
 def test_list_repo_type_filters_table_and_selects_dataset_detail(tmp_path, capsys):
@@ -958,16 +1232,20 @@ def test_list_repo_type_filters_table_and_selects_dataset_detail(tmp_path, capsy
         ["--config", str(config_path), "status", "--repo-type", "dataset", "org/data"]
     ) == 0
     detail = capsys.readouterr().out
-    assert "repository: org/data" in detail
-    assert "repo_type: dataset" in detail
+    assert detail.startswith("org/data\n")
 
 
 def test_clean_cache_dry_run_reports_reclaimable_space_without_deleting(tmp_path, capsys):
     config_path = tmp_path / "config.yaml"
-    (tmp_path / ".cache" / "hub").mkdir(parents=True)
-    (tmp_path / ".cache" / "hub" / "blob").write_bytes(b"x" * 5)
+    control = tmp_path / ".model-mirror"
+    (control / "cache" / "hub").mkdir(parents=True)
+    (control / "cache" / "hub" / "blob").write_bytes(b"x" * 5)
+    (control / "tmp").mkdir()
+    (control / "tmp" / "partial").write_bytes(b"x" * 7)
+    (tmp_path / ".cache").mkdir()
+    (tmp_path / ".cache" / "legacy").write_bytes(b"x")
     (tmp_path / ".tmp").mkdir()
-    (tmp_path / ".tmp" / "partial").write_bytes(b"x" * 7)
+    (tmp_path / ".tmp" / "legacy").write_bytes(b"xx")
     mirror = tmp_path / "models" / "org" / "model"
     mirror.mkdir(parents=True)
     (mirror / "file.bin").write_bytes(b"xx")
@@ -980,10 +1258,14 @@ def test_clean_cache_dry_run_reports_reclaimable_space_without_deleting(tmp_path
     assert rc == 0
     output = capsys.readouterr().out
     assert "cleanup mode: dry-run" in output
-    assert "reclaimable=15 B" in output
+    assert "reclaimable=18 B" in output
     assert "would-remove: archive-cache" in output
     assert "would-remove: archive-tmp" in output
+    assert "would-remove: legacy-archive-cache" in output
+    assert "would-remove: legacy-archive-tmp" in output
     assert "would-remove: mirror-cache" in output
+    assert (control / "cache").exists()
+    assert (control / "tmp").exists()
     assert (tmp_path / ".cache").exists()
     assert (tmp_path / ".tmp").exists()
     assert (mirror / ".cache").exists()
@@ -992,10 +1274,15 @@ def test_clean_cache_dry_run_reports_reclaimable_space_without_deleting(tmp_path
 
 def test_clean_cache_force_removes_cache_and_tmp_but_keeps_payload(tmp_path, capsys):
     config_path = tmp_path / "config.yaml"
-    (tmp_path / ".cache" / "hub").mkdir(parents=True)
-    (tmp_path / ".cache" / "hub" / "blob").write_bytes(b"x" * 5)
+    control = tmp_path / ".model-mirror"
+    (control / "cache" / "hub").mkdir(parents=True)
+    (control / "cache" / "hub" / "blob").write_bytes(b"x" * 5)
+    (control / "tmp").mkdir()
+    (control / "tmp" / "partial").write_bytes(b"x" * 7)
+    (tmp_path / ".cache").mkdir()
+    (tmp_path / ".cache" / "legacy").write_bytes(b"x")
     (tmp_path / ".tmp").mkdir()
-    (tmp_path / ".tmp" / "partial").write_bytes(b"x" * 7)
+    (tmp_path / ".tmp" / "legacy").write_bytes(b"xx")
     mirror = tmp_path / "models" / "org" / "model"
     mirror.mkdir(parents=True)
     (mirror / "file.bin").write_bytes(b"xx")
@@ -1010,7 +1297,12 @@ def test_clean_cache_force_removes_cache_and_tmp_but_keeps_payload(tmp_path, cap
     assert "cleanup mode: force" in output
     assert "removed: archive-cache" in output
     assert "removed: archive-tmp" in output
+    assert "removed: legacy-archive-cache" in output
+    assert "removed: legacy-archive-tmp" in output
     assert "removed: mirror-cache" in output
+    assert control.exists()
+    assert not (control / "cache").exists()
+    assert not (control / "tmp").exists()
     assert not (tmp_path / ".cache").exists()
     assert not (tmp_path / ".tmp").exists()
     assert not (mirror / ".cache").exists()
@@ -1043,6 +1335,47 @@ def test_clean_cache_refuses_unsafe_configured_targets(tmp_path, capsys):
 
 def test_directory_size_returns_zero_for_missing_path(tmp_path):
     assert cli_module.directory_size(tmp_path / "missing") == 0
+
+
+def test_archive_cache_usage_supports_default_and_configured_paths(tmp_path):
+    control = tmp_path / ".model-mirror"
+    (control / "cache").mkdir(parents=True)
+    (control / "cache" / "one").write_bytes(b"1")
+    (control / "tmp").mkdir()
+    (control / "tmp" / "two").write_bytes(b"22")
+    root = tmp_path / "models" / "org" / "model" / ".cache"
+    root.mkdir(parents=True)
+    (root / "three").write_bytes(b"333")
+
+    usage = cli_module.archive_cache_usage(Config(directory=tmp_path))
+    assert usage.total == 6
+
+    configured_cache = tmp_path / "custom" / ".cache"
+    configured_tmp = tmp_path / "custom" / ".tmp"
+    configured_cache.mkdir(parents=True)
+    configured_tmp.mkdir(parents=True)
+    (configured_cache / "four").write_bytes(b"4444")
+    (configured_tmp / "five").write_bytes(b"55555")
+    configured = cli_module.archive_cache_usage(
+        Config(directory=tmp_path, cache_dir=configured_cache, tmp_dir=configured_tmp)
+    )
+    assert configured.archive_cache == 4
+    assert configured.archive_tmp == 5
+    assert configured.mirror_cache == 3
+
+
+def test_cleanup_targets_deduplicates_explicit_legacy_paths(tmp_path):
+    targets = cli_module.cleanup_targets(
+        Config(
+            directory=tmp_path,
+            cache_dir=tmp_path / ".cache",
+            tmp_dir=tmp_path / ".tmp",
+        )
+    )
+
+    assert targets.count((tmp_path / ".cache", "archive-cache")) == 1
+    assert targets.count((tmp_path / ".tmp", "archive-tmp")) == 1
+    assert all(not label.startswith("legacy-") for _path, label in targets)
 
 
 def test_list_command_prints_busy_lock(tmp_path, capsys):
@@ -1155,7 +1488,7 @@ def test_list_state_tags_cover_multi_tag_states():
     ) == []
 
 
-def test_list_format_helpers_cover_display_branches():
+def test_list_format_helpers_cover_display_branches(capsys):
     assert cli_module.format_bytes(0) == "0 B"
     assert cli_module.format_bytes(1536) == "1.5 KiB"
     assert cli_module.format_bytes(1024**5 * 2) == "2.0 PiB"
@@ -1176,6 +1509,10 @@ def test_list_format_helpers_cover_display_branches():
         cli_module.parse_nonnegative_int_arg("-1")
 
     assert cli_module.format_progress_detail(ProgressSnapshot(entries=[], source="heartbeat")) is None
+    assert cli_module.format_upstream_observation(None) == "-"
+    assert cli_module.format_upstream_observation(
+        cli_module.UpstreamObservation("unavailable", None, "2026-01-01T00:00:00+00:00")
+    ) == "unavailable"
     long_path = "nested/" + ("x" * 80) + ".bin"
     detail = cli_module.format_progress_detail(
         ProgressSnapshot(
@@ -1207,6 +1544,9 @@ def test_list_format_helpers_cover_display_branches():
         ]
     )
     assert selected.path == "a.bin"
+
+    cli_module.print_detail_values("values", ["one", "two"])
+    assert capsys.readouterr().out == "values:\n  - one\n  - two\n"
 
 
 class FakeChild:

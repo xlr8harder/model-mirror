@@ -25,7 +25,13 @@ from .checksums import (
     record_is_current,
     write_manifest,
 )
-from .config import Config, TOKEN_SETUP_HINT, apply_hf_environment, hf_token_available
+from .config import (
+    Config,
+    TOKEN_SETUP_HINT,
+    apply_hf_environment,
+    archive_runtime_tmp_path,
+    hf_token_available,
+)
 from .progress import DEFAULT_STALL_RETRIES, ProgressRecorder
 from .verify import metadata_blob_id, metadata_lfs_sha256, metadata_path
 
@@ -865,7 +871,7 @@ def download_staging_dir(
     revision: str,
     allow_patterns: list[str] | None,
 ) -> Path:
-    tmp_root = Path(config.tmp_dir) if config.tmp_dir is not None else Path(config.directory) / ".tmp"
+    tmp_root = archive_runtime_tmp_path(config)
     scope = "all" if allow_patterns is None else "allow-" + stable_digest("\n".join(sorted(allow_patterns)))[:16]
     slug = safe_slug(f"{repo_type}-{repo_id}-{revision}-{scope}")
     identity = "\n".join((repo_type, repo_id, revision, scope))

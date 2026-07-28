@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -12,12 +13,15 @@ from pathlib import Path
 
 import yaml
 
+from . import __version__
 from .audit import audit_model
-from .checksums import MANIFEST, iter_payload_files, write_checksums, verify_checksums
+from .checksums import MANIFEST, iter_payload_files, load_manifest, write_checksums, verify_checksums
 from .config import (
     Config,
     REPO_TYPE_DIRS,
     archive_path,
+    archive_runtime_cache_path,
+    archive_runtime_tmp_path,
     load_config,
     parse_bool,
     parse_nonnegative_int,
@@ -108,8 +112,16 @@ CONFIG_OPTIONS = [
         "Path to a Hugging Face token file. If unset, model-mirror checks HF_TOKEN_PATH, "
         "HF_HOME/token, ~/.cache/huggingface/token, and ~/.huggingface/token. Token contents are never printed.",
     ),
-    ("cache_dir", None, "Overrides the Hugging Face cache root; defaults to DIRECTORY/.cache."),
-    ("tmp_dir", None, "Overrides temporary file directory; defaults to DIRECTORY/.tmp."),
+    (
+        "cache_dir",
+        None,
+        "Overrides the Hugging Face cache root; defaults to DIRECTORY/.model-mirror/cache.",
+    ),
+    (
+        "tmp_dir",
+        None,
+        "Overrides temporary file directory; defaults to DIRECTORY/.model-mirror/tmp.",
+    ),
 ]
 
 
@@ -131,13 +143,23 @@ class MirrorStatusEntry:
     repo_type: str
     state: VerificationState | None
     active_lock: dict | None
-    payload_files: int
-    payload_size: int
+    payload_files: int | None
+    payload_size: int | None
+    payload_source: str
     expected_files: int | None
-    expected_files_present: int | None
     snapshot_commit: str
+    snapshot_requested_revision: str
     progress: ProgressSnapshot
     torrent_status: str | None
+    upstream_observation: UpstreamObservation | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class UpstreamObservation:
+    status: str
+    commit: str | None
+    observed_at_utc: str
+    error: str | None = None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -146,6 +168,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Mirror Hugging Face repositories into local bulk storage and verify their integrity.",
         epilog="Run 'model-mirror COMMAND --help' for command-specific options.",
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--config", help="path to config file; defaults to ~/.model-mirror.yaml")
     subparsers = parser.add_subparsers(dest="command")
     command_parsers: dict[str, argparse.ArgumentParser] = {}
@@ -406,7 +429,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="list mirrors in columns or show one mirror in detail",
         description=(
             "Show a compact archive-wide table, or detailed last-known local state when REPO is supplied. "
-            "This command does not contact the upstream repository."
+            "This command is metadata-only and does not contact upstream unless --check-upstream is supplied."
         ),
     )
     status_parser = add_command_parser(
@@ -414,7 +437,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="show archive status or detailed local state for one mirror",
         description=(
             "Show a compact archive-wide table, or detailed last-known local state when REPO is supplied. "
-            "This command does not contact the upstream repository."
+            "This command is metadata-only and does not contact upstream unless --check-upstream is supplied."
         ),
     )
     for status_like_parser in (list_parser, status_parser):
@@ -423,6 +446,22 @@ def build_parser() -> argparse.ArgumentParser:
             "--repo-type",
             choices=["model", "dataset", "space"],
             help="repo kind; filters the table or selects the detailed repo",
+        )
+        status_like_parser.add_argument(
+            "--check-upstream",
+            action="store_true",
+            help="advisory live comparison with upstream; does not update local metadata",
+        )
+        status_like_parser.add_argument(
+            "--verbose",
+            action="store_true",
+            help="show all recorded metadata fields in the human-readable detail view",
+        )
+        status_like_parser.add_argument(
+            "--json",
+            action="store_true",
+            dest="json_output",
+            help="emit stable structured JSON; --verbose has no effect",
         )
 
     clean_cache_parser = add_command_parser(
@@ -497,7 +536,15 @@ def main(argv: list[str] | None = None, *, hub=None) -> int:
         if args.command == "config":
             return handle_config(args, config, config_path)
         if args.command in {"list", "status"}:
-            return handle_list(config, repo_id=args.model, repo_type=args.repo_type)
+            return handle_list(
+                config,
+                repo_id=args.model,
+                repo_type=args.repo_type,
+                check_upstream=args.check_upstream,
+                verbose=args.verbose,
+                json_output=args.json_output,
+                hub=hub,
+            )
         if args.command == "clean-cache":
             return handle_clean_cache(config, force=args.force)
         if args.command == "mirror":
@@ -762,28 +809,60 @@ def set_config_value(config: Config, key: str, value: str) -> None:
         raise SystemExit(f"Unsupported config key: {key}")
 
 
-def handle_list(config: Config, *, repo_id: str | None = None, repo_type: str | None = None) -> int:
+def handle_list(
+    config: Config,
+    *,
+    repo_id: str | None = None,
+    repo_type: str | None = None,
+    check_upstream: bool = False,
+    verbose: bool = False,
+    json_output: bool = False,
+    hub=None,
+) -> int:
+    errors: list[dict[str, str]] = []
     if repo_id is not None:
         selected_type = repo_type or config.repo_type
         root = archive_path(config, repo_id, selected_type)
         if not root.is_dir():
-            print(f"mirror not found: {selected_type}:{repo_id} -> {root}")
+            message = f"mirror not found: {selected_type}:{repo_id} -> {root}"
+            if json_output:
+                errors.append(
+                    {
+                        "code": "mirror-not-found",
+                        "repo_id": repo_id,
+                        "repo_type": selected_type,
+                        "message": message,
+                    }
+                )
+                print_status_json(config, [], errors)
+            else:
+                print(message)
             return 1
-        print_mirror_detail(build_mirror_status(config, root, repo_id, selected_type))
+        entries = [build_mirror_status(config, root, repo_id, selected_type)]
+        if check_upstream:
+            observe_upstreams(config, entries, hub=hub)
+        if json_output:
+            print_status_json(config, entries, errors)
+        elif verbose:
+            print_mirror_detail_verbose(entries[0])
+        else:
+            print_mirror_detail(entries[0])
         return 0
 
     entries = collect_mirror_status(config, repo_type=repo_type)
+    if check_upstream:
+        observe_upstreams(config, entries, hub=hub)
+    if json_output:
+        print_status_json(config, entries, errors)
+        return 0
+
     archive_root = Path(config.directory)
-    total_size = sum(entry.payload_size for entry in entries)
-    cache_usage = archive_cache_usage(config)
-    print(f"archive: {archive_root}  mirrors={len(entries)}  payload={format_bytes(total_size)}")
-    print(
-        "cache: "
-        f"{format_bytes(cache_usage.total)} "
-        f"(archive={format_bytes(cache_usage.archive_cache)}, "
-        f"tmp={format_bytes(cache_usage.archive_tmp)}, "
-        f"mirror={format_bytes(cache_usage.mirror_cache)})"
-    )
+    known_sizes = [entry.payload_size for entry in entries if entry.payload_size is not None]
+    unknown_sizes = len(entries) - len(known_sizes)
+    summary = f"archive: {archive_root}  mirrors={len(entries)}  recorded_payload={format_bytes(sum(known_sizes))}"
+    if unknown_sizes:
+        summary += f"  unknown_payload={unknown_sizes}"
+    print(summary)
     print_mirror_table(entries)
     return 0
 
@@ -1005,13 +1084,16 @@ def collect_mirror_status(config: Config, *, repo_type: str | None = None) -> li
 def build_mirror_status(config: Config, root: Path, repo_id: str, repo_type: str) -> MirrorStatusEntry:
     state = read_verification_state(root)
     snapshot = read_snapshot_plan(root)
-    payload_files, payload_size = mirror_payload_stats(root)
+    payload_files, payload_size, payload_source = recorded_payload_stats(root, snapshot)
+    if (
+        payload_source == "snapshot"
+        and state is not None
+        and state.resolved_commit
+        and snapshot is not None
+        and snapshot.resolved_commit != state.resolved_commit
+    ):
+        payload_files, payload_size, payload_source = None, None, "unknown"
     expected_files = len(snapshot.files) if snapshot is not None else None
-    expected_files_present = (
-        sum(1 for item in snapshot.files if (root / item.path).is_file())
-        if snapshot is not None
-        else None
-    )
     return MirrorStatusEntry(
         root=root,
         repo_id=repo_id,
@@ -1020,18 +1102,78 @@ def build_mirror_status(config: Config, root: Path, repo_id: str, repo_type: str
         active_lock=read_active_lock(root),
         payload_files=payload_files,
         payload_size=payload_size,
+        payload_source=payload_source,
         expected_files=expected_files,
-        expected_files_present=expected_files_present,
         snapshot_commit=snapshot.resolved_commit if snapshot is not None else "",
-        progress=progress_snapshot(root, stall_timeout_seconds=config.stall_timeout_seconds),
+        snapshot_requested_revision=snapshot.requested_revision if snapshot is not None else "",
+        progress=progress_snapshot(
+            root,
+            stall_timeout_seconds=config.stall_timeout_seconds,
+            scan_incomplete=False,
+        ),
         torrent_status=list_torrent_status(root),
     )
+
+
+def recorded_payload_stats(root: Path, snapshot) -> tuple[int | None, int | None, str]:
+    manifest_path = root / MANIFEST
+    if manifest_path.exists():
+        manifest = load_manifest(root)
+        sizes = [row.get("size") for row in manifest.values()]
+        total_size = (
+            sum(sizes)
+            if all(isinstance(size, int) and not isinstance(size, bool) and size >= 0 for size in sizes)
+            else None
+        )
+        return len(manifest), total_size, "manifest"
+    if snapshot is not None:
+        sizes = [item.size for item in snapshot.files]
+        total_size = sum(sizes) if all(size is not None and size >= 0 for size in sizes) else None
+        return len(snapshot.files), total_size, "snapshot"
+    return None, None, "unknown"
+
+
+def observe_upstreams(config: Config, entries: list[MirrorStatusEntry], *, hub=None) -> None:
+    selected_hub = hub or HuggingFaceHub(config)
+    for entry in entries:
+        state = entry.state
+        requested_revision = (
+            state.requested_revision
+            if state is not None and state.requested_revision
+            else entry.snapshot_requested_revision or config.revision
+        )
+        observed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        try:
+            snapshot = get_snapshot(selected_hub, entry.repo_id, entry.repo_type, requested_revision)
+        except Exception as exc:
+            entry.upstream_observation = UpstreamObservation(
+                status="unavailable",
+                commit=None,
+                observed_at_utc=observed_at,
+                error=str(exc),
+            )
+            continue
+        local_commit = resolved_commit_for_status(entry)
+        entry.upstream_observation = UpstreamObservation(
+            status=(
+                "available"
+                if not local_commit
+                else "current"
+                if local_commit == snapshot.resolved_commit
+                else "changed"
+            ),
+            commit=snapshot.resolved_commit,
+            observed_at_utc=observed_at,
+        )
 
 
 def print_mirror_table(entries: list[MirrorStatusEntry]) -> None:
     headers = ["TYPE", "REPOSITORY", "FILES", "SIZE", "COMMIT", "CHECKED", "EXCEPTIONS"]
     include_torrent = any(entry.torrent_status is not None for entry in entries)
     include_activity = any(entry.progress.active for entry in entries)
+    include_live_upstream = any(entry.upstream_observation is not None for entry in entries)
+    if include_live_upstream:
+        headers.append("UPSTREAM NOW")
     if include_torrent:
         headers.append("TORRENT")
     if include_activity:
@@ -1045,11 +1187,13 @@ def print_mirror_table(entries: list[MirrorStatusEntry]) -> None:
             entry.repo_type,
             entry.repo_id,
             file_count_label(entry),
-            format_bytes(entry.payload_size),
+            format_optional_bytes(entry.payload_size),
             shorten_commit(commit),
             verification_age_label(state.checked_at_utc) if state is not None else "unknown",
             ",".join(mirror_exception_tags(entry)) or "-",
         ]
+        if include_live_upstream:
+            row.append(format_upstream_observation(entry.upstream_observation))
         if include_torrent:
             row.append(entry.torrent_status or "-")
         if include_activity:
@@ -1082,6 +1226,98 @@ def print_table(headers: list[str], rows: list[list[str]], *, right_aligned: set
 def print_mirror_detail(entry: MirrorStatusEntry) -> None:
     state = entry.state
     exceptions = mirror_exception_tags(entry)
+    print(entry.repo_id)
+    print()
+    status = state.status if state is not None else "unverified"
+    checked = verification_age_label(state.checked_at_utc) if state is not None else "unknown"
+    print_status_field("Verification", f"{status} · {checked} ago" if checked != "unknown" else status)
+    commit = resolved_commit_for_status(entry)
+    revision = (
+        state.requested_revision
+        if state is not None and state.requested_revision
+        else entry.snapshot_requested_revision or "unknown"
+    )
+    snapshot = shorten_commit(commit) if commit else "unknown"
+    print_status_field("Commit", f"{snapshot} · {revision}")
+    payload = (
+        f"{entry.payload_files} {'file' if entry.payload_files == 1 else 'files'} · "
+        f"{format_optional_bytes(entry.payload_size)}"
+        if entry.payload_files is not None
+        else "unknown"
+    )
+    print_status_field("Payload", payload)
+    print_status_field("Upstream", human_upstream_status(entry))
+    print_status_field("Torrent", entry.torrent_status or "not published")
+
+    if exceptions:
+        print_status_field("Attention", ", ".join(exceptions))
+    if entry.active_lock is not None:
+        print_status_field("Lock", format_lock_detail(entry.active_lock))
+    progress = format_progress_detail(entry.progress)
+    if progress is not None:
+        print_status_field("Activity", progress)
+
+    next_steps = status_next_steps(entry)
+    for index, step in enumerate(next_steps):
+        print_status_field("Next" if index == 0 else "", step)
+
+    if state is not None and state.repair_paths:
+        print()
+        print("Repair paths")
+        for value in state.repair_paths:
+            print(f"  {value}")
+    if state is not None and state.issues:
+        print()
+        print("Issues")
+        for value in state.issues:
+            print(f"  {value}")
+
+
+def print_status_field(label: str, value: str) -> None:
+    print(f"  {label:<14}{value}")
+
+
+def human_upstream_status(entry: MirrorStatusEntry) -> str:
+    observation = entry.upstream_observation
+    if observation is not None:
+        value = f"{observation.status} now"
+        if observation.commit:
+            value += f" · {shorten_commit(observation.commit)}"
+        if observation.error:
+            value += f" · {observation.error}"
+        return value
+    state = entry.state
+    if state is None or not state.upstream_status:
+        return "unknown"
+    suffix = " when last checked" if state.upstream_status != "unknown" else ""
+    return f"{state.upstream_status}{suffix}"
+
+
+def format_upstream_observation(observation: UpstreamObservation | None) -> str:
+    if observation is None:
+        return "-"
+    if observation.commit:
+        return f"{observation.status}:{shorten_commit(observation.commit)}"
+    return observation.status
+
+
+def status_next_steps(entry: MirrorStatusEntry) -> list[str]:
+    state = entry.state
+    if state is None:
+        return [f"model-mirror verify {entry.repo_id}"]
+    if primary_state_tag(state) == "unverified":
+        return [f"model-mirror verify {entry.repo_id}"]
+    steps = []
+    if state.repair_paths:
+        steps.append(f"model-mirror repair {entry.repo_id}")
+    if state.upstream_status == "changed":
+        steps.append(f"model-mirror repair --update {entry.repo_id}")
+    return steps
+
+
+def print_mirror_detail_verbose(entry: MirrorStatusEntry) -> None:
+    state = entry.state
+    exceptions = mirror_exception_tags(entry)
     print(f"repository: {entry.repo_id}")
     print(f"repo_type: {entry.repo_type}")
     print(f"path: {entry.root}")
@@ -1095,18 +1331,148 @@ def print_mirror_detail(entry: MirrorStatusEntry) -> None:
     print(f"upstream_commit: {state.upstream_commit if state is not None and state.upstream_commit else 'unknown'}")
     print(f"upstream_status: {state.upstream_status if state is not None else 'unknown'}")
     print(f"offline_only: {str(state.offline_only).lower() if state is not None else 'unknown'}")
-    print(f"payload_files: {entry.payload_files}")
-    print(f"payload_size: {format_bytes(entry.payload_size)} ({entry.payload_size} bytes)")
+    print(f"payload_files: {entry.payload_files if entry.payload_files is not None else 'unknown'}")
+    if entry.payload_size is None:
+        print("payload_size: unknown")
+    else:
+        print(f"payload_size: {format_bytes(entry.payload_size)} ({entry.payload_size} bytes)")
+    print(f"payload_source: {entry.payload_source}")
     if entry.expected_files is None:
         print("expected_files: unknown")
     else:
         stale_suffix = " (snapshot stale)" if snapshot_is_stale(entry) else ""
-        print(f"expected_files: {entry.expected_files_present}/{entry.expected_files} present{stale_suffix}")
+        print(f"expected_files: {entry.expected_files} recorded{stale_suffix}")
     print(f"lock: {format_lock_detail(entry.active_lock) if entry.active_lock is not None else 'none'}")
     print(f"progress: {format_progress_detail(entry.progress) or 'none'}")
     print(f"torrent: {entry.torrent_status or 'none'}")
+    observation = entry.upstream_observation
+    if observation is None:
+        print("live_upstream: not checked")
+    else:
+        detail = f"{observation.status} commit={observation.commit or 'unknown'} observed_at={observation.observed_at_utc}"
+        if observation.error:
+            detail += f" error={observation.error}"
+        print(f"live_upstream: {detail}")
     print_detail_values("repair_paths", state.repair_paths if state is not None else [])
     print_detail_values("issues", state.issues if state is not None else [])
+
+
+def print_status_json(
+    config: Config,
+    entries: list[MirrorStatusEntry],
+    errors: list[dict[str, str]],
+) -> None:
+    document = {
+        "schema": "model-mirror-status",
+        "version": 1,
+        "archive": str(Path(config.directory)),
+        "repositories": [mirror_status_json(entry) for entry in entries],
+        "errors": errors,
+    }
+    print(json.dumps(document, indent=2, sort_keys=True))
+
+
+def mirror_status_json(entry: MirrorStatusEntry) -> dict:
+    state = entry.state
+    observation = entry.upstream_observation
+    return {
+        "repo_id": entry.repo_id,
+        "repo_type": entry.repo_type,
+        "path": str(entry.root),
+        "requested_revision": (
+            state.requested_revision
+            if state is not None and state.requested_revision
+            else entry.snapshot_requested_revision or None
+        ),
+        "resolved_commit": resolved_commit_for_status(entry) or None,
+        "last_verification": {
+            "status": state.status if state is not None else "unverified",
+            "checked_at": state.checked_at_utc if state is not None and state.checked_at_utc else None,
+            "offline_only": state.offline_only if state is not None else None,
+            "issues": list(state.issues) if state is not None else [],
+            "repair_paths": list(state.repair_paths) if state is not None else [],
+        },
+        "payload": {
+            "files": entry.payload_files,
+            "bytes": entry.payload_size,
+            "source": entry.payload_source,
+        },
+        "snapshot": {
+            "commit": entry.snapshot_commit or None,
+            "expected_files": entry.expected_files,
+            "stale": snapshot_is_stale(entry),
+        },
+        "upstream": {
+            "recorded": {
+                "status": state.upstream_status if state is not None else "unknown",
+                "commit": state.upstream_commit if state is not None and state.upstream_commit else None,
+            },
+            "live": (
+                {
+                    "status": observation.status,
+                    "commit": observation.commit,
+                    "observed_at": observation.observed_at_utc,
+                    "error": observation.error,
+                }
+                if observation is not None
+                else None
+            ),
+        },
+        "exceptions": mirror_exception_tags(entry),
+        "lock": entry.active_lock,
+        "activity": [progress_entry_json(item) for item in entry.progress.entries],
+        "torrent": torrent_status_json(entry),
+    }
+
+
+def progress_entry_json(entry: ProgressEntry) -> dict:
+    return {
+        "path": entry.path,
+        "stage": entry.stage,
+        "bytes_done": entry.bytes_done,
+        "bytes_total": entry.bytes_total,
+        "updated_at": entry.updated_at_utc or None,
+        "idle_seconds": entry.idle_seconds,
+        "stalled": entry.stalled,
+        "source": entry.source,
+        "rate_bytes_per_second": entry.rate_bytes_per_second,
+    }
+
+
+def torrent_status_json(entry: MirrorStatusEntry) -> dict | None:
+    if entry.torrent_status is None:
+        return None
+    if entry.torrent_status == "metadata-error":
+        return {"status": "metadata-error"}
+    from .torrent_publication import load_fenced_publication
+
+    try:
+        fenced = load_fenced_publication(entry.root)
+    except (OSError, ValueError):
+        return {"status": "metadata-error"}
+    if fenced is None:
+        return None
+    record = fenced[0]
+    try:
+        coverage = torrent_coverage_status(entry.root)
+    except (OSError, ValueError, RuntimeError):
+        coverage = "metadata-error"
+    return {
+        "publication_id": record.publication_id,
+        "resolved_commit": record.resolved_commit,
+        "profile": record.profile,
+        "lifecycle": record.lifecycle,
+        "client_mode": record.client_mode,
+        "desired_seed": record.desired_seed,
+        "observed_backend": record.observed_backend,
+        "coverage": coverage,
+        "content_verification": record.content_verification,
+        "publication_trust": record.publication_trust,
+        "upstream_provenance": record.upstream_provenance,
+        "upstream_availability": record.upstream_availability,
+        "infohash_v1": record.infohash_v1,
+        "infohash_v2": record.infohash_v2,
+    }
 
 
 def print_detail_values(label: str, values: list[str]) -> None:
@@ -1129,9 +1495,7 @@ def shorten_commit(commit: str) -> str:
 
 
 def file_count_label(entry: MirrorStatusEntry) -> str:
-    if entry.expected_files is None or snapshot_is_stale(entry):
-        return str(entry.payload_files)
-    return f"{entry.expected_files_present}/{entry.expected_files}"
+    return str(entry.payload_files) if entry.payload_files is not None else "?"
 
 
 def mirror_exception_tags(entry: MirrorStatusEntry) -> list[str]:
@@ -1189,8 +1553,8 @@ def torrent_coverage_status(root: Path) -> str:
 
 def archive_cache_usage(config: Config) -> CacheUsage:
     archive_root = Path(config.directory)
-    cache_root = Path(config.cache_dir) if config.cache_dir is not None else archive_root / ".cache"
-    tmp_root = Path(config.tmp_dir) if config.tmp_dir is not None else archive_root / ".tmp"
+    cache_root = archive_runtime_cache_path(config)
+    tmp_root = archive_runtime_tmp_path(config)
     return CacheUsage(
         archive_cache=directory_size(cache_root),
         archive_tmp=directory_size(tmp_root),
@@ -1223,9 +1587,16 @@ def handle_clean_cache(config: Config, *, force: bool) -> int:
 
 def cleanup_targets(config: Config) -> list[tuple[Path, str]]:
     archive_root = Path(config.directory)
-    cache_root = Path(config.cache_dir) if config.cache_dir is not None else archive_root / ".cache"
-    tmp_root = Path(config.tmp_dir) if config.tmp_dir is not None else archive_root / ".tmp"
+    cache_root = archive_runtime_cache_path(config)
+    tmp_root = archive_runtime_tmp_path(config)
     targets = [(cache_root, "archive-cache"), (tmp_root, "archive-tmp")]
+    selected = {path.resolve(strict=False) for path, _label in targets}
+    for path, label in (
+        (archive_root / ".cache", "legacy-archive-cache"),
+        (archive_root / ".tmp", "legacy-archive-tmp"),
+    ):
+        if path.resolve(strict=False) not in selected:
+            targets.append((path, label))
     targets.extend((path, "mirror-cache") for path in mirror_cache_dirs(archive_root))
     return targets
 
@@ -1242,9 +1613,15 @@ def is_safe_cleanup_target(path: Path, archive_root: Path, label: str) -> bool:
     resolved_path = path.resolve(strict=False)
     resolved_archive = archive_root.resolve(strict=False)
     protected = {resolved_archive, *(resolved_archive / type_dir for type_dir in REPO_TYPE_DIRS.values())}
-    expected_name = ".tmp" if label == "archive-tmp" else ".cache"
+    expected_names = {
+        "archive-cache": {"cache", ".cache"},
+        "archive-tmp": {"tmp", ".tmp"},
+        "legacy-archive-cache": {".cache"},
+        "legacy-archive-tmp": {".tmp"},
+        "mirror-cache": {".cache"},
+    }
     return (
-        resolved_path.name == expected_name
+        resolved_path.name in expected_names.get(label, set())
         and resolved_path.is_relative_to(resolved_archive)
         and resolved_path not in protected
     )
@@ -1277,6 +1654,10 @@ def format_bytes(size: int) -> str:
                 return f"{int(value)} B"
             return f"{value:.1f} {unit}"
         value /= 1024
+
+
+def format_optional_bytes(size: int | None) -> str:
+    return format_bytes(size) if size is not None else "unknown"
 
 
 def format_lock_detail(info: dict | None) -> str:

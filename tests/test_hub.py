@@ -91,7 +91,7 @@ def test_huggingface_hub_adapter_uses_configured_environment(tmp_path, monkeypat
     path = hub.snapshot_download("org/model", "model", "main", destination)
 
     assert captured["repo_info"] == ("org/model", "model", "main", True)
-    assert captured["hf_home"] == str(tmp_path / ".cache")
+    assert captured["hf_home"] == str(tmp_path / ".model-mirror" / "cache")
     assert captured["token_path"] == str(token_path)
     assert captured["snapshot"].repo_id == "org/model"
     assert captured["snapshot"].repo_type == "model"
@@ -173,7 +173,7 @@ def test_huggingface_hub_snapshot_download_uses_ephemeral_staging_cache(tmp_path
     result = hub.snapshot_download("org/model", "model", "main", destination)
 
     assert result == destination
-    assert captured["local_dir"].is_relative_to(archive / ".tmp" / "downloads")
+    assert captured["local_dir"].is_relative_to(archive / ".model-mirror" / "tmp" / "downloads")
     assert captured["cache_dir"] == captured["local_dir"] / ".cache" / "hub"
     assert not captured["cache_dir"].is_relative_to(destination)
     assert captured["env"] == {

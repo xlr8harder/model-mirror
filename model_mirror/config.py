@@ -9,6 +9,7 @@ import yaml
 
 
 DEFAULT_CONFIG_PATH = Path("~/.model-mirror.yaml").expanduser()
+ARCHIVE_CONTROL_DIR = ".model-mirror"
 TOKEN_SETUP_HINT = "model-mirror config set token-path /path/to/huggingface/token"
 REPO_TYPE_DIRS = {
     "model": "models",
@@ -244,12 +245,28 @@ def archive_path(config: Config, repo_id: str, repo_type: str | None = None) -> 
     return Path(config.directory) / type_dir / safe_repo_path(repo_id)
 
 
+def archive_control_path(config: Config) -> Path:
+    return Path(config.directory) / ARCHIVE_CONTROL_DIR
+
+
+def archive_runtime_cache_path(config: Config) -> Path:
+    if config.cache_dir is not None:
+        return Path(config.cache_dir)
+    return archive_control_path(config) / "cache"
+
+
+def archive_runtime_tmp_path(config: Config) -> Path:
+    if config.tmp_dir is not None:
+        return Path(config.tmp_dir)
+    return archive_control_path(config) / "tmp"
+
+
 def apply_hf_environment(config: Config, environ: Mapping[str, str] | None = None) -> dict[str, str]:
     base_env = dict(os.environ if environ is None else environ)
     token_path = detect_token_path(config, base_env)
     env = dict(base_env)
-    cache_dir = config.cache_dir or Path(config.directory) / ".cache"
-    tmp_dir = config.tmp_dir or Path(config.directory) / ".tmp"
+    cache_dir = archive_runtime_cache_path(config)
+    tmp_dir = archive_runtime_tmp_path(config)
 
     env["HF_HOME"] = str(cache_dir)
     env["HF_HUB_CACHE"] = str(cache_dir / "hub")

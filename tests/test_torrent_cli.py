@@ -1,4 +1,5 @@
 import hashlib
+import json
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
@@ -6,7 +7,9 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
+import model_mirror.cli as cli_module
 import model_mirror.torrent_import as import_module
+import model_mirror.torrent_publication as publication_module
 import model_mirror.torrent_seed as seed_module
 import model_mirror.torrent_coverage as coverage_module
 from model_mirror.checksums import write_checksums
@@ -129,6 +132,17 @@ def test_torrent_create_publish_show_stop_retire_and_errors(tmp_path, capsys):
     status_output = capsys.readouterr().out
     assert "TORRENT" in status_output
     assert "published,managed" in status_output
+    assert main(["--config", str(config), "status", "--json", "org/model"]) == 0
+    status_document = json.loads(capsys.readouterr().out)
+    torrent = status_document["repositories"][0]["torrent"]
+    assert torrent["publication_id"] == f"huggingface:model:org/model@{COMMIT}"
+    assert torrent["coverage"] == "complete"
+    assert torrent["content_verification"] == "upstream-verified"
+    assert torrent["publication_trust"] == "local-verified-publication"
+    assert torrent["upstream_provenance"] == "upstream-verified"
+    assert torrent["upstream_availability"] == "available"
+    assert torrent["infohash_v1"]
+    assert torrent["infohash_v2"]
     assert main(["--config", str(config), "torrent", "show", "org/model"]) == 0
     output = capsys.readouterr().out
     assert "feature_stability: experimental" in output
@@ -186,6 +200,48 @@ def test_torrent_create_publish_show_stop_retire_and_errors(tmp_path, capsys):
     assert list_torrent_status(tmp_path / "missing") is None
     (root / ".model-mirror" / "torrent" / "fence.json").write_text("{")
     assert list_torrent_status(root) == "metadata-error"
+    assert main(["--config", str(config), "status", "--json", "org/model"]) == 0
+    assert json.loads(capsys.readouterr().out)["repositories"][0]["torrent"] == {
+        "status": "metadata-error"
+    }
+
+
+def test_status_json_handles_torrent_metadata_races(tmp_path, monkeypatch):
+    root = archive(tmp_path)
+    create_publication(root, repo_id="org/model", repo_type="model")
+    entry = cli_module.build_mirror_status(
+        Config(directory=tmp_path),
+        root,
+        "org/model",
+        "model",
+    )
+
+    with monkeypatch.context() as context:
+        context.setattr(
+            publication_module,
+            "load_fenced_publication",
+            lambda _root: (_ for _ in ()).throw(OSError("gone")),
+        )
+        assert cli_module.torrent_status_json(entry) == {"status": "metadata-error"}
+
+    with monkeypatch.context() as context:
+        context.setattr(
+            cli_module,
+            "torrent_coverage_status",
+            lambda _root: (_ for _ in ()).throw(RuntimeError("bad coverage")),
+        )
+        assert cli_module.torrent_status_json(entry)["coverage"] == "metadata-error"
+
+    unpublished = tmp_path / "models" / "other" / "model"
+    unpublished.mkdir(parents=True)
+    missing_entry = cli_module.build_mirror_status(
+        Config(directory=tmp_path),
+        unpublished,
+        "other/model",
+        "model",
+    )
+    missing_entry.torrent_status = "published"
+    assert cli_module.torrent_status_json(missing_entry) is None
 
 
 def test_torrent_handoff_and_import_cli(tmp_path, capsys):

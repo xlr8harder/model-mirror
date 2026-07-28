@@ -6,6 +6,9 @@ import model_mirror.config as config_module
 from model_mirror.config import (
     Config,
     apply_hf_environment,
+    archive_control_path,
+    archive_runtime_cache_path,
+    archive_runtime_tmp_path,
     archive_path,
     detect_token_path,
     hf_token_available,
@@ -209,6 +212,22 @@ def test_archive_path_uses_repo_type_directories(tmp_path):
     assert archive_path(config, "org/space", repo_type="space") == tmp_path / "spaces" / "org" / "space"
 
 
+def test_archive_runtime_paths_share_one_control_directory_by_default(tmp_path):
+    config = Config(directory=tmp_path)
+
+    assert archive_control_path(config) == tmp_path / ".model-mirror"
+    assert archive_runtime_cache_path(config) == tmp_path / ".model-mirror" / "cache"
+    assert archive_runtime_tmp_path(config) == tmp_path / ".model-mirror" / "tmp"
+
+    configured = Config(
+        directory=tmp_path,
+        cache_dir=tmp_path / "custom-cache",
+        tmp_dir=tmp_path / "custom-tmp",
+    )
+    assert archive_runtime_cache_path(configured) == tmp_path / "custom-cache"
+    assert archive_runtime_tmp_path(configured) == tmp_path / "custom-tmp"
+
+
 def test_archive_path_rejects_unknown_repo_type(tmp_path):
     try:
         archive_path(Config(directory=tmp_path), "org/model", repo_type="unknown")
@@ -228,11 +247,11 @@ def test_apply_hf_environment_keeps_all_cache_state_under_archive(tmp_path, monk
     )
     env = apply_hf_environment(config, environ={})
 
-    assert env["HF_HOME"] == str(tmp_path / ".cache")
-    assert env["HF_HUB_CACHE"] == str(tmp_path / ".cache" / "hub")
-    assert env["HF_ASSETS_CACHE"] == str(tmp_path / ".cache" / "assets")
-    assert env["HF_XET_CACHE"] == str(tmp_path / ".cache" / "xet")
-    assert env["TMPDIR"] == str(tmp_path / ".tmp")
+    assert env["HF_HOME"] == str(tmp_path / ".model-mirror" / "cache")
+    assert env["HF_HUB_CACHE"] == str(tmp_path / ".model-mirror" / "cache" / "hub")
+    assert env["HF_ASSETS_CACHE"] == str(tmp_path / ".model-mirror" / "cache" / "assets")
+    assert env["HF_XET_CACHE"] == str(tmp_path / ".model-mirror" / "cache" / "xet")
+    assert env["TMPDIR"] == str(tmp_path / ".model-mirror" / "tmp")
     assert env["HF_TOKEN_PATH"] == str(tmp_path / "token")
     assert env["HF_XET_HIGH_PERFORMANCE"] == "1"
     assert env["HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY"] == "1"
@@ -260,13 +279,14 @@ def test_apply_hf_environment_overrides_inherited_cache_paths(tmp_path):
 
     env = apply_hf_environment(Config(directory=tmp_path), environ=inherited)
 
-    assert env["HF_HOME"] == str(tmp_path / ".cache")
-    assert env["HF_HUB_CACHE"] == str(tmp_path / ".cache" / "hub")
-    assert env["HF_ASSETS_CACHE"] == str(tmp_path / ".cache" / "assets")
-    assert env["HF_XET_CACHE"] == str(tmp_path / ".cache" / "xet")
-    assert env["TRANSFORMERS_CACHE"] == str(tmp_path / ".cache" / "transformers")
-    assert env["XDG_CACHE_HOME"] == str(tmp_path / ".cache" / "xdg")
-    assert env["TMPDIR"] == str(tmp_path / ".tmp")
+    control = tmp_path / ".model-mirror"
+    assert env["HF_HOME"] == str(control / "cache")
+    assert env["HF_HUB_CACHE"] == str(control / "cache" / "hub")
+    assert env["HF_ASSETS_CACHE"] == str(control / "cache" / "assets")
+    assert env["HF_XET_CACHE"] == str(control / "cache" / "xet")
+    assert env["TRANSFORMERS_CACHE"] == str(control / "cache" / "transformers")
+    assert env["XDG_CACHE_HOME"] == str(control / "cache" / "xdg")
+    assert env["TMPDIR"] == str(control / "tmp")
     assert env["HF_TOKEN"] == "hf_secret"
     assert "HF_XET_HIGH_PERFORMANCE" not in env
     assert "HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY" not in env
@@ -298,7 +318,7 @@ def test_apply_hf_environment_detects_hf_home_token_before_relocating_cache(tmp_
     )
 
     assert env["HF_TOKEN_PATH"] == str(token)
-    assert env["HF_HOME"] == str(tmp_path / "archive" / ".cache")
+    assert env["HF_HOME"] == str(tmp_path / "archive" / ".model-mirror" / "cache")
 
 
 def test_detect_token_path_prefers_configured_path_even_if_missing(tmp_path):

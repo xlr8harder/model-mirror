@@ -175,11 +175,14 @@ def progress_snapshot(
     *,
     stall_timeout_seconds: int = DEFAULT_STALL_TIMEOUT_SECONDS,
     now: datetime | None = None,
+    scan_incomplete: bool = True,
 ) -> ProgressSnapshot:
     now = now or datetime.now(timezone.utc)
     entries = progress_file_entries(root, stall_timeout_seconds=stall_timeout_seconds, now=now)
     if entries:
         return ProgressSnapshot(entries=entries, source="heartbeat")
+    if not scan_incomplete:
+        return ProgressSnapshot(entries=[], source="heartbeat")
     return ProgressSnapshot(
         entries=incomplete_file_entries(root, stall_timeout_seconds=stall_timeout_seconds, now=now),
         source="partial-file",

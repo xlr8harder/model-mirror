@@ -36,6 +36,12 @@ model-mirror verify org/model
 model-mirror repair org/model  # if verify reports repair paths
 ```
 
+Once the first PyPI release is published, the normal installation will be
+`uv tool install model-mirror`, or
+`uv tool install 'model-mirror[torrent]'` with experimental torrent support.
+Installed releases can be updated with `uv tool upgrade model-mirror` and
+inspected with `model-mirror --version`.
+
 For development inside the checkout, use `uv sync` and prefix commands with
 `uv run`. The rest of this README assumes the tool installation above.
 
@@ -52,19 +58,33 @@ Mirrors are stored by repo type:
 /mnt/big-drive/huggingface/models/org/model/
 /mnt/big-drive/huggingface/datasets/org/data/
 /mnt/big-drive/huggingface/spaces/org/space/
+/mnt/big-drive/huggingface/.model-mirror/cache/
+/mnt/big-drive/huggingface/.model-mirror/tmp/
 ```
+
+The archive has one top-level control directory, `.model-mirror/`. Its `cache/`
+and `tmp/` children contain disposable Hugging Face/Xet state and resumable
+download staging. Each mirrored repository also has its own `.model-mirror/`
+directory for durable commit-scoped metadata. Payload directories never contain
+a model-mirror virtual environment or package-installation cache.
 
 Run `model-mirror --help` or `model-mirror COMMAND --help` for the full CLI
 reference. Run `model-mirror config options` for every supported config key.
 Commands exit non-zero for dirty, incomplete, busy, or invalid states where that
 matters; see each subcommand's help for exact exit-status behavior.
 
-Without a repository argument, `model-mirror status` prints a compact
-archive-wide table with repository type and ID, file count, payload size,
-abbreviated resolved commit, last-check age, and exceptional state. A healthy
-row uses `-` in `EXCEPTIONS` instead of repeating `clean`. Torrent and live
-activity columns appear only when relevant. `model-mirror list` is currently an
-alias for the same output.
+Without a repository argument, `model-mirror status` prints a compact,
+metadata-only archive table with repository type and ID, recorded file count
+and payload size, abbreviated resolved commit, verification age, and
+exceptional state. A healthy row uses `-` in `EXCEPTIONS` instead of repeating
+`clean`. Torrent and live activity columns appear only when relevant.
+`model-mirror list` is currently an alias for the same output.
+
+Status reads model-mirror's existing verification, manifest, snapshot, lock,
+progress, and torrent metadata. It does not recursively scan payload or cache
+directories, read payload bytes, contact the Hub, or update metadata. Missing
+recorded counts or sizes are displayed as unknown; use `verify` to reconcile
+the local filesystem.
 
 Pass a repository ID for a detailed, strictly local last-known report without
 contacting the Hub:
@@ -73,13 +93,28 @@ contacting the Hub:
 model-mirror status org/model
 model-mirror list org/model                 # same detailed view
 model-mirror status --repo-type dataset org/data
+model-mirror status --check-upstream org/model
+model-mirror status --verbose org/model
+model-mirror status --json
 ```
 
-The detailed view includes the explicit status, full resolved and upstream
-commits, snapshot commit, requested revision, exact payload bytes, payload and
-expected-file counts, verification timestamp, issues, repair paths, lock,
-progress, and torrent state. A mismatch between verification and snapshot
-commits is reported as `snapshot-stale`.
+The default detail view emphasizes verification state and age, resolved commit,
+recorded payload size, upstream state, torrent publication, exceptional state,
+and useful next actions. Issues and repair paths appear only when present.
+`--verbose` prints all recorded metadata fields.
+
+`--check-upstream` performs an advisory live comparison between the locally
+resolved commit and the commit currently resolved by the requested upstream
+revision. It does not write verification state, snapshot metadata, timestamps,
+or locks. The ordinary recorded upstream state is still shown separately from
+the live observation in JSON.
+
+`--json` emits the versioned `model-mirror-status` schema with one
+`repositories` array for both single-repository and archive-wide output.
+Numbers remain numeric, timestamps are ISO 8601, and issues and repair paths are
+arrays. `--verbose` is accepted as a no-op when combined with `--json`. A
+mismatch between verification and snapshot commits is reported as
+`snapshot-stale`.
 
 ## Verification
 
@@ -339,9 +374,12 @@ model-mirror repair --all                  # repair all mirrors with recorded re
 model-mirror repair --update org/model     # apply a changed upstream commit recorded by verify
 model-mirror offline org/model             # local verification only; no Hub checks
 model-mirror online org/model              # re-enable Hub checks
-model-mirror list                          # show mirrors, state tags, and verification age
-model-mirror status                        # archive sizes, cache use, locks, progress, and torrent state
-model-mirror status org/model              # detailed last-known local repository state
+model-mirror list                          # fast recorded state for every mirror
+model-mirror status                        # metadata-only archive status
+model-mirror status org/model              # concise last-known repository state
+model-mirror status --verbose org/model    # full recorded metadata
+model-mirror status --check-upstream org/model  # advisory live upstream comparison
+model-mirror status --json                 # stable machine-readable status
 model-mirror remove org/model              # inspect, confirm, and permanently remove one mirror
 model-mirror upgrade org/model             # fill missing torrent hash coverage
 model-mirror torrent publish org/model     # publish and request durable seeding
@@ -381,6 +419,10 @@ Important configuration options:
   `~/.huggingface/token`. If no token is found during Hub access,
   model-mirror warns and prints the config command to set this path. Token
   contents are never printed.
+- `cache_dir`: optional override for the Hugging Face/Xet cache; defaults to
+  `DIRECTORY/.model-mirror/cache`
+- `tmp_dir`: optional override for staging and temporary files; defaults to
+  `DIRECTORY/.model-mirror/tmp`
 - `hf_xet_reconstruct_write_sequentially`: HDD-friendly Xet reconstruction
   writes; uses the current `HF_XET_RECONSTRUCTION_USE_VECTORED_WRITE=false`
   knob when supported
@@ -402,14 +444,18 @@ redownloading it, so it likewise does not retain both the damaged and repaired
 copy.
 
 Allow space for the final snapshot, active partial files, and auxiliary
-transport cache under `DIRECTORY/.tmp/downloads`. The auxiliary cache is not
-specified as a fixed percentage and can vary with the HTTP/Xet implementation,
-but model-mirror does not intentionally reconstruct a second full payload
-there. Interrupted partial files and staging cache are retained for resume.
-`model-mirror status` reports cache and temporary usage, and
-`model-mirror clean-cache` previews reclaimable cache space before
-`clean-cache --force` removes it without deleting mirrored payloads. Do not run
-forced cache cleanup while `status` shows an active download or repair.
+transport cache under `DIRECTORY/.model-mirror/tmp/downloads`. The auxiliary
+cache is not specified as a fixed percentage and can vary with the HTTP/Xet
+implementation, but model-mirror does not intentionally reconstruct a second
+full payload there. Interrupted partial files and staging cache are retained
+for resume.
+`model-mirror clean-cache` scans and previews reclaimable cache space before
+`clean-cache --force` removes it without deleting mirrored payloads. It also
+detects legacy archive-root `.cache/` and `.tmp/` directories left by older
+versions. The `.model-mirror/` control directory itself remains in place. The
+metadata-only `status` command reports active work when its progress heartbeat
+is available; do not run forced cache cleanup while it shows an active download
+or repair.
 
 ## Locking And Interrupted Commands
 
