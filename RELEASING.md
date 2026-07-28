@@ -5,15 +5,14 @@ version plus the matching annotated Git tag.
 
 ## One-time PyPI setup
 
-1. Choose and add the project's license.
-2. Create the `model-mirror` project on PyPI, or configure a pending publisher
+1. Create the `model-mirror` project on PyPI, or configure a pending publisher
    for the first release.
-3. Add a PyPI trusted publisher for:
+2. Add a PyPI trusted publisher for:
    - owner: `xlr8harder`
    - repository: `model-mirror`
    - workflow: `release.yml`
    - environment: `pypi`
-4. Create a protected `pypi` environment in the GitHub repository.
+3. Create a protected `pypi` environment in the GitHub repository.
 
 The release workflow uses OpenID Connect trusted publishing. Do not add a
 long-lived PyPI token to the repository.
