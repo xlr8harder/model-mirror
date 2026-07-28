@@ -154,19 +154,6 @@ def test_mirror_command_uses_injected_hub(tmp_path, capsys):
     assert "downloaded" in capsys.readouterr().out
 
 
-def test_card_command_uses_injected_hub_for_dataset(tmp_path, capsys):
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
-    hub = FakeHub([FakeFile("README.md", 2), FakeFile("data.bin", 3)])
-
-    rc = main(["--config", str(config_path), "card", "--repo-type", "dataset", "org/data"], hub=hub)
-
-    assert rc == 0
-    assert hub.downloads == ["org/data", "org/data"]
-    assert "downloaded: org/data" in capsys.readouterr().out
-    assert (tmp_path / "datasets" / "org" / "data" / "README.md").exists()
-
-
 def test_mirror_command_accepts_commit_option(tmp_path):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")

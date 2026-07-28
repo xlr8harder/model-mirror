@@ -11,7 +11,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .audit import audit_model
-from .card import download_card_assets
 from .checksums import MANIFEST, iter_payload_files, write_checksums, verify_checksums
 from .config import (
     Config,
@@ -160,16 +159,6 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="SECONDS",
         help="override stall timeout for this mirror; default 600 seconds, 0 disables timeout",
     )
-
-    card_parser = add_command_parser(
-        "card",
-        help="download a repo card and local assets",
-        description="Download README.md plus repository-local images referenced by the README.",
-        epilog="Exit status: 0 when card files are downloaded; 1 when README.md is missing.",
-    )
-    card_parser.add_argument("repo", help="Hugging Face repo id, e.g. org/model")
-    card_parser.add_argument("--repo-type", choices=["model", "dataset", "space"], help="repo kind to download")
-    add_revision_options(card_parser)
 
     verify_parser = add_command_parser(
         "verify",
@@ -489,17 +478,6 @@ def main(argv: list[str] | None = None, *, hub=None) -> int:
             )
             print(f"{result.status}: {args.model} -> {result.path}")
             return mirror_exit_code(result.status)
-        if args.command == "card":
-            selected_hub = hub or HuggingFaceHub(config)
-            result = download_card_assets(
-                config,
-                args.repo,
-                hub=selected_hub,
-                repo_type=args.repo_type,
-                revision=selected_revision_arg(args),
-            )
-            print(f"{result.status}: {args.repo} -> {result.path} ({len(result.paths)} files)")
-            return 0 if result.status == "downloaded" else 1
         if args.command == "verify":
             return handle_verify(args, config, hub=hub)
         if args.command == "repair":

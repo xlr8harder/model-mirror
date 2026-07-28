@@ -413,7 +413,7 @@ forced cache cleanup while `status` shows an active download or repair.
 ## Locking And Interrupted Commands
 
 Repository operations use an advisory kernel `flock` on
-`.verification.lock`. `mirror`, `card`, `verify`, `repair`, `offline`, `online`,
+`.verification.lock`. `mirror`, `verify`, `repair`, `offline`, `online`,
 `upgrade`, and torrent control-plane transitions take this per-repository lock;
 the managed seeder holds it only during short reconciliation transitions.
 `list` and `status` remain non-blocking and report the command, PID, host, and
