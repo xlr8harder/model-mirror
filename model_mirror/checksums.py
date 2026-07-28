@@ -7,6 +7,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Protocol
 
+from .payload import (
+    PayloadMissingError,
+    PayloadPathError,
+    validate_payload_file,
+    validate_payload_path,
+)
+
 
 CHECKSUMS = ".checksums"
 MANIFEST = ".manifest"
@@ -29,11 +36,12 @@ class ChecksumResult:
     checked: int = 0
     missing: list[str] = field(default_factory=list)
     failures: list[str] = field(default_factory=list)
+    unsafe: list[str] = field(default_factory=list)
     extras: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
-        return not self.missing and not self.failures and not self.extras
+        return not self.missing and not self.failures and not self.unsafe and not self.extras
 
 
 @dataclass(slots=True)
@@ -155,14 +163,24 @@ def hash_file_prefix(
     return state
 
 
-def iter_payload_files(root: Path):
+def iter_payload_entries(root: Path):
     for path in sorted(root.rglob("*")):
-        if not path.is_file():
+        if not path.is_symlink() and not path.is_file():
             continue
         rel = path.relative_to(root)
         if rel.parts and rel.parts[0] in SKIP_DIRS:
             continue
         if rel.as_posix() in SKIP_FILES:
+            continue
+        yield path
+
+
+def iter_payload_files(root: Path):
+    for path in iter_payload_entries(root):
+        rel = path.relative_to(root).as_posix()
+        try:
+            validate_payload_file(root, path, rel)
+        except PayloadPathError:
             continue
         yield path
 
@@ -245,6 +263,7 @@ def record_is_current(row: dict | None, size: int, mtime_ns: int) -> bool:
 
 
 def checksum_row(root: Path, path: Path) -> dict:
+    validate_payload_file(root, path, path.relative_to(root).as_posix())
     hashes = file_hashes(path)
     return checksum_row_from_hashes(root, path, hashes)
 
@@ -265,6 +284,7 @@ def write_manifest(root: Path, manifest: dict[str, dict]) -> None:
     with manifest_tmp.open("w", encoding="utf-8", newline="\n") as handle:
         handle.write(json.dumps({"schema": MANIFEST_SCHEMA, "version": MANIFEST_VERSION}, sort_keys=True) + "\n")
         for rel in sorted(manifest):
+            validate_payload_path(rel)
             handle.write(json.dumps(manifest[rel], sort_keys=True) + "\n")
     manifest_tmp.replace(root / MANIFEST)
     remove_obsolete_checksum_files(root)
@@ -280,8 +300,11 @@ def update_checksums(root: Path, paths: list[str], *, max_workers: int = 1) -> C
     result = ChecksumWriteResult(total=len(paths))
     work: list[Path] = []
     for rel in paths:
+        rel = validate_payload_path(rel)
         path = root / rel
-        if not path.exists() or not path.is_file():
+        try:
+            validate_payload_file(root, path, rel)
+        except PayloadPathError:
             if manifest.pop(rel, None) is not None:
                 result.removed += 1
             continue
@@ -331,8 +354,11 @@ def load_manifest(root: Path) -> dict[str, dict]:
                     continue
                 saw_record = True
                 try:
-                    manifest[row["path"]] = row
-                except KeyError as exc:
+                    rel = validate_payload_path(str(row["path"]))
+                    if rel in manifest:
+                        raise ValueError(f"Duplicate path on line {line_number} in {manifest_path}: {rel}")
+                    manifest[rel] = row
+                except (KeyError, PayloadPathError) as exc:
                     raise ValueError(f"Malformed line {line_number} in {manifest_path}") from exc
     return manifest
 
@@ -352,8 +378,13 @@ def verify_checksums(root: Path, strict: bool = False) -> ChecksumResult:
     result = ChecksumResult()
     for rel, row in manifest.items():
         path = root / rel
-        if not path.exists():
+        try:
+            validate_payload_file(root, path, rel)
+        except PayloadMissingError:
             result.missing.append(rel)
+            continue
+        except PayloadPathError:
+            result.unsafe.append(rel)
             continue
         result.checked += 1
         hashes = file_hashes(path)
@@ -364,7 +395,7 @@ def verify_checksums(root: Path, strict: bool = False) -> ChecksumResult:
         tracked = set(manifest)
         result.extras = [
             path.relative_to(root).as_posix()
-            for path in iter_payload_files(root)
+            for path in iter_payload_entries(root)
             if path.relative_to(root).as_posix() not in tracked
         ]
 

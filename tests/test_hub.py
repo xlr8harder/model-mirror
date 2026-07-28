@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import sys
 import threading
@@ -27,6 +28,7 @@ from model_mirror.hub import (
     cached_manifest_verifies,
 )
 from model_mirror.progress import ProgressRecorder, progress_snapshot
+from model_mirror.runtime_cache import read_download_record
 
 
 def sha256(payload: bytes) -> str:
@@ -191,6 +193,34 @@ def test_huggingface_hub_snapshot_download_uses_ephemeral_staging_cache(tmp_path
     assert not (destination / ".tmp").exists()
 
 
+def test_failed_snapshot_download_retains_identified_staging_for_status(tmp_path, monkeypatch):
+    config = Config(directory=tmp_path)
+    hub = HuggingFaceHub(config)
+    destination = tmp_path / "models" / "org" / "model"
+    snapshot = HubSnapshot(
+        "org/model",
+        "model",
+        "main",
+        "commit123",
+        [HubFile("file.bin", 3)],
+    )
+
+    monkeypatch.setattr(hub_module, "stream_snapshot", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("fail")))
+
+    with pytest.raises(RuntimeError, match="fail"):
+        hub.download_snapshot(snapshot, destination)
+
+    staging = download_staging_dir(config, "org/model", "model", "commit123", None)
+    record = read_download_record(staging)
+    assert record is not None
+    assert record.repo_id == "org/model"
+    assert record.repo_type == "model"
+    assert record.requested_revision == "main"
+    assert record.resolved_commit == "commit123"
+    assert record.destination == str(destination)
+    assert record.allow_patterns is None
+
+
 def test_huggingface_hub_snapshot_download_prunes_incomplete_local_dir_chunks(tmp_path, monkeypatch):
     destination = tmp_path / "models" / "org" / "model"
     config = Config(directory=tmp_path)
@@ -295,6 +325,29 @@ def test_snapshot_plan_round_trips_and_filters_compatible_resume(tmp_path):
     ) is None
 
 
+@pytest.mark.parametrize("payload_path", ["../outside.bin", "/absolute.bin", ".manifest"])
+def test_snapshot_plan_rejects_unsafe_payload_paths(tmp_path, payload_path):
+    snapshot = HubSnapshot("org/model", "model", "main", "commit", [HubFile(payload_path, 1)])
+
+    with pytest.raises(ValueError, match="payload"):
+        write_snapshot_plan(tmp_path, snapshot)
+
+
+def test_snapshot_plan_rejects_duplicate_payload_paths(tmp_path):
+    item = HubFile("file.bin", 1)
+    snapshot = HubSnapshot("org/model", "model", "main", "commit", [item, item])
+
+    with pytest.raises(ValueError, match="Duplicate payload path"):
+        write_snapshot_plan(tmp_path, snapshot)
+
+
+def test_snapshot_plan_rejects_unknown_repository_type(tmp_path):
+    snapshot = HubSnapshot("org/model", "unknown", "main", "commit", [])
+
+    with pytest.raises(ValueError, match="Unsupported repository type"):
+        write_snapshot_plan(tmp_path, snapshot)
+
+
 def test_snapshot_plan_missing_returns_none(tmp_path):
     assert read_snapshot_plan(tmp_path) is None
     assert compatible_snapshot_plan(
@@ -314,6 +367,28 @@ def test_snapshot_plan_reader_rejects_unknown_schema_or_version(tmp_path):
 
     path.write_text('{"schema": "model-mirror-snapshot", "version": 999}\n', encoding="utf-8")
     with pytest.raises(ValueError, match="Unsupported snapshot plan version"):
+        read_snapshot_plan(tmp_path)
+
+
+def test_snapshot_plan_reader_rejects_unsafe_persisted_paths(tmp_path):
+    path = snapshot_plan_path(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema": "model-mirror-snapshot",
+                "version": 1,
+                "repo_id": "org/model",
+                "repo_type": "model",
+                "requested_revision": "main",
+                "resolved_commit": "commit",
+                "files": [{"path": "../outside.bin", "size": 1}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="unsafe payload path"):
         read_snapshot_plan(tmp_path)
 
 
@@ -345,6 +420,30 @@ def test_stream_file_to_path_resumes_xet_incomplete_from_hashed_prefix(tmp_path,
     assert not partial.exists()
     assert hashes.sha256 == sha256(payload)
     assert hashes.git_blob_sha1 == git_blob_sha1(payload)
+
+
+def test_stream_file_to_path_rejects_symlinked_incomplete_file(tmp_path):
+    snapshot = HubSnapshot("org/model", "model", "main", "commit123", [])
+    item = HubFile("file.bin", 3, lfs_sha256=sha256(b"abc"))
+    destination = tmp_path / "file.bin"
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"abc")
+    hub_module.incomplete_path_for(destination).symlink_to(outside)
+
+    with pytest.raises(DownloadIntegrityError, match="unsafe incomplete download path"):
+        hub_module.stream_file_to_path(snapshot, item, destination)
+
+    assert outside.read_bytes() == b"abc"
+
+
+def test_stream_file_to_path_rejects_directory_incomplete_path(tmp_path):
+    snapshot = HubSnapshot("org/model", "model", "main", "commit123", [])
+    item = HubFile("file.bin", 3, lfs_sha256=sha256(b"abc"))
+    destination = tmp_path / "file.bin"
+    hub_module.incomplete_path_for(destination).mkdir()
+
+    with pytest.raises(DownloadIntegrityError, match="unsafe incomplete download path"):
+        hub_module.stream_file_to_path(snapshot, item, destination)
 
 
 def test_stream_file_to_path_retries_corrupt_partial_from_zero(tmp_path, monkeypatch):

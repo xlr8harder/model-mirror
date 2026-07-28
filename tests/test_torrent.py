@@ -220,9 +220,8 @@ def test_descriptor_requires_matching_clean_pinned_state(tmp_path):
 def test_descriptor_rejects_ambiguous_or_unverified_payload_rows(tmp_path):
     duplicate = prepared_archive(tmp_path / "duplicate", payloads={"file.bin": b"x"})
     file = HubFile("file.bin", 1, lfs_sha256=hashlib.sha256(b"x").hexdigest())
-    write_snapshot_plan(duplicate, HubSnapshot("org/model", "model", "main", "a" * 40, [file, file]))
-    with pytest.raises(TorrentPublicationError, match="duplicate payload"):
-        build_publication_descriptor(duplicate, repo_id="org/model", repo_type="model")
+    with pytest.raises(ValueError, match="Duplicate payload path"):
+        write_snapshot_plan(duplicate, HubSnapshot("org/model", "model", "main", "a" * 40, [file, file]))
 
     invalid_size = prepared_archive(tmp_path / "invalid-size", payloads={"file.bin": b"x"})
     write_snapshot_plan(

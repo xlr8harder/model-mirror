@@ -7,14 +7,13 @@ import shutil
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
 
 from . import __version__
-from .audit import audit_model
 from .checksums import MANIFEST, iter_payload_files, load_manifest, write_checksums, verify_checksums
 from .config import (
     Config,
@@ -43,6 +42,13 @@ from .removal import (
     removal_record_path,
     stage_removal,
     write_removal_record,
+)
+from .runtime_cache import (
+    CacheIssue,
+    RuntimeCacheBusyError,
+    RuntimeCacheLock,
+    active_repository_locks,
+    inspect_runtime_cache,
 )
 from .state import (
     VerificationState,
@@ -153,6 +159,7 @@ class MirrorStatusEntry:
     progress: ProgressSnapshot
     torrent_status: str | None
     upstream_observation: UpstreamObservation | None = None
+    cache_issues: list[CacheIssue] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -482,12 +489,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     clean_cache_parser = add_command_parser(
         "clean-cache",
-        help="remove Hugging Face cache and temporary files",
+        help="inspect or remove exceptional runtime cache state",
         description=(
-            "Remove archive cache, temporary files, and per-mirror Hugging Face metadata caches "
-            "without touching mirrored payload files. Without --force, only reports reclaimable space."
+            "Inspect stale, interrupted, or untracked archive cache and temporary data. "
+            "With --force, remove it without touching mirrored payload files."
         ),
-        epilog="Exit status: 0 when cleanup succeeds; 1 when a configured cleanup target is unsafe.",
+        epilog=(
+            "Exit status: 0 when inspection or cleanup succeeds; 1 when runtime data is active "
+            "or a configured cleanup target is unsafe."
+        ),
     )
     clean_cache_parser.add_argument("--force", action="store_true", help="delete cache and temporary files")
 
@@ -911,6 +921,7 @@ def handle_list(
     hub=None,
 ) -> int:
     errors: list[dict[str, str]] = []
+    cache_issues = inspect_runtime_cache(config)
     if repo_id is not None:
         selected_type = repo_type or config.repo_type
         root = archive_path(config, repo_id, selected_type)
@@ -925,26 +936,36 @@ def handle_list(
                         "message": message,
                     }
                 )
-                print_status_json(config, [], errors)
+                print_status_json(config, [], errors, cache_issues=[])
             else:
                 print(message)
             return 1
         entries = [build_mirror_status(config, root, repo_id, selected_type)]
+        selected_cache_issues = select_cache_issues(
+            cache_issues,
+            repo_id=repo_id,
+            repo_type=selected_type,
+        )
+        attach_cache_issues(entries, selected_cache_issues)
         if check_upstream:
             observe_upstreams(config, entries, hub=hub)
         if json_output:
-            print_status_json(config, entries, errors)
+            print_status_json(config, entries, errors, cache_issues=selected_cache_issues)
         elif verbose:
             print_mirror_detail_verbose(entries[0])
+            print_cache_attention(selected_cache_issues)
         else:
             print_mirror_detail(entries[0])
+            print_cache_attention(selected_cache_issues)
         return 0
 
     entries = collect_mirror_status(config, repo_type=repo_type)
+    selected_cache_issues = select_cache_issues(cache_issues, repo_type=repo_type)
+    attach_cache_issues(entries, selected_cache_issues)
     if check_upstream:
         observe_upstreams(config, entries, hub=hub)
     if json_output:
-        print_status_json(config, entries, errors)
+        print_status_json(config, entries, errors, cache_issues=selected_cache_issues)
         return 0
 
     archive_root = Path(config.directory)
@@ -955,7 +976,37 @@ def handle_list(
         summary += f"  unknown_payload={unknown_sizes}"
     print(summary)
     print_mirror_table(entries)
+    print_cache_attention(selected_cache_issues)
     return 0
+
+
+def select_cache_issues(
+    issues: list[CacheIssue],
+    *,
+    repo_id: str | None = None,
+    repo_type: str | None = None,
+) -> list[CacheIssue]:
+    selected = []
+    for issue in issues:
+        if issue.repo_id is None:
+            selected.append(issue)
+            continue
+        if repo_id is not None and issue.repo_id != repo_id:
+            continue
+        if repo_type is not None and issue.repo_type != repo_type:
+            continue
+        selected.append(issue)
+    return selected
+
+
+def attach_cache_issues(entries: list[MirrorStatusEntry], issues: list[CacheIssue]) -> None:
+    by_repo: dict[tuple[str | None, str], list[CacheIssue]] = {}
+    for issue in issues:
+        if issue.repo_id is None:
+            continue
+        by_repo.setdefault((issue.repo_type, issue.repo_id), []).append(issue)
+    for entry in entries:
+        entry.cache_issues.extend(by_repo.get((entry.repo_type, entry.repo_id), []))
 
 
 def handle_remove(args, config: Config) -> int:
@@ -1436,6 +1487,7 @@ def print_mirror_detail_verbose(entry: MirrorStatusEntry) -> None:
     print(f"lock: {format_lock_detail(entry.active_lock) if entry.active_lock is not None else 'none'}")
     print(f"progress: {format_progress_detail(entry.progress) or 'none'}")
     print(f"torrent: {entry.torrent_status or 'none'}")
+    print_detail_values("cache", [format_cache_issue_summary(issue) for issue in entry.cache_issues])
     observation = entry.upstream_observation
     if observation is None:
         print("live_upstream: not checked")
@@ -1452,12 +1504,15 @@ def print_status_json(
     config: Config,
     entries: list[MirrorStatusEntry],
     errors: list[dict[str, str]],
+    *,
+    cache_issues: list[CacheIssue],
 ) -> None:
     document = {
         "schema": "model-mirror-status",
         "version": 1,
         "archive": str(Path(config.directory)),
         "repositories": [mirror_status_json(entry) for entry in entries],
+        "cache": [cache_issue_json(issue) for issue in cache_issues],
         "errors": errors,
     }
     print(json.dumps(document, indent=2, sort_keys=True))
@@ -1512,7 +1567,21 @@ def mirror_status_json(entry: MirrorStatusEntry) -> dict:
         "exceptions": mirror_exception_tags(entry),
         "lock": entry.active_lock,
         "activity": [progress_entry_json(item) for item in entry.progress.entries],
+        "cache": [cache_issue_json(issue) for issue in entry.cache_issues],
         "torrent": torrent_status_json(entry),
+    }
+
+
+def cache_issue_json(issue: CacheIssue) -> dict:
+    return {
+        "status": issue.kind,
+        "reason": issue.reason,
+        "label": issue.label,
+        "path": str(issue.path),
+        "repo_id": issue.repo_id,
+        "repo_type": issue.repo_type,
+        "resolved_commit": issue.resolved_commit,
+        "actions": list(issue.actions),
     }
 
 
@@ -1575,6 +1644,28 @@ def print_detail_values(label: str, values: list[str]) -> None:
         print(f"  - {value}")
 
 
+def print_cache_attention(issues: list[CacheIssue]) -> None:
+    if not issues:
+        return
+    print()
+    print("Cache attention")
+    for issue in issues:
+        print(f"  {format_cache_issue_summary(issue)}")
+        print(f"    path: {issue.path}")
+        for action in issue.actions:
+            print(f"    {action}")
+
+
+def format_cache_issue_summary(issue: CacheIssue) -> str:
+    identity = (
+        f" {issue.repo_type}:{issue.repo_id}"
+        if issue.repo_id is not None and issue.repo_type is not None
+        else ""
+    )
+    commit = f" target={shorten_commit(issue.resolved_commit)}" if issue.resolved_commit else ""
+    return f"{issue.tag}: {issue.reason}{identity}{commit}"
+
+
 def resolved_commit_for_status(entry: MirrorStatusEntry) -> str:
     if entry.state is not None and entry.state.resolved_commit:
         return entry.state.resolved_commit
@@ -1596,6 +1687,8 @@ def mirror_exception_tags(entry: MirrorStatusEntry) -> list[str]:
     marker = removal_record_path(entry.root)
     if marker.exists() or marker.is_symlink():
         append_unique(tags, "removal-pending")
+    for issue in entry.cache_issues:
+        append_unique(tags, issue.tag)
     return tags
 
 
@@ -1654,6 +1747,27 @@ def archive_cache_usage(config: Config) -> CacheUsage:
 
 
 def handle_clean_cache(config: Config, *, force: bool) -> int:
+    if force:
+        try:
+            with RuntimeCacheLock(config, exclusive=True):
+                active = active_repository_locks(config)
+                if active:
+                    for (repo_type, repo_id), info in sorted(active.items()):
+                        print(
+                            f"cleanup blocked by active repository: {repo_type}:{repo_id} "
+                            f"({lock_label(info)})"
+                        )
+                    print("wait for active operations to finish, then rerun model-mirror clean-cache --force")
+                    return 1
+                return clean_cache_locked(config, force=True)
+        except RuntimeCacheBusyError as exc:
+            print(f"cleanup blocked: {exc}")
+            print("wait for active operations to finish, then rerun model-mirror clean-cache --force")
+            return 1
+    return clean_cache_locked(config, force=False)
+
+
+def clean_cache_locked(config: Config, *, force: bool) -> int:
     archive_root = Path(config.directory)
     targets = cleanup_targets(config)
     unsafe = [path for path, label in targets if not is_safe_cleanup_target(path, archive_root, label)]
@@ -2264,16 +2378,11 @@ def verify_one_locked(config: Config, repo_id: str, args, selected_hub, root: Pa
     )
     if checksum_result is not None:
         merge_checksum_result(result, checksum_result)
-    if args.repo_type == "model":
-        audit = audit_model(root, skip_transformers=True)
-    else:
-        audit = None
     state = state_from_results(
         repo_id,
         args.repo_type,
         requested_revision,
         result,
-        audit,
         resolved_commit=resolved_commit,
         upstream_commit=upstream_snapshot.resolved_commit,
     )
@@ -2281,13 +2390,10 @@ def verify_one_locked(config: Config, repo_id: str, args, selected_hub, root: Pa
 
     if state.status == "incomplete":
         print(f"cached verification incomplete: {repo_id}{upstream_change_suffix(state)}")
+        print_verification_details(repo_id, result)
         print(f"run full verification: model-mirror verify {repo_id}")
         if state.upstream_status == "changed":
             print_update_next_step(repo_id)
-        return 1
-    if audit is not None and not audit.ok:
-        print(f"verification failed: {repo_id}{upstream_change_suffix(state)}")
-        print_verification_next_steps(repo_id, state)
         return 1
     if result.ok:
         mode = "cached" if args.cached else "full"
@@ -2296,6 +2402,7 @@ def verify_one_locked(config: Config, repo_id: str, args, selected_hub, root: Pa
             print_update_next_step(repo_id)
         return 0
     print(f"verification failed: {repo_id}{upstream_change_suffix(state)}")
+    print_verification_details(repo_id, result)
     print_verification_next_steps(repo_id, state)
     return 1
 
@@ -2309,6 +2416,36 @@ def print_verification_next_steps(repo_id: str, state) -> None:
         print(f"next: model-mirror repair {repo_id}")
     if state.upstream_status == "changed":
         print_update_next_step(repo_id)
+
+
+def print_verification_details(repo_id: str, result: RemoteVerifyResult) -> None:
+    print(
+        f"checked: files={result.files_checked} hashes={result.hashes_checked}"
+    )
+    groups = [
+        ("missing", result.missing),
+        ("size mismatch", result.size_mismatches),
+        ("hash mismatch", result.hash_mismatches),
+        ("cached hash unavailable", result.cached_hash_missing),
+        ("unsafe path", result.unsafe_paths),
+        ("unexpected", result.extras),
+    ]
+    for label, values in groups:
+        print_verification_issue_group(repo_id, label, values)
+
+
+def print_verification_issue_group(repo_id: str, label: str, values: list[str], *, limit: int = 20) -> None:
+    if not values:
+        return
+    print(f"{label} ({len(values)}):")
+    for value in values[:limit]:
+        print(f"  {value}")
+    remaining = len(values) - limit
+    if remaining > 0:
+        print(
+            f"  ... {remaining} more; run model-mirror status --verbose {repo_id} "
+            "for the complete recorded issue list"
+        )
 
 
 def print_update_next_step(repo_id: str) -> None:
@@ -2339,6 +2476,7 @@ def verify_one_offline(config: Config, root: Path, repo_id: str, args, existing_
     remote_result = RemoteVerifyResult(
         missing=result.missing,
         hash_mismatches=result.failures,
+        unsafe_paths=result.unsafe,
         extras=result.extras,
     )
     state = state_from_results(

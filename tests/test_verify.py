@@ -144,6 +144,35 @@ def test_verify_remote_strict_reports_extra_payload_files(tmp_path):
     assert result.extras == ["extra.bin"]
 
 
+def test_verify_remote_rejects_expected_symlink_without_following_it(tmp_path):
+    outside = tmp_path.parent / f"{tmp_path.name}-outside.bin"
+    outside.write_bytes(b"abc")
+    (tmp_path / "weights.bin").symlink_to(outside)
+
+    result = verify_remote(tmp_path, [FakeFile("weights.bin", 3)], check_hashes=False)
+
+    assert result.ok is False
+    assert result.files_checked == 0
+    assert result.unsafe_paths == ["weights.bin"]
+
+
+def test_verify_remote_reports_unsafe_metadata_path_without_accessing_it(tmp_path):
+    result = verify_remote(tmp_path, [FakeFile("../outside.bin", 3)], check_hashes=False)
+
+    assert result.ok is False
+    assert result.unsafe_paths == ["../outside.bin"]
+
+
+def test_verify_remote_strict_reports_unexpected_symlink(tmp_path):
+    target = tmp_path.parent / f"{tmp_path.name}-target.bin"
+    target.write_bytes(b"x")
+    (tmp_path / "extra.bin").symlink_to(target)
+
+    result = verify_remote(tmp_path, [], check_hashes=False, strict=True)
+
+    assert result.extras == ["extra.bin"]
+
+
 def test_metadata_adapters_support_huggingface_sibling_shape():
     lfs = SimpleNamespace(sha256="abc")
     sibling = SimpleNamespace(rfilename="file.bin", size=1, lfs=lfs, blob_id="blob123")

@@ -5,6 +5,27 @@ matching version section into the corresponding GitHub Release.
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-07-28
+
+### Added
+
+- Status now reports only exceptional runtime-cache state, distinguishes
+  identified interrupted staging from untracked data, and prints exact resume
+  and cleanup commands.
+- Download staging now records its repository and resolved commit so crash
+  residue can be diagnosed without recursively scanning large archives.
+- Verification failures now show categorized file-level causes and actionable
+  next commands.
+- Snapshot, download, checksum, repair, and publication paths now share
+  canonical-path, duplicate-path, regular-file, and symlink safety checks.
+
+### Fixed
+
+- Verification no longer imposes format-specific file or layout requirements;
+  model payload formats are treated as opaque bytes.
+- Forced cache cleanup now refuses to run while repository or runtime-cache
+  locks show active work.
+
 ## [0.2.1] - 2026-07-28
 
 ### Added

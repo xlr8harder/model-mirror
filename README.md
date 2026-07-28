@@ -96,10 +96,11 @@ exceptional state. A healthy row uses `-` in `EXCEPTIONS` instead of repeating
 `model-mirror list` is currently an alias for the same output.
 
 Status reads model-mirror's existing verification, manifest, snapshot, lock,
-progress, and torrent metadata. It does not recursively scan payload or cache
-directories, read payload bytes, contact the Hub, or update metadata. Missing
-recorded counts or sizes are displayed as unknown; use `verify` to reconcile
-the local filesystem.
+progress, torrent metadata, and shallow runtime-cache operation records. It
+does not recursively scan payload or cache directories, calculate cache sizes,
+read payload bytes, contact the Hub, or update metadata. Missing recorded
+counts or sizes are displayed as unknown; use `verify` to reconcile the local
+filesystem.
 
 Pass a repository ID for a detailed, strictly local last-known report without
 contacting the Hub:
@@ -127,15 +128,16 @@ the live observation in JSON.
 `--json` emits the versioned `model-mirror-status` schema with one
 `repositories` array for both single-repository and archive-wide output.
 Numbers remain numeric, timestamps are ISO 8601, and issues and repair paths are
-arrays. `--verbose` is accepted as a no-op when combined with `--json`. A
-mismatch between verification and snapshot commits is reported as
-`snapshot-stale`.
+arrays. Exceptional runtime data appears in the top-level `cache` array and on
+its associated repository; the array is empty in steady state. `--verbose` is
+accepted as a no-op when combined with `--json`. A mismatch between verification
+and snapshot commits is reported as `snapshot-stale`.
 
 ## Verification
 
 `mirror` verifies by default. A clean mirror has:
 
-- all expected Hub files present
+- all expected Hub paths present as canonical regular files (symlinks are rejected)
 - expected file sizes
 - local SHA-256 and Git blob SHA-1 hashes in versioned `.manifest`
 - LFS file hashes compared with Hub LFS SHA-256 metadata
@@ -166,6 +168,18 @@ whether the upstream repo has moved to a newer commit. Full offline verification
 requires an existing `.manifest`; `--offline --cached` only reports the current
 `.verification` state. `--max-age` is useful for periodic jobs that should skip
 recently verified clean mirrors.
+
+Failed verification prints categorized paths for missing files, size
+mismatches, hash mismatches, unavailable cached hashes, unexpected files, and
+unsafe payload paths, followed by an exact repair or full-verification command.
+Long lists are capped in the immediate output; the complete recorded issue list
+remains available through `model-mirror status --verbose REPO`.
+
+Model formats are opaque to model-mirror. It does not require or parse
+`config.json`, Safetensors, GGUF, ONNX, or framework-specific layouts. It
+verifies the pinned upstream file list, safe regular-file paths, sizes, hashes,
+and mirror metadata; format compatibility belongs to the software consuming
+the mirror.
 
 If the upstream repository is unavailable, online verification exits non-zero
 and prints the command to mark the local mirror offline-only:
@@ -466,14 +480,21 @@ transport cache under `DIRECTORY/.model-mirror/tmp/downloads`. The auxiliary
 cache is not specified as a fixed percentage and can vary with the HTTP/Xet
 implementation, but model-mirror does not intentionally reconstruct a second
 full payload there. Interrupted partial files and staging cache are retained
-for resume.
-`model-mirror clean-cache` scans and previews reclaimable cache space before
-`clean-cache --force` removes it without deleting mirrored payloads. It also
+for resume. Every staging directory contains a small operation record identifying
+the repository and pinned target commit. Successful operations remove their
+staging directory, so steady state contains no runtime cache.
+
+`status` performs a shallow check of those records. It prints no cache section
+in steady state. Interrupted or leftover staging is reported as `stale-cache`
+with both the exact resume command and an explicit discard command; cache that
+cannot be associated with a known operation is reported as `untracked-cache`.
+This check does not walk or size the cached files.
+
+`model-mirror clean-cache` recursively sizes and previews reclaimable cache
+space. `clean-cache --force` removes it without deleting mirrored payloads, but
+refuses to run while repository or runtime-cache locks show active work. It also
 detects legacy archive-root `.cache/` and `.tmp/` directories left by older
-versions. The `.model-mirror/` control directory itself remains in place. The
-metadata-only `status` command reports active work when its progress heartbeat
-is available; do not run forced cache cleanup while it shows an active download
-or repair.
+versions. The `.model-mirror/` control directory itself remains in place.
 
 ## Locking And Interrupted Commands
 

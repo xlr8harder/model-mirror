@@ -12,6 +12,7 @@ import model_mirror.repair as repair_module
 from model_mirror.config import Config
 from model_mirror.checksums import checksum_row_from_hashes, file_hashes, load_manifest, write_checksums
 from model_mirror.repair import missing_manifest_paths, repair
+from model_mirror.payload import UnsafePayloadError
 from model_mirror.state import VerificationState, read_verification_state, write_verification_state
 
 
@@ -80,6 +81,57 @@ def test_repair_uses_local_verification_state_without_reverifying_first(tmp_path
     assert hub.downloads[0][4] == ["bad.bin", "missing.bin"]
     assert (archive / "good.bin").read_bytes() == b"good"
     assert read_verification_state(archive).status == "clean"
+
+
+def test_repair_never_unlinks_through_symlinked_payload_parent(tmp_path):
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "file.bin"
+    victim.write_bytes(b"keep")
+    (archive / "linked").symlink_to(outside, target_is_directory=True)
+    write_verification_state(
+        archive,
+        VerificationState(
+            status="dirty",
+            repo_id="org/model",
+            resolved_commit="main",
+            repair_paths=["linked/file.bin"],
+        ),
+    )
+    hub = FakeHub([FakeFile("linked/file.bin", 3)])
+
+    with pytest.raises(UnsafePayloadError, match="symlink"):
+        repair(Config(directory=tmp_path), "org/model", hub=hub)
+
+    assert victim.read_bytes() == b"keep"
+    assert hub.downloads == []
+
+
+def test_repair_replaces_expected_payload_symlink_without_touching_target(tmp_path):
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"keep")
+    (archive / "file.bin").symlink_to(outside)
+    write_verification_state(
+        archive,
+        VerificationState(
+            status="dirty",
+            repo_id="org/model",
+            resolved_commit="main",
+            repair_paths=["file.bin"],
+        ),
+    )
+    hub = FakeHub([FakeFile("file.bin", 3)])
+
+    result = repair(Config(directory=tmp_path), "org/model", hub=hub)
+
+    assert result.status == "repaired"
+    assert not (archive / "file.bin").is_symlink()
+    assert (archive / "file.bin").read_bytes() == b"xxx"
+    assert outside.read_bytes() == b"keep"
 
 
 def test_repair_noops_when_verification_state_is_clean(tmp_path):

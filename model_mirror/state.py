@@ -85,17 +85,12 @@ def write_verification_state(root: Path, state: VerificationState) -> Path:
     return path
 
 
-def repair_paths_from_results(remote_result, audit_result=None) -> list[str]:
+def repair_paths_from_results(remote_result) -> list[str]:
     paths = set()
     paths.update(getattr(remote_result, "missing", []))
     paths.update(getattr(remote_result, "size_mismatches", []))
     paths.update(getattr(remote_result, "hash_mismatches", []))
-    if audit_result is not None:
-        paths.update(getattr(audit_result, "missing_files", []))
-        for failure in getattr(audit_result, "failures", []):
-            candidate = str(failure).split(":", 1)[0]
-            if candidate.endswith((".json", ".safetensors", ".bin", ".txt", ".model")):
-                paths.add(candidate)
+    paths.update(getattr(remote_result, "unsafe_paths", []))
     return sorted(paths)
 
 
@@ -104,22 +99,25 @@ def state_from_results(
     repo_type: str,
     requested_revision: str,
     remote_result,
-    audit_result=None,
     *,
     resolved_commit: str = "",
     upstream_commit: str = "",
     offline_only: bool = False,
 ) -> VerificationState:
     issues = []
-    for name in ("missing", "size_mismatches", "hash_mismatches", "cached_hash_missing", "extras"):
+    for name in (
+        "missing",
+        "size_mismatches",
+        "hash_mismatches",
+        "cached_hash_missing",
+        "unsafe_paths",
+        "extras",
+    ):
         values = getattr(remote_result, name, [])
         issues.extend(f"{name}: {value}" for value in values)
-    if audit_result is not None:
-        issues.extend(f"missing: {value}" for value in getattr(audit_result, "missing_files", []))
-        issues.extend(f"audit: {value}" for value in getattr(audit_result, "failures", []))
 
-    ok = getattr(remote_result, "ok", False) and (audit_result is None or getattr(audit_result, "ok", False))
-    repair_paths = repair_paths_from_results(remote_result, audit_result)
+    ok = getattr(remote_result, "ok", False)
+    repair_paths = repair_paths_from_results(remote_result)
     cache_incomplete = bool(getattr(remote_result, "cached_hash_missing", [])) and not repair_paths
     return VerificationState(
         status="clean" if ok else "incomplete" if cache_incomplete else "dirty",

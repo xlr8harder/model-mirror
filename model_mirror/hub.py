@@ -27,12 +27,21 @@ from .checksums import (
 )
 from .config import (
     Config,
+    REPO_TYPE_DIRS,
     TOKEN_SETUP_HINT,
     apply_hf_environment,
     archive_runtime_tmp_path,
     hf_token_available,
+    safe_repo_path,
+)
+from .payload import (
+    PayloadMissingError,
+    validate_payload_destination,
+    validate_payload_file,
+    validate_payload_path,
 )
 from .progress import DEFAULT_STALL_RETRIES, ProgressRecorder
+from .runtime_cache import RuntimeCacheLock, write_download_record
 from .verify import metadata_blob_id, metadata_lfs_sha256, metadata_path
 
 
@@ -57,6 +66,10 @@ class DownloadIntegrityError(RuntimeError):
     pass
 
 
+class UnsafeDownloadPathError(DownloadIntegrityError):
+    pass
+
+
 class StallTimeoutError(TimeoutError):
     pass
 
@@ -65,6 +78,19 @@ SNAPSHOT_PLAN_DIR = ".model-mirror"
 SNAPSHOT_PLAN_FILE = "snapshot.json"
 SNAPSHOT_PLAN_SCHEMA = "model-mirror-snapshot"
 SNAPSHOT_PLAN_VERSION = 1
+
+
+def validate_snapshot(snapshot: HubSnapshot) -> HubSnapshot:
+    safe_repo_path(snapshot.repo_id)
+    if snapshot.repo_type not in REPO_TYPE_DIRS:
+        raise ValueError(f"Unsupported repository type: {snapshot.repo_type}")
+    seen: set[str] = set()
+    for item in snapshot.files:
+        rel = validate_payload_path(item.path)
+        if rel in seen:
+            raise ValueError(f"Duplicate payload path in snapshot: {rel}")
+        seen.add(rel)
+    return snapshot
 
 
 class HuggingFaceHub:
@@ -76,17 +102,20 @@ class HuggingFaceHub:
         return self.snapshot(repo_id, repo_type, revision).files
 
     def snapshot(self, repo_id: str, repo_type: str, revision: str) -> HubSnapshot:
-        with patch.dict(os.environ, self._environment(), clear=False):
-            from huggingface_hub import HfApi
+        with RuntimeCacheLock(self.config, exclusive=False):
+            with patch.dict(os.environ, self._environment(), clear=False):
+                from huggingface_hub import HfApi
 
-            api = HfApi()
-            info = api.repo_info(repo_id, repo_type=repo_type, revision=revision, files_metadata=True)
-        return HubSnapshot(
-            repo_id=repo_id,
-            repo_type=repo_type,
-            requested_revision=revision,
-            resolved_commit=getattr(info, "sha", revision),
-            files=[self._file_from_sibling(sibling) for sibling in getattr(info, "siblings", []) or []],
+                api = HfApi()
+                info = api.repo_info(repo_id, repo_type=repo_type, revision=revision, files_metadata=True)
+        return validate_snapshot(
+            HubSnapshot(
+                repo_id=repo_id,
+                repo_type=repo_type,
+                requested_revision=revision,
+                resolved_commit=getattr(info, "sha", revision),
+                files=[self._file_from_sibling(sibling) for sibling in getattr(info, "siblings", []) or []],
+            )
         )
 
     def snapshot_download(
@@ -114,30 +143,43 @@ class HuggingFaceHub:
         allow_patterns: list[str] | None = None,
         stall_timeout_seconds: int | None = None,
     ) -> Path:
-        local_dir.mkdir(parents=True, exist_ok=True)
-        staging_dir = download_staging_dir(
-            self.config,
-            snapshot.repo_id,
-            snapshot.repo_type,
-            snapshot.resolved_commit,
-            allow_patterns,
-        )
-        staging_dir.mkdir(parents=True, exist_ok=True)
-        prune_incomplete_downloads(staging_dir)
-        env = download_environment(self._environment(), staging_dir)
-        with patch.dict(os.environ, env, clear=False):
-            stream_snapshot(
-                snapshot,
-                local_dir,
-                staging_dir,
-                allow_patterns=allow_patterns,
-                download_workers=self.config.download_workers,
-                stall_timeout_seconds=(
-                    self.config.stall_timeout_seconds if stall_timeout_seconds is None else stall_timeout_seconds
-                ),
-                stall_retries=self.config.stall_retries,
+        validate_snapshot(snapshot)
+        with RuntimeCacheLock(self.config, exclusive=False):
+            local_dir.mkdir(parents=True, exist_ok=True)
+            staging_dir = download_staging_dir(
+                self.config,
+                snapshot.repo_id,
+                snapshot.repo_type,
+                snapshot.resolved_commit,
+                allow_patterns,
             )
-        shutil.rmtree(staging_dir)
+            staging_dir.mkdir(parents=True, exist_ok=True)
+            write_download_record(
+                staging_dir,
+                repo_id=snapshot.repo_id,
+                repo_type=snapshot.repo_type,
+                requested_revision=snapshot.requested_revision,
+                resolved_commit=snapshot.resolved_commit,
+                destination=local_dir,
+                allow_patterns=allow_patterns,
+            )
+            prune_incomplete_downloads(staging_dir)
+            env = download_environment(self._environment(), staging_dir)
+            with patch.dict(os.environ, env, clear=False):
+                stream_snapshot(
+                    snapshot,
+                    local_dir,
+                    staging_dir,
+                    allow_patterns=allow_patterns,
+                    download_workers=self.config.download_workers,
+                    stall_timeout_seconds=(
+                        self.config.stall_timeout_seconds
+                        if stall_timeout_seconds is None
+                        else stall_timeout_seconds
+                    ),
+                    stall_retries=self.config.stall_retries,
+                )
+            shutil.rmtree(staging_dir)
         return local_dir
 
     def _environment(self) -> dict[str, str]:
@@ -166,14 +208,16 @@ class HuggingFaceHub:
 
 def get_snapshot(hub, repo_id: str, repo_type: str, revision: str) -> HubSnapshot:
     if hasattr(hub, "snapshot"):
-        return hub.snapshot(repo_id, repo_type, revision)
+        return validate_snapshot(hub.snapshot(repo_id, repo_type, revision))
     files = hub.files(repo_id, repo_type, revision)
-    return HubSnapshot(
-        repo_id=repo_id,
-        repo_type=repo_type,
-        requested_revision=revision,
-        resolved_commit=revision,
-        files=files,
+    return validate_snapshot(
+        HubSnapshot(
+            repo_id=repo_id,
+            repo_type=repo_type,
+            requested_revision=revision,
+            resolved_commit=revision,
+            files=files,
+        )
     )
 
 
@@ -182,6 +226,7 @@ def snapshot_plan_path(root: Path) -> Path:
 
 
 def write_snapshot_plan(root: Path, snapshot: HubSnapshot) -> Path:
+    validate_snapshot(snapshot)
     path = snapshot_plan_path(root)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -216,20 +261,22 @@ def read_snapshot_plan(root: Path) -> HubSnapshot | None:
         raise ValueError(f"Unsupported snapshot plan schema in {path}: {data.get('schema')}")
     if data.get("version") != SNAPSHOT_PLAN_VERSION:
         raise ValueError(f"Unsupported snapshot plan version in {path}: {data.get('version')}")
-    return HubSnapshot(
-        repo_id=str(data["repo_id"]),
-        repo_type=str(data["repo_type"]),
-        requested_revision=str(data["requested_revision"]),
-        resolved_commit=str(data["resolved_commit"]),
-        files=[
-            HubFile(
-                path=str(item["path"]),
-                size=item.get("size"),
-                lfs_sha256=item.get("lfs_sha256"),
-                blob_id=item.get("blob_id"),
-            )
-            for item in data.get("files", [])
-        ],
+    return validate_snapshot(
+        HubSnapshot(
+            repo_id=str(data["repo_id"]),
+            repo_type=str(data["repo_type"]),
+            requested_revision=str(data["requested_revision"]),
+            resolved_commit=str(data["resolved_commit"]),
+            files=[
+                HubFile(
+                    path=str(item["path"]),
+                    size=item.get("size"),
+                    lfs_sha256=item.get("lfs_sha256"),
+                    blob_id=item.get("blob_id"),
+                )
+                for item in data.get("files", [])
+            ],
+        )
     )
 
 
@@ -275,6 +322,7 @@ def stream_snapshot(
     stall_timeout_seconds: int = 600,
     stall_retries: int = DEFAULT_STALL_RETRIES,
 ) -> None:
+    validate_snapshot(snapshot)
     manifest = load_manifest(local_dir)
     selected_files = filtered_snapshot_files(snapshot.files, allow_patterns)
     coverage_recorder = torrent_coverage_recorder(local_dir, snapshot)
@@ -282,6 +330,7 @@ def stream_snapshot(
     work = []
     for item in selected_files:
         destination = local_dir / item.path
+        validate_payload_destination(local_dir, destination, item.path)
         if verified_manifest_record(local_dir, destination, item, manifest):
             continue
         work.append(item)
@@ -346,6 +395,7 @@ def stream_snapshot_file(
     stall_retries: int,
 ) -> dict:
     destination = local_dir / item.path
+    validate_payload_destination(local_dir, destination, item.path)
     progress = progress_recorder.track(item.path, total=item.size, stage="starting")
     completed = False
     try:
@@ -463,7 +513,9 @@ def promote_legacy_staged_file(
     torrent_accumulator=None,
 ) -> tuple[dict, FileHashes] | None:
     staged_path = staging_dir / item.path
-    if not staged_path.exists() or not staged_path.is_file():
+    try:
+        validate_payload_file(staging_dir, staged_path, item.path)
+    except PayloadMissingError:
         return None
     progress.update(0, stage="hashing-staged", force=True)
     hashes = file_hashes(
@@ -519,6 +571,8 @@ def stream_file_to_path(
             if progress is not None:
                 progress.update(current_size, stage=f"retrying-stall-{stall_retry_count}", force=True)
             continue
+        except UnsafeDownloadPathError:
+            raise
         except DownloadIntegrityError:
             if integrity_retry_used:
                 raise
@@ -541,6 +595,8 @@ def stream_file_to_path_once(
     expected_size = require_expected_size(item)
     destination.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = incomplete_path_for(destination)
+    if tmp_path.is_symlink() or (tmp_path.exists() and not tmp_path.is_file()):
+        raise UnsafeDownloadPathError(f"unsafe incomplete download path for {item.path}")
     if not allow_resume:
         tmp_path.unlink(missing_ok=True)
     resume_size = resumable_prefix_size(tmp_path, expected_size) if allow_resume else 0

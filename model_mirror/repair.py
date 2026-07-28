@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from .audit import audit_model
 from .checksums import load_manifest, update_checksums, write_checksums
 from .config import Config, archive_path
 from .hub import (
@@ -15,6 +14,7 @@ from .hub import (
     write_snapshot_plan,
 )
 from .lock import ModelBusyError, ModelLock
+from .payload import validate_payload_parent
 from .state import AuditState, read_audit_state, state_from_results, write_audit_state
 from .verify import current_manifest_hash, metadata_blob_id, metadata_lfs_sha256, metadata_path, metadata_size, verify_remote
 
@@ -157,16 +157,37 @@ def repair_locked(
         get_snapshot(selected_hub, repo_id, selected_type, target_revision),
         requested_revision,
     )
+    expected_paths = {metadata_path(item) for item in snapshot.files}
+    paths = [rel for rel in paths if rel in expected_paths]
     if (
         config.checksum
         and not force_partial
         and missing_manifest_paths(root, snapshot.files, ignored_paths=set(paths))
     ):
         return verification_incomplete_result(root, paths, state)
+    if not paths:
+        checksums_available = cached_manifest_verifies(root, snapshot.files)
+        final_state = derive_state(
+            config,
+            repo_id,
+            selected_hub,
+            selected_type,
+            requested_revision,
+            root,
+            snapshot=snapshot,
+            resolved_commit=target_revision,
+            upstream_commit=state.upstream_commit,
+            cached=checksums_available,
+            from_manifest=checksums_available,
+            persist=False,
+        )
+        persist_repair_state(root, snapshot, final_state)
+        return repair_result(repair_status(final_state, success="repaired"), root, [], final_state)
     root.mkdir(parents=True, exist_ok=True)
     for rel in paths:
         target = root / rel
-        if target.exists() and target.is_file():
+        rel = validate_payload_parent(root, target, rel)
+        if target.is_symlink() or (target.exists() and target.is_file()):
             target.unlink()
 
     download_snapshot(selected_hub, snapshot, root, allow_patterns=paths)
@@ -376,21 +397,11 @@ def derive_state(
         snapshot = get_snapshot(hub, repo_id, repo_type, resolved_commit or requested_revision)
     metadata = snapshot.files
     remote_result = verify_remote(root, metadata, cached=cached, from_manifest=from_manifest)
-    expected_paths = {metadata_path(item) for item in metadata}
-    gguf_only = "config.json" not in expected_paths and any(
-        path.lower().endswith(".gguf") for path in expected_paths
-    )
-    audit_result = (
-        audit_model(root, skip_transformers=True, require_config=not gguf_only)
-        if repo_type == "model"
-        else None
-    )
     state = state_from_results(
         repo_id,
         repo_type,
         requested_revision,
         remote_result,
-        audit_result,
         resolved_commit=resolved_commit or snapshot.resolved_commit,
         upstream_commit=upstream_commit or snapshot.resolved_commit,
     )

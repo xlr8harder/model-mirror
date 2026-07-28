@@ -3,7 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .checksums import file_hashes, load_manifest, iter_payload_files, record_is_current
+from .checksums import file_hashes, iter_payload_entries, load_manifest, record_is_current
+from .payload import (
+    PayloadMissingError,
+    PayloadPathError,
+    validate_payload_file,
+    validate_payload_path,
+)
 
 
 @dataclass(slots=True)
@@ -14,6 +20,7 @@ class RemoteVerifyResult:
     size_mismatches: list[str] = field(default_factory=list)
     hash_mismatches: list[str] = field(default_factory=list)
     cached_hash_missing: list[str] = field(default_factory=list)
+    unsafe_paths: list[str] = field(default_factory=list)
     extras: list[str] = field(default_factory=list)
 
     @property
@@ -23,6 +30,7 @@ class RemoteVerifyResult:
             or self.size_mismatches
             or self.hash_mismatches
             or self.cached_hash_missing
+            or self.unsafe_paths
             or self.extras
         )
 
@@ -68,11 +76,20 @@ def verify_remote(
 
     expected_paths = set()
     for item in metadata:
-        rel = metadata_path(item)
+        try:
+            rel = validate_payload_path(metadata_path(item))
+        except PayloadPathError:
+            result.unsafe_paths.append(metadata_path(item))
+            continue
         expected_paths.add(rel)
         path = root / rel
-        if not path.exists():
+        try:
+            validate_payload_file(root, path, rel)
+        except PayloadMissingError:
             result.missing.append(rel)
+            continue
+        except PayloadPathError:
+            result.unsafe_paths.append(rel)
             continue
 
         result.files_checked += 1
@@ -120,7 +137,7 @@ def verify_remote(
     if strict:
         result.extras = [
             path.relative_to(root).as_posix()
-            for path in iter_payload_files(root)
+            for path in iter_payload_entries(root)
             if path.relative_to(root).as_posix() not in expected_paths
         ]
 
@@ -145,6 +162,7 @@ def merge_checksum_result(remote_result, checksum_result) -> None:
     for attr, values in (
         ("missing", checksum_result.missing),
         ("hash_mismatches", checksum_result.failures),
+        ("unsafe_paths", getattr(checksum_result, "unsafe", [])),
         ("extras", checksum_result.extras),
     ):
         existing = getattr(remote_result, attr)

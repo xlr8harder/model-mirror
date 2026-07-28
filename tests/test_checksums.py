@@ -53,6 +53,50 @@ def test_write_and_verify_checksums_excludes_metadata_and_writes_versioned_manif
     assert result.checked == 1
 
 
+def test_write_checksums_never_follows_payload_symlinks(tmp_path):
+    outside = tmp_path.parent / f"{tmp_path.name}-outside.bin"
+    outside.write_bytes(b"outside")
+    (tmp_path / "linked.bin").symlink_to(outside)
+
+    result = write_checksums(tmp_path)
+
+    assert result.total == 0
+    assert load_manifest(tmp_path) == {}
+
+
+def test_verify_checksums_reports_tracked_symlink_as_unsafe(tmp_path):
+    path = tmp_path / "file.bin"
+    path.write_bytes(b"abc")
+    write_checksums(tmp_path)
+    path.unlink()
+    outside = tmp_path.parent / f"{tmp_path.name}-outside.bin"
+    outside.write_bytes(b"abc")
+    path.symlink_to(outside)
+
+    result = verify_checksums(tmp_path)
+
+    assert result.ok is False
+    assert result.unsafe == ["file.bin"]
+    assert result.checked == 0
+
+
+def test_update_checksums_rejects_unsafe_requested_path(tmp_path):
+    with pytest.raises(ValueError, match="unsafe payload path"):
+        update_checksums(tmp_path, ["../outside.bin"])
+
+
+def test_load_manifest_rejects_duplicate_paths(tmp_path):
+    header = {"schema": MANIFEST_SCHEMA, "version": MANIFEST_VERSION}
+    row = {"path": "file.bin", "sha256": "a", "git_blob_sha1": "b", "size": 1, "mtime_ns": 1}
+    (tmp_path / ".manifest").write_text(
+        "\n".join(json.dumps(value) for value in (header, row, row)) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Duplicate path"):
+        load_manifest(tmp_path)
+
+
 def test_file_hashes_computes_sha256_and_git_blob_sha1_in_one_call(tmp_path):
     payload = b"hello\n"
     path = tmp_path / "README.md"

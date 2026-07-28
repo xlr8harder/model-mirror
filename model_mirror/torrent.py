@@ -8,6 +8,11 @@ from pathlib import Path, PurePosixPath
 
 from .checksums import load_manifest, record_is_current
 from .hub import read_snapshot_plan
+from .payload import (
+    PayloadPathError,
+    validate_payload_file as validate_regular_payload_file,
+    validate_payload_path as validate_relative_payload_path,
+)
 from .state import read_verification_state
 
 
@@ -19,16 +24,6 @@ MIN_PIECE_LENGTH = 1024 * 1024
 MAX_PIECE_LENGTH = 16 * 1024 * 1024
 TARGET_PIECES = 128 * 1024
 SAFE_COMMIT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-RESERVED_TOP_LEVEL = {
-    ".archive",
-    ".cache",
-    ".checksums",
-    ".manifest",
-    ".model-mirror",
-    ".pad",
-    ".verification",
-    ".verification.lock",
-}
 
 
 class TorrentPublicationError(RuntimeError):
@@ -131,12 +126,8 @@ def build_publication_descriptor(
 
     manifest = load_manifest(root)
     payload_files: list[TorrentPayloadFile] = []
-    seen: set[str] = set()
     for item in sorted(snapshot.files, key=lambda candidate: candidate.path.encode("utf-8")):
         rel = validate_payload_path(item.path)
-        if rel in seen:
-            raise TorrentPublicationError(f"duplicate payload path in pinned snapshot: {rel}")
-        seen.add(rel)
         if item.size is None or item.size < 0:
             raise TorrentPublicationError(f"missing or invalid expected size for {rel}")
 
@@ -192,29 +183,17 @@ def select_piece_length(total_size: int) -> int:
 
 
 def validate_payload_path(value: str) -> str:
-    if not value or "\\" in value or "\x00" in value:
-        raise TorrentPublicationError(f"unsafe payload path: {value!r}")
-    path = PurePosixPath(value)
-    if (
-        path.is_absolute()
-        or path.as_posix() != value
-        or any(part in {"", ".", ".."} for part in path.parts)
-    ):
-        raise TorrentPublicationError(f"unsafe payload path: {value!r}")
-    normalized = path.as_posix()
-    if path.parts[0] in RESERVED_TOP_LEVEL:
-        raise TorrentPublicationError(f"payload path conflicts with model-mirror metadata: {value!r}")
-    return normalized
+    try:
+        return validate_relative_payload_path(value)
+    except PayloadPathError as exc:
+        raise TorrentPublicationError(str(exc)) from exc
 
 
 def validate_payload_file(root: Path, path: Path, rel: str) -> None:
-    if not path.exists() or not path.is_file():
-        raise TorrentPublicationError(f"payload file is missing: {rel}")
-    current = root
-    for part in PurePosixPath(rel).parts:
-        current = current / part
-        if current.is_symlink():
-            raise TorrentPublicationError(f"payload path contains a symlink: {rel}")
+    try:
+        validate_regular_payload_file(root, path, rel)
+    except PayloadPathError as exc:
+        raise TorrentPublicationError(str(exc)) from exc
 
 
 def require_hex(value: object, length: int, label: str) -> str:
