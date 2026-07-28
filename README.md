@@ -148,6 +148,12 @@ repaired files, and runs a final cached verification. In a `verify` then
 files are hashed again after download, but unchanged large files are not
 rehashed a second time.
 
+Repair also reconciles a pinned snapshot plan whose commit is older than the
+clean verification state. It fetches the recorded commit's Hub metadata and
+reuses current manifest hashes, so payload files are not reread when that cached
+evidence is complete. A successful commit update promotes the new snapshot plan
+before recording the new commit as clean.
+
 If repair sees incomplete cached verification data for untouched files, it stops
 before downloading and tells you to run full `verify`. `repair --force-partial`
 overrides that safety check, but may leave the repository inconsistent and still

@@ -197,7 +197,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="repair a mirrored archive",
         description=(
             "Redownload files listed in existing .verification repair paths, "
-            "then run a final verification. Run verify first."
+            "reconcile a stale pinned snapshot plan, then run a final verification. Run verify first."
         ),
         epilog=(
             "Exit status: 0 when complete, repaired, or updated cleanly; 1 when verification state is missing, "

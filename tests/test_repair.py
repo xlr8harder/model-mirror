@@ -1,6 +1,13 @@
 from dataclasses import dataclass
 
-from model_mirror.hub import HubSnapshot, cached_manifest_verifies
+import pytest
+
+from model_mirror.hub import (
+    HubSnapshot,
+    cached_manifest_verifies,
+    read_snapshot_plan,
+    write_snapshot_plan,
+)
 import model_mirror.repair as repair_module
 from model_mirror.config import Config
 from model_mirror.checksums import checksum_row_from_hashes, file_hashes, load_manifest, write_checksums
@@ -369,6 +376,10 @@ def test_missing_manifest_paths_skips_unrepairable_or_unavailable_files(tmp_path
 def test_repair_update_applies_changed_upstream_commit(tmp_path):
     archive = tmp_path / "models" / "org" / "model"
     archive.mkdir(parents=True)
+    write_snapshot_plan(
+        archive,
+        HubSnapshot("org/model", "model", "main", "oldcommit", [FakeFile("file.bin", 3)]),
+    )
     write_verification_state(
         archive,
         VerificationState(
@@ -394,6 +405,125 @@ def test_repair_update_applies_changed_upstream_commit(tmp_path):
     assert state.resolved_commit == "newcommit"
     assert state.upstream_commit == "newcommit"
     assert state.upstream_status == "current"
+    snapshot = read_snapshot_plan(archive)
+    assert snapshot.resolved_commit == "newcommit"
+    assert snapshot.requested_revision == "main"
+    assert [item.path for item in snapshot.files] == ["config.json", "file.bin"]
+
+
+def test_repair_update_does_not_publish_clean_state_before_snapshot_plan(tmp_path, monkeypatch):
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    write_snapshot_plan(
+        archive,
+        HubSnapshot("org/model", "model", "main", "oldcommit", [FakeFile("file.bin", 3)]),
+    )
+    write_verification_state(
+        archive,
+        VerificationState(
+            status="clean",
+            repo_id="org/model",
+            requested_revision="main",
+            resolved_commit="oldcommit",
+            upstream_commit="newcommit",
+            upstream_status="changed",
+        ),
+    )
+    hub = FakeHub(
+        [FakeFile("file.bin", 3)],
+        metadata_by_revision={"newcommit": [FakeFile("config.json", 2), FakeFile("file.bin", 4)]},
+    )
+
+    def fail_snapshot_write(root, snapshot):
+        raise RuntimeError("snapshot write failed")
+
+    monkeypatch.setattr(repair_module, "write_snapshot_plan", fail_snapshot_write)
+
+    with pytest.raises(RuntimeError, match="snapshot write failed"):
+        repair(Config(directory=tmp_path), "org/model", hub=hub, update=True)
+
+    state = read_verification_state(archive)
+    assert state.resolved_commit == "oldcommit"
+    assert state.upstream_commit == "newcommit"
+    assert state.upstream_status == "changed"
+
+
+def test_repair_reconciles_stale_snapshot_from_manifest_without_payload_reread(tmp_path, monkeypatch):
+    archive = tmp_path / "datasets" / "org" / "data"
+    archive.mkdir(parents=True)
+    payload = archive / "file.bin"
+    payload.write_bytes(b"abc")
+    hashes = file_hashes(payload)
+    write_checksums(archive)
+    write_snapshot_plan(
+        archive,
+        HubSnapshot("org/data", "dataset", "main", "oldcommit", [FakeFile("old.bin", 1)]),
+    )
+    write_verification_state(
+        archive,
+        VerificationState(
+            status="clean",
+            repo_id="org/data",
+            repo_type="dataset",
+            requested_revision="main",
+            resolved_commit="newcommit",
+            upstream_commit="newcommit",
+            upstream_status="current",
+        ),
+    )
+    hub = FakeHub(
+        [FakeFile("file.bin", 3, lfs_sha256=hashes.sha256)],
+        metadata_by_revision={"newcommit": [FakeFile("file.bin", 3, lfs_sha256=hashes.sha256)]},
+    )
+
+    def fail_payload_reread(path):
+        raise AssertionError(f"unexpected payload reread: {path}")
+
+    monkeypatch.setattr("model_mirror.verify.file_hashes", fail_payload_reread)
+
+    result = repair(Config(directory=tmp_path), "org/data", repo_type="dataset", hub=hub)
+
+    assert result.status == "repaired"
+    assert hub.downloads == []
+    snapshot = read_snapshot_plan(archive)
+    assert snapshot.resolved_commit == "newcommit"
+    assert snapshot.requested_revision == "main"
+    assert [item.path for item in snapshot.files] == ["file.bin"]
+    assert read_verification_state(archive).status == "clean"
+
+
+def test_repair_keeps_stale_snapshot_when_reconciliation_fails_verification(tmp_path):
+    archive = tmp_path / "datasets" / "org" / "data"
+    archive.mkdir(parents=True)
+    (archive / "file.bin").write_bytes(b"x")
+    write_snapshot_plan(
+        archive,
+        HubSnapshot("org/data", "dataset", "main", "oldcommit", [FakeFile("old.bin", 1)]),
+    )
+    write_verification_state(
+        archive,
+        VerificationState(
+            status="clean",
+            repo_id="org/data",
+            repo_type="dataset",
+            requested_revision="main",
+            resolved_commit="newcommit",
+            upstream_commit="newcommit",
+            upstream_status="current",
+        ),
+    )
+    hub = FakeHub(
+        [FakeFile("file.bin", 3)],
+        metadata_by_revision={"newcommit": [FakeFile("file.bin", 3)]},
+    )
+
+    result = repair(Config(directory=tmp_path), "org/data", repo_type="dataset", hub=hub)
+
+    assert result.status == "incomplete"
+    assert read_snapshot_plan(archive).resolved_commit == "oldcommit"
+    state = read_verification_state(archive)
+    assert state.status == "dirty"
+    assert state.repair_paths == ["file.bin"]
 
 
 def test_repair_update_can_skip_checksum_writes(tmp_path):

@@ -6,7 +6,14 @@ from pathlib import Path
 from .audit import audit_model
 from .checksums import load_manifest, update_checksums, write_checksums
 from .config import Config, archive_path
-from .hub import HuggingFaceHub, HubSnapshot, cached_manifest_verifies, get_snapshot
+from .hub import (
+    HuggingFaceHub,
+    HubSnapshot,
+    cached_manifest_verifies,
+    get_snapshot,
+    read_snapshot_plan,
+    write_snapshot_plan,
+)
 from .lock import ModelBusyError, ModelLock
 from .state import AuditState, read_audit_state, state_from_results, write_audit_state
 from .verify import current_manifest_hash, metadata_blob_id, metadata_lfs_sha256, metadata_path, metadata_size, verify_remote
@@ -119,6 +126,22 @@ def repair_locked(
             root,
             state,
         )
+    pinned_snapshot = read_snapshot_plan(root)
+    if (
+        state.clean
+        and state.resolved_commit
+        and pinned_snapshot is not None
+        and pinned_snapshot.resolved_commit != state.resolved_commit
+    ):
+        return reconcile_snapshot_plan(
+            config,
+            repo_id,
+            selected_hub,
+            selected_type,
+            selected_revision,
+            root,
+            state,
+        )
     if state.clean:
         return repair_result("complete", root, [], state)
 
@@ -130,7 +153,10 @@ def repair_locked(
     target_revision = state.resolved_commit
     if not target_revision:
         return verification_incomplete_result(root, paths, state)
-    snapshot = get_snapshot(selected_hub, repo_id, selected_type, target_revision)
+    snapshot = snapshot_for_requested_revision(
+        get_snapshot(selected_hub, repo_id, selected_type, target_revision),
+        requested_revision,
+    )
     if (
         config.checksum
         and not force_partial
@@ -161,8 +187,9 @@ def repair_locked(
         upstream_commit=state.upstream_commit,
         cached=checksums_available,
         from_manifest=checksums_available,
+        persist=False,
     )
-    write_audit_state(root, final_state)
+    persist_repair_state(root, snapshot, final_state)
     status = repair_status(final_state, success="repaired")
     return repair_result(status, root, paths, final_state)
 
@@ -190,7 +217,10 @@ def update_to_upstream(
     requested_revision = state.requested_revision or selected_revision
     target_revision = state.upstream_commit
     root.mkdir(parents=True, exist_ok=True)
-    snapshot = get_snapshot(selected_hub, repo_id, selected_type, target_revision)
+    snapshot = snapshot_for_requested_revision(
+        get_snapshot(selected_hub, repo_id, selected_type, target_revision),
+        requested_revision,
+    )
     download_snapshot(selected_hub, snapshot, root)
     checksums_available = cached_manifest_verifies(root, snapshot.files)
     if config.checksum and not checksums_available:
@@ -208,10 +238,61 @@ def update_to_upstream(
         upstream_commit=target_revision,
         cached=checksums_available,
         from_manifest=checksums_available,
+        persist=False,
     )
-    write_audit_state(root, final_state)
+    persist_repair_state(root, snapshot, final_state)
     status = repair_status(final_state, success="updated")
     return repair_result(status, root, [], final_state)
+
+
+def reconcile_snapshot_plan(
+    config: Config,
+    repo_id: str,
+    selected_hub,
+    selected_type: str,
+    selected_revision: str,
+    root: Path,
+    state: AuditState,
+) -> RepairResult:
+    requested_revision = state.requested_revision or selected_revision
+    snapshot = snapshot_for_requested_revision(
+        get_snapshot(selected_hub, repo_id, selected_type, state.resolved_commit),
+        requested_revision,
+    )
+    checksums_available = cached_manifest_verifies(root, snapshot.files)
+    final_state = derive_state(
+        config,
+        repo_id,
+        selected_hub,
+        selected_type,
+        requested_revision,
+        root,
+        snapshot=snapshot,
+        resolved_commit=state.resolved_commit,
+        upstream_commit=state.upstream_commit,
+        cached=checksums_available,
+        from_manifest=checksums_available,
+        persist=False,
+    )
+    persist_repair_state(root, snapshot, final_state)
+    status = repair_status(final_state, success="repaired")
+    return repair_result(status, root, [], final_state)
+
+
+def snapshot_for_requested_revision(snapshot: HubSnapshot, requested_revision: str) -> HubSnapshot:
+    return HubSnapshot(
+        repo_id=snapshot.repo_id,
+        repo_type=snapshot.repo_type,
+        requested_revision=requested_revision,
+        resolved_commit=snapshot.resolved_commit,
+        files=snapshot.files,
+    )
+
+
+def persist_repair_state(root: Path, snapshot: HubSnapshot, state: AuditState) -> None:
+    if state.clean:
+        write_snapshot_plan(root, snapshot)
+    write_audit_state(root, state)
 
 
 def repair_status(state: AuditState, *, success: str) -> str:
@@ -289,6 +370,7 @@ def derive_state(
     upstream_commit: str | None = None,
     cached: bool = False,
     from_manifest: bool = False,
+    persist: bool = True,
 ) -> AuditState:
     if snapshot is None:
         snapshot = get_snapshot(hub, repo_id, repo_type, resolved_commit or requested_revision)
@@ -312,5 +394,6 @@ def derive_state(
         resolved_commit=resolved_commit or snapshot.resolved_commit,
         upstream_commit=upstream_commit or snapshot.resolved_commit,
     )
-    write_audit_state(root, state)
+    if persist:
+        write_audit_state(root, state)
     return state
