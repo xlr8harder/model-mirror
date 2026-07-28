@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+import yaml
+
 from .audit import audit_model
 from .checksums import MANIFEST, iter_payload_files, write_checksums, verify_checksums
 from .config import (
@@ -27,6 +29,17 @@ from .lock import ModelBusyError, ModelLock, lock_label, read_active_lock
 from .mirror import mirror
 from .progress import ProgressEntry, ProgressSnapshot, progress_snapshot
 from .repair import repair
+from .removal import (
+    REMOVALS_DIR,
+    RemovalRecord,
+    complete_removal,
+    prune_empty_removal_parents,
+    read_removal_record,
+    removal_path,
+    removal_record_path,
+    stage_removal,
+    write_removal_record,
+)
 from .state import (
     VerificationState,
     read_verification_state,
@@ -158,6 +171,29 @@ def build_parser() -> argparse.ArgumentParser:
         type=parse_nonnegative_int_arg,
         metavar="SECONDS",
         help="override stall timeout for this mirror; default 600 seconds, 0 disables timeout",
+    )
+
+    remove_parser = add_command_parser(
+        "remove",
+        help="permanently remove a mirror",
+        description=(
+            "Show the selected mirror's identity, commit, verification age, file count, and size, "
+            "then require confirmation before permanent removal. Interrupted removals are resumable."
+        ),
+        epilog=(
+            "Exit status: 0 when removed or cancelled; 1 when the mirror is missing, busy, unsafe, "
+            "has an active torrent publication, or removal is interrupted."
+        ),
+    )
+    remove_parser.add_argument("model", metavar="repo", help="repo id to remove, e.g. org/model")
+    remove_parser.add_argument(
+        "--repo-type", choices=["model", "dataset", "space"], default="model", help="repo kind to remove"
+    )
+    remove_parser.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="skip the interactive repository-name confirmation",
     )
 
     verify_parser = add_command_parser(
@@ -478,6 +514,8 @@ def main(argv: list[str] | None = None, *, hub=None) -> int:
             )
             print(f"{result.status}: {args.model} -> {result.path}")
             return mirror_exit_code(result.status)
+        if args.command == "remove":
+            return handle_remove(args, config)
         if args.command == "verify":
             return handle_verify(args, config, hub=hub)
         if args.command == "repair":
@@ -750,6 +788,203 @@ def handle_list(config: Config, *, repo_id: str | None = None, repo_type: str | 
     return 0
 
 
+def handle_remove(args, config: Config) -> int:
+    root = archive_path(config, args.model, args.repo_type)
+    staged = removal_path(config, args.model, args.repo_type)
+    removal_control = Path(config.directory) / REMOVALS_DIR
+    try:
+        with ModelLock(removal_control, "remove", args.model, args.repo_type):
+            if staged.exists() or staged.is_symlink():
+                return resume_remove(args, config, root, staged)
+            if root.is_symlink():
+                print(f"remove refused unsafe mirror path: {root}")
+                return 1
+            if not root.is_dir():
+                print(f"mirror not found: {args.repo_type}:{args.model} -> {root}")
+                return 1
+
+            with ModelLock(root, "remove", args.model, args.repo_type):
+                marker = removal_record_path(root)
+                pending = marker.exists() or marker.is_symlink()
+                try:
+                    record = read_removal_record(root) if pending else None
+                except ValueError:
+                    record = None
+                record = record or inspect_removal(root, args.model, args.repo_type)
+                if pending:
+                    print(f"prepared interrupted removal found: {root}")
+                print_removal_summary(record)
+                publication_error = active_publication_removal_error(root)
+                if publication_error is not None:
+                    marker.unlink(missing_ok=True)
+                    print(publication_error)
+                    return 1
+                if not args.yes and not confirm_removal(args.model):
+                    marker.unlink(missing_ok=True)
+                    print(f"cancelled: {args.repo_type}:{args.model} was not removed")
+                    return 0
+                write_removal_record(root, record)
+
+            try:
+                stage_removal(root, staged, record)
+                complete_removal(staged)
+            except (OSError, ValueError) as exc:
+                print(
+                    f"removal interrupted: {args.repo_type}:{args.model} -> "
+                    f"{staged if staged.exists() else root} ({exc}); "
+                    "rerun the same remove command to resume"
+                )
+                return 1
+            finish_removal_cleanup(config, staged)
+    except (OSError, ValueError) as exc:
+        print(f"remove failed: {args.repo_type}:{args.model} -> {exc}")
+        return 1
+
+    print(
+        f"removed: {args.repo_type}:{args.model} "
+        f"({record.payload_files} files, {format_bytes(record.payload_size)})"
+    )
+    return 0
+
+
+def resume_remove(args, config: Config, root: Path, staged: Path) -> int:
+    if staged.is_symlink() or not staged.is_dir():
+        print(f"remove refused unsafe interrupted-removal path: {staged}")
+        return 1
+    try:
+        record = read_removal_record(staged)
+    except ValueError:
+        record = None
+    if record is not None and (
+        record.repo_id != args.model or record.repo_type != args.repo_type
+    ):
+        print(
+            f"remove resume refused: removal record identity is "
+            f"{record.repo_type}:{record.repo_id}, expected {args.repo_type}:{args.model}"
+        )
+        return 1
+    record = record or inspect_removal(staged, args.model, args.repo_type, original_path=root)
+    print(f"interrupted removal found: {staged}")
+    print_removal_summary(record)
+    if not args.yes and not confirm_removal(args.model):
+        print(f"cancelled: interrupted removal remains at {staged}")
+        return 0
+    try:
+        complete_removal(staged)
+    except OSError as exc:
+        print(
+            f"removal still incomplete: {args.repo_type}:{args.model} -> {staged} ({exc}); "
+            "rerun the same remove command to resume"
+        )
+        return 1
+
+    finish_removal_cleanup(config, staged)
+    print(
+        f"removed interrupted mirror: {args.repo_type}:{args.model} "
+        f"({record.payload_files} original files, {format_bytes(record.payload_size)})"
+    )
+    if root.exists() or root.is_symlink():
+        print(f"note: a newer mirror still exists and was not removed: {root}")
+    return 0
+
+
+def inspect_removal(
+    root: Path,
+    repo_id: str,
+    repo_type: str,
+    *,
+    original_path: Path | None = None,
+) -> RemovalRecord:
+    payload_files, payload_size = mirror_payload_stats(root)
+    state = None
+    snapshot = None
+    exceptions: list[str] = []
+    try:
+        state = read_verification_state(root)
+    except (OSError, ValueError, yaml.YAMLError):
+        exceptions.append("verification-metadata-error")
+    try:
+        snapshot = read_snapshot_plan(root)
+    except (OSError, ValueError):
+        exceptions.append("snapshot-metadata-error")
+    if state is not None:
+        for tag in list_exception_tags(state, None):
+            append_unique(exceptions, tag)
+    if (
+        state is not None
+        and state.resolved_commit
+        and snapshot is not None
+        and snapshot.resolved_commit != state.resolved_commit
+    ):
+        append_unique(exceptions, "snapshot-stale")
+    resolved_commit = (
+        state.resolved_commit
+        if state is not None and state.resolved_commit
+        else snapshot.resolved_commit if snapshot is not None else ""
+    )
+    checked_at = state.checked_at_utc if state is not None else ""
+    return RemovalRecord(
+        repo_id=repo_id,
+        repo_type=repo_type,
+        original_path=str(original_path or root),
+        status=state.status if state is not None else "unverified",
+        exceptions=",".join(exceptions) or "none",
+        resolved_commit=resolved_commit,
+        checked_at_utc=checked_at or "unknown",
+        check_age=verification_age_label(checked_at) if checked_at else "unknown",
+        payload_files=payload_files,
+        payload_size=payload_size,
+    )
+
+
+def print_removal_summary(record: RemovalRecord) -> None:
+    print("mirror selected for permanent removal:")
+    print(f"  repository: {record.repo_id}")
+    print(f"  repo_type: {record.repo_type}")
+    print(f"  path: {record.original_path}")
+    print(f"  status: {record.status}")
+    print(f"  exceptions: {record.exceptions}")
+    print(f"  resolved_commit: {record.resolved_commit or 'unknown'}")
+    print(f"  last_checked: {record.checked_at_utc}")
+    print(f"  verification_age: {record.check_age}")
+    print(f"  payload_files: {record.payload_files}")
+    print(f"  payload_size: {format_bytes(record.payload_size)} ({record.payload_size} bytes)")
+
+
+def active_publication_removal_error(root: Path) -> str | None:
+    from .torrent_publication import load_fenced_publication
+
+    try:
+        fenced = load_fenced_publication(root)
+    except (OSError, ValueError) as exc:
+        return f"remove blocked: torrent publication state is unreadable: {exc}"
+    if fenced is None:
+        return None
+    record = fenced[0]
+    return (
+        f"remove blocked by active torrent publication {record.publication_id}. "
+        f"Stop any external client if applicable, then run "
+        f"'model-mirror torrent stop --repo-type {record.repo_type} {record.repo_id}' and "
+        f"'model-mirror torrent retire --repo-type {record.repo_type} {record.repo_id}'."
+    )
+
+
+def confirm_removal(repo_id: str) -> bool:
+    try:
+        response = input(f"Type '{repo_id}' to confirm permanent removal: ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return response.strip() == repo_id
+
+
+def finish_removal_cleanup(config: Config, staged: Path) -> None:
+    prune_empty_removal_parents(
+        staged.parent,
+        stop=Path(config.directory) / REMOVALS_DIR,
+    )
+
+
 def collect_mirror_status(config: Config, *, repo_type: str | None = None) -> list[MirrorStatusEntry]:
     archive_root = Path(config.directory)
     entries: list[MirrorStatusEntry] = []
@@ -903,6 +1138,9 @@ def mirror_exception_tags(entry: MirrorStatusEntry) -> list[str]:
     tags = list_exception_tags(entry.state, entry.active_lock, entry.progress)
     if snapshot_is_stale(entry):
         append_unique(tags, "snapshot-stale")
+    marker = removal_record_path(entry.root)
+    if marker.exists() or marker.is_symlink():
+        append_unique(tags, "removal-pending")
     return tags
 
 

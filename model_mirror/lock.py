@@ -13,6 +13,7 @@ from .state import utc_now
 
 
 LOCK_FILE = ".verification.lock"
+REMOVAL_MARKER = ".model-mirror-removal.json"
 
 
 class ModelBusyError(RuntimeError):
@@ -45,6 +46,18 @@ class ModelLock:
             self.handle.seek(0)
             info = yaml.safe_load(self.handle.read()) or {}
             raise ModelBusyError(self.root, info) from exc
+
+        marker = self.root / REMOVAL_MARKER
+        if self.command != "remove" and (marker.exists() or marker.is_symlink()):
+            info = {
+                "command": "remove-pending",
+                "repo_id": self.repo_id,
+                "repo_type": self.repo_type,
+            }
+            fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+            self.handle.close()
+            self.handle = None
+            raise ModelBusyError(self.root, info)
 
         info = {
             "pid": os.getpid(),

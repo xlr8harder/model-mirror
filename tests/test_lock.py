@@ -3,7 +3,7 @@ import errno
 import pytest
 
 import model_mirror.lock as lock_module
-from model_mirror.lock import ModelLock, lock_label, read_active_lock
+from model_mirror.lock import ModelBusyError, ModelLock, REMOVAL_MARKER, lock_label, read_active_lock
 
 
 def test_model_lock_exit_without_handle_is_noop(tmp_path):
@@ -53,3 +53,14 @@ def test_read_active_lock_reraises_unexpected_flock_errors(tmp_path, monkeypatch
 
     with pytest.raises(OSError, match="unexpected"):
         read_active_lock(tmp_path)
+
+
+def test_removal_marker_blocks_normal_operations_but_allows_remove(tmp_path):
+    (tmp_path / REMOVAL_MARKER).touch()
+
+    with pytest.raises(ModelBusyError, match="remove-pending"):
+        with ModelLock(tmp_path, "verify", "org/model"):
+            pass
+
+    with ModelLock(tmp_path, "remove", "org/model"):
+        pass

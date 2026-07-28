@@ -338,6 +338,7 @@ def test_config_options_describes_supported_keys(tmp_path, capsys):
     "command,expected",
     [
         ("mirror", "Exit status: 0 when complete or downloaded cleanly"),
+        ("remove", "repository-name confirmation"),
         ("verify", "cached verification data is missing/stale"),
         ("repair", "--force-partial"),
     ],

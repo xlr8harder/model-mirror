@@ -342,6 +342,7 @@ model-mirror online org/model              # re-enable Hub checks
 model-mirror list                          # show mirrors, state tags, and verification age
 model-mirror status                        # archive sizes, cache use, locks, progress, and torrent state
 model-mirror status org/model              # detailed last-known local repository state
+model-mirror remove org/model              # inspect, confirm, and permanently remove one mirror
 model-mirror upgrade org/model             # fill missing torrent hash coverage
 model-mirror torrent publish org/model     # publish and request durable seeding
 model-mirror torrent join FILE_OR_MAGNET   # recover a normal local archive
@@ -413,7 +414,7 @@ forced cache cleanup while `status` shows an active download or repair.
 ## Locking And Interrupted Commands
 
 Repository operations use an advisory kernel `flock` on
-`.verification.lock`. `mirror`, `verify`, `repair`, `offline`, `online`,
+`.verification.lock`. `mirror`, `remove`, `verify`, `repair`, `offline`, `online`,
 `upgrade`, and torrent control-plane transitions take this per-repository lock;
 the managed seeder holds it only during short reconciliation transitions.
 `list` and `status` remain non-blocking and report the command, PID, host, and
@@ -428,22 +429,37 @@ command to resume its pinned snapshot.
 
 ## Removing A Mirror
 
-There is no `remove` command or global repository database. A repository and
-all of its model-mirror state live in one directory, so removal is an explicit
-filesystem operation:
+`remove` prints the repository identity, type, path, status, exceptional state,
+resolved commit, last verification time and age, payload file count, and exact
+size. By default it requires typing the full repository ID; `--yes` is available
+for deliberate automation:
 
 ```bash
-model-mirror status
-# For a published torrent, stop external seeding if applicable, then:
-model-mirror torrent retire org/model
-rm -r -- /mnt/big-drive/huggingface/models/org/model
+model-mirror remove org/model
+model-mirror remove --repo-type dataset org/data
+model-mirror remove --yes org/model
 ```
 
-Do not remove a repository reported as busy. For datasets or Spaces, use the
-corresponding path below `datasets/` or `spaces/`. Torrent retirement releases
-local managed seed intent and the update fence, but cannot revoke torrent
-metadata already shared with other peers. Removing a repository does not remove
-archive-wide cache; inspect that separately with `model-mirror clean-cache`.
+Removal is blocked while a torrent publication fence is active. Stop any
+external client first when applicable, then release the local publication:
+
+```bash
+model-mirror torrent stop org/model
+model-mirror torrent retire org/model
+model-mirror remove org/model
+```
+
+After confirmation, model-mirror atomically moves the mirror from its canonical
+path into `.model-mirror-removals/` under the same archive. It removes payload
+files first, ordinary metadata next, and the preserved removal record and lock
+last. If the command or host stops partway through, rerun the same `remove`
+command to resume. A new mirror created at the original path while an older
+removal is pending is never deleted by that resumed cleanup.
+
+Torrent retirement releases local managed seed intent and the update fence, but
+cannot revoke torrent metadata already shared with other peers. Removing a
+repository does not remove archive-wide cache; inspect that separately with
+`model-mirror clean-cache`.
 
 ## Notes
 
