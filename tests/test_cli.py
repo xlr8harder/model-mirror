@@ -509,14 +509,17 @@ def test_help_command_prints_full_help(capsys):
     output = capsys.readouterr().out
     assert "usage: model-mirror" in output
     assert "show help" in output
+    assert "status (list)" in output
+    assert "\n    list " not in output
 
 
 def test_help_command_prints_subcommand_help(capsys):
     assert main(["help", "list"]) == 0
 
     output = capsys.readouterr().out
-    assert "usage: model-mirror list" in output
+    assert "usage: model-mirror status" in output
     assert "detailed last-known local state" in output
+    assert "deprecated 'list' command" in output
     assert "--repo-type" in output
 
 

@@ -5,6 +5,11 @@ matching version section into the corresponding GitHub Release.
 
 ## [Unreleased]
 
+### Changed
+
+- `model-mirror list` is now a deprecated compatibility alias shown with
+  `status` instead of appearing as a separate top-level command.
+
 ## [0.2.2] - 2026-07-28
 
 ### Added

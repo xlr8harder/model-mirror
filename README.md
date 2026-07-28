@@ -93,7 +93,8 @@ metadata-only archive table with repository type and ID, recorded file count
 and payload size, abbreviated resolved commit, verification age, and
 exceptional state. A healthy row uses `-` in `EXCEPTIONS` instead of repeating
 `clean`. Torrent and live activity columns appear only when relevant.
-`model-mirror list` is currently an alias for the same output.
+The deprecated `model-mirror list` spelling remains available as a compatibility
+alias but is no longer presented as a separate command.
 
 Status reads model-mirror's existing verification, manifest, snapshot, lock,
 progress, torrent metadata, and shallow runtime-cache operation records. It
@@ -107,7 +108,6 @@ contacting the Hub:
 
 ```bash
 model-mirror status org/model
-model-mirror list org/model                 # same detailed view
 model-mirror status --repo-type dataset org/data
 model-mirror status --check-upstream org/model
 model-mirror status --verbose org/model
@@ -403,7 +403,6 @@ model-mirror repair --all                  # repair all mirrors with recorded re
 model-mirror repair --update org/model     # apply a changed upstream commit recorded by verify
 model-mirror offline org/model             # local verification only; no Hub checks
 model-mirror online org/model              # re-enable Hub checks
-model-mirror list                          # fast recorded state for every mirror
 model-mirror status                        # metadata-only archive status
 model-mirror status org/model              # concise last-known repository state
 model-mirror status --verbose org/model    # full recorded metadata

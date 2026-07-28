@@ -181,9 +181,16 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
     command_parsers: dict[str, argparse.ArgumentParser] = {}
 
-    def add_command_parser(name: str, **kwargs) -> argparse.ArgumentParser:
-        command_parser = subparsers.add_parser(name, **kwargs)
+    def add_command_parser(
+        name: str,
+        *,
+        aliases: tuple[str, ...] = (),
+        **kwargs,
+    ) -> argparse.ArgumentParser:
+        command_parser = subparsers.add_parser(name, aliases=list(aliases), **kwargs)
         command_parsers[name] = command_parser
+        for alias in aliases:
+            command_parsers[alias] = command_parser
         return command_parser
 
     mirror_parser = add_command_parser(
@@ -236,7 +243,7 @@ def build_parser() -> argparse.ArgumentParser:
     verify_parser = add_command_parser(
         "verify",
         help="verify mirrored archives",
-        description="Check local files against Hub metadata, local checksums, and model metadata.",
+        description="Check local files against pinned Hub metadata and local checksums.",
         epilog=(
             "Exit status: 0 when verification is clean; 1 when files are missing, corrupt, extra, busy, "
             "the upstream repository is unavailable, or cached verification data is missing/stale; "
@@ -447,45 +454,38 @@ def build_parser() -> argparse.ArgumentParser:
         help="repo kind to update; defaults to configured repo_type",
     )
 
-    list_parser = add_command_parser(
-        "list",
-        help="list mirrors in columns or show one mirror in detail",
-        description=(
-            "Show a compact archive-wide table, or detailed last-known local state when REPO is supplied. "
-            "This command is metadata-only and does not contact upstream unless --check-upstream is supplied."
-        ),
-    )
     status_parser = add_command_parser(
         "status",
+        aliases=("list",),
         help="show archive status or detailed local state for one mirror",
         description=(
             "Show a compact archive-wide table, or detailed last-known local state when REPO is supplied. "
-            "This command is metadata-only and does not contact upstream unless --check-upstream is supplied."
+            "This command is metadata-only and does not contact upstream unless --check-upstream is supplied. "
+            "The deprecated 'list' command remains available as a compatibility alias."
         ),
     )
-    for status_like_parser in (list_parser, status_parser):
-        status_like_parser.add_argument("model", metavar="repo", nargs="?", help="optional repo id, e.g. org/model")
-        status_like_parser.add_argument(
-            "--repo-type",
-            choices=["model", "dataset", "space"],
-            help="repo kind; filters the table or selects the detailed repo",
-        )
-        status_like_parser.add_argument(
-            "--check-upstream",
-            action="store_true",
-            help="advisory live comparison with upstream; does not update local metadata",
-        )
-        status_like_parser.add_argument(
-            "--verbose",
-            action="store_true",
-            help="show all recorded metadata fields in the human-readable detail view",
-        )
-        status_like_parser.add_argument(
-            "--json",
-            action="store_true",
-            dest="json_output",
-            help="emit stable structured JSON; --verbose has no effect",
-        )
+    status_parser.add_argument("model", metavar="repo", nargs="?", help="optional repo id, e.g. org/model")
+    status_parser.add_argument(
+        "--repo-type",
+        choices=["model", "dataset", "space"],
+        help="repo kind; filters the table or selects the detailed repo",
+    )
+    status_parser.add_argument(
+        "--check-upstream",
+        action="store_true",
+        help="advisory live comparison with upstream; does not update local metadata",
+    )
+    status_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="show all recorded metadata fields in the human-readable detail view",
+    )
+    status_parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="emit stable structured JSON; --verbose has no effect",
+    )
 
     clean_cache_parser = add_command_parser(
         "clean-cache",
