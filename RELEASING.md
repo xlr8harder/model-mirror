@@ -29,8 +29,12 @@ Select the next version according to the change:
 While the project is pre-1.0, substantial CLI or metadata compatibility changes
 normally warrant a minor release.
 
+Record user-facing work under `[Unreleased]` in `CHANGELOG.md`. Before release,
+move those entries into a dated section matching the new version. The release
+workflow rejects a tag with no matching, non-empty changelog section.
+
 ```bash
-RELEASE_VERSION=0.2.1
+RELEASE_VERSION=0.2.2  # example; choose the appropriate next version
 uv version "$RELEASE_VERSION"
 uv run coverage run -m pytest -q
 uv run coverage report -m
@@ -49,7 +53,8 @@ The tag must exactly equal `v` plus the version in `pyproject.toml`, must be
 annotated, and must point to a commit already on `main`. Release tags are
 protected from rewriting or deletion after publication. The GitHub workflow
 repeats the full test, build, and smoke-test sequence before publishing the
-wheel and source distribution through PyPI trusted publishing.
+wheel and source distribution through PyPI trusted publishing, then creates a
+GitHub Release from the matching `CHANGELOG.md` section.
 
 ## User installation and updates
 

@@ -29,6 +29,7 @@ from model_mirror.hub import HubFile, HubSnapshot, write_snapshot_plan
 from model_mirror.lock import ModelLock
 from model_mirror.progress import ProgressEntry, ProgressSnapshot, progress_path
 from model_mirror.state import VerificationState, read_verification_state, write_verification_state
+from model_mirror.version_check import ReleaseNote, VersionCheck
 
 
 @dataclass
@@ -371,7 +372,133 @@ def test_version_uses_package_metadata(capsys):
         main(["--version"])
 
     assert exc.value.code == 0
-    assert capsys.readouterr().out == "model-mirror 0.2.0\n"
+    assert capsys.readouterr().out == f"model-mirror {cli_module.__version__}\n"
+
+
+@pytest.mark.parametrize(
+    "result,expected_rc,expected",
+    [
+        (
+            VersionCheck("1.0.0", "1.0.0", "current"),
+            0,
+            ["installed: 1.0.0", "latest: 1.0.0", "status: current"],
+        ),
+        (
+            VersionCheck("1.0.0", "1.0.1", "out-of-date"),
+            0,
+            [
+                "status: out-of-date",
+                "update: uv tool upgrade model-mirror-cli",
+            ],
+        ),
+        (
+            VersionCheck("1.1.0", "1.0.1", "ahead"),
+            0,
+            ["status: ahead"],
+        ),
+        (
+            VersionCheck("1.0.0", None, "unavailable", "offline"),
+            1,
+            ["latest: unavailable", "status: unavailable", "error: offline"],
+        ),
+    ],
+)
+def test_version_command_reports_pypi_comparison(monkeypatch, capsys, result, expected_rc, expected):
+    monkeypatch.setattr(cli_module, "check_version", lambda installed: result)
+    monkeypatch.setattr(cli_module, "load_config", lambda path: pytest.fail("version must not load archive config"))
+
+    assert main(["version"]) == expected_rc
+
+    output = capsys.readouterr().out
+    assert all(item in output for item in expected)
+    assert ("update:" in output) == (result.status == "out-of-date")
+
+
+def test_version_command_supports_json(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli_module,
+        "check_version",
+        lambda installed: VersionCheck(
+            "1.0.0",
+            "1.0.2",
+            "out-of-date",
+            releases=(
+                ReleaseNote("1.0.1", "https://example/1.0.1", "first"),
+                ReleaseNote("1.0.2", "https://example/1.0.2", "second"),
+            ),
+        ),
+    )
+
+    assert main(["version", "--json"]) == 0
+
+    assert json.loads(capsys.readouterr().out) == {
+        "schema": "model-mirror-version",
+        "version": 1,
+        "installed_version": "1.0.0",
+        "latest_version": "1.0.2",
+        "status": "out-of-date",
+        "update_command": "uv tool upgrade model-mirror-cli",
+        "error": None,
+        "release_url": "https://github.com/xlr8harder/model-mirror/releases/tag/v1.0.2",
+        "releases": [
+            {"version": "1.0.1", "url": "https://example/1.0.1", "notes": "first"},
+            {"version": "1.0.2", "url": "https://example/1.0.2", "notes": "second"},
+        ],
+        "release_notes_error": None,
+    }
+
+
+def test_version_command_prints_all_pending_release_notes(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli_module,
+        "check_version",
+        lambda installed: VersionCheck(
+            "1.0.0",
+            "1.0.2",
+            "out-of-date",
+            releases=(
+                ReleaseNote("1.0.1", "https://example/1.0.1", "first"),
+                ReleaseNote("1.0.2", "https://example/1.0.2", ""),
+            ),
+            release_notes_error="one release had no notes",
+        ),
+    )
+
+    assert main(["version"]) == 0
+
+    output = capsys.readouterr().out
+    assert output.index("1.0.1:") < output.index("1.0.2:")
+    assert "first" in output
+    assert "changes_error: one release had no notes" in output
+
+
+def test_repo_commands_use_configured_repo_type_by_default():
+    parser = cli_module.build_parser()
+    config = Config(repo_type="dataset")
+    repo_commands = [
+        ["mirror", "org/data"],
+        ["remove", "org/data"],
+        ["verify", "org/data"],
+        ["repair", "org/data"],
+        ["upgrade", "org/data"],
+        ["torrent", "publish", "org/data"],
+        ["offline", "org/data"],
+        ["online", "org/data"],
+    ]
+
+    for command in repo_commands:
+        args = parser.parse_args(command)
+        assert args.repo_type is None
+        cli_module.apply_configured_repo_type(args, config)
+        assert args.repo_type == "dataset"
+
+    explicit = parser.parse_args(["verify", "--repo-type", "space", "org/app"])
+    cli_module.apply_configured_repo_type(explicit, config)
+    assert explicit.repo_type == "space"
+
+    archive_status = parser.parse_args(["status"])
+    cli_module.apply_configured_repo_type(archive_status, config)
+    assert archive_status.repo_type is None
 
 
 def test_help_command_prints_full_help(capsys):

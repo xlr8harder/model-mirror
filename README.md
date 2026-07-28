@@ -44,7 +44,16 @@ Update and inspect an installed release with:
 ```bash
 uv tool upgrade model-mirror-cli
 model-mirror --version
+model-mirror version
 ```
+
+`--version` reports the installed version without network access. The `version`
+command explicitly checks the latest PyPI release and, when the installation is
+out of date, prints the published changes and
+`uv tool upgrade model-mirror-cli`. Release notes come from the curated
+[`CHANGELOG.md`](https://github.com/xlr8harder/model-mirror/blob/main/CHANGELOG.md)
+through the corresponding GitHub Releases. The check does not run implicitly
+from `status` or other archive operations.
 
 For development, clone the
 [source repository](https://github.com/xlr8harder/model-mirror), run
@@ -386,14 +395,17 @@ model-mirror status org/model              # concise last-known repository state
 model-mirror status --verbose org/model    # full recorded metadata
 model-mirror status --check-upstream org/model  # advisory live upstream comparison
 model-mirror status --json                 # stable machine-readable status
+model-mirror version                       # compare installed version with PyPI
 model-mirror remove org/model              # inspect, confirm, and permanently remove one mirror
 model-mirror upgrade org/model             # fill missing torrent hash coverage
 model-mirror torrent publish org/model     # publish and request durable seeding
 model-mirror torrent join FILE_OR_MAGNET   # recover a normal local archive
 ```
 
-Datasets and Spaces are supported with `--repo-type dataset` or
-`--repo-type space`.
+Omitting `--repo-type` uses the configured default, initially `model`, for every
+repo-targeted command. Use `--repo-type dataset` or `--repo-type space` to
+override it. Archive-wide `list` and `status` include all repo types; torrent
+join/import operations read the repo type from the publication descriptor.
 
 ## Key Configuration
 

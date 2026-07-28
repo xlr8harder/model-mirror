@@ -52,6 +52,7 @@ from .state import (
     write_verification_state,
 )
 from .verify import RemoteVerifyResult, merge_checksum_result, verify_remote
+from .version_check import RELEASE_URL_TEMPLATE, UPDATE_COMMAND, VersionCheck, check_version
 
 
 TORRENT_EXPERIMENTAL_NOTICE = (
@@ -185,7 +186,11 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="Exit status: 0 when complete or downloaded cleanly; 1 when final verification is not clean.",
     )
     mirror_parser.add_argument("model", metavar="repo", help="Hugging Face repo id, e.g. org/model")
-    mirror_parser.add_argument("--repo-type", choices=["model", "dataset", "space"], help="repo kind to mirror")
+    mirror_parser.add_argument(
+        "--repo-type",
+        choices=["model", "dataset", "space"],
+        help="repo kind to mirror; defaults to configured repo_type",
+    )
     add_revision_options(mirror_parser)
     mirror_parser.add_argument("--force", action="store_true", help="download even if the local copy looks complete")
     mirror_parser.add_argument("--no-verify", action="store_true", help="skip verification after download")
@@ -210,7 +215,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     remove_parser.add_argument("model", metavar="repo", help="repo id to remove, e.g. org/model")
     remove_parser.add_argument(
-        "--repo-type", choices=["model", "dataset", "space"], default="model", help="repo kind to remove"
+        "--repo-type",
+        choices=["model", "dataset", "space"],
+        help="repo kind to remove; defaults to configured repo_type",
     )
     remove_parser.add_argument(
         "-y",
@@ -233,7 +240,9 @@ def build_parser() -> argparse.ArgumentParser:
     verify_parser.add_argument("--cached", action="store_true", help="verify Hub hashes from cached .manifest rows")
     verify_parser.add_argument("--all", action="store_true", help="verify every mirrored model")
     verify_parser.add_argument(
-        "--repo-type", choices=["model", "dataset", "space"], default="model", help="repo kind to verify"
+        "--repo-type",
+        choices=["model", "dataset", "space"],
+        help="repo kind to verify; defaults to configured repo_type",
     )
     add_revision_options(verify_parser)
     verify_parser.add_argument("--strict", action="store_true", help="fail on extra local files")
@@ -269,7 +278,9 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     repair_parser.add_argument(
-        "--repo-type", choices=["model", "dataset", "space"], default="model", help="repo kind to repair"
+        "--repo-type",
+        choices=["model", "dataset", "space"],
+        help="repo kind to repair; defaults to configured repo_type",
     )
 
     upgrade_parser = add_command_parser(
@@ -286,7 +297,9 @@ def build_parser() -> argparse.ArgumentParser:
     upgrade_parser.add_argument("--all", action="store_true", help="upgrade every mirrored repository of this type")
     upgrade_parser.add_argument("--dry-run", action="store_true", help="report required reads without changing metadata")
     upgrade_parser.add_argument(
-        "--repo-type", choices=["model", "dataset", "space"], default="model", help="repo kind to upgrade"
+        "--repo-type",
+        choices=["model", "dataset", "space"],
+        help="repo kind to upgrade; defaults to configured repo_type",
     )
 
     torrent_parser = add_command_parser(
@@ -309,8 +322,7 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--repo-type",
             choices=["model", "dataset", "space"],
-            default="model",
-            help="repo kind",
+            help="repo kind; defaults to configured repo_type",
         )
         return command
 
@@ -410,7 +422,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     offline_parser.add_argument("model", metavar="repo", help="repo id to mark offline-only")
     offline_parser.add_argument(
-        "--repo-type", choices=["model", "dataset", "space"], default="model", help="repo kind to update"
+        "--repo-type",
+        choices=["model", "dataset", "space"],
+        help="repo kind to update; defaults to configured repo_type",
     )
 
     online_parser = add_command_parser(
@@ -421,7 +435,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     online_parser.add_argument("model", metavar="repo", help="repo id to mark online")
     online_parser.add_argument(
-        "--repo-type", choices=["model", "dataset", "space"], default="model", help="repo kind to update"
+        "--repo-type",
+        choices=["model", "dataset", "space"],
+        help="repo kind to update; defaults to configured repo_type",
     )
 
     list_parser = add_command_parser(
@@ -475,6 +491,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     clean_cache_parser.add_argument("--force", action="store_true", help="delete cache and temporary files")
 
+    version_parser = add_command_parser(
+        "version",
+        help="compare the installed version with the latest PyPI release",
+        description=(
+            "Query PyPI for the latest model-mirror-cli release and compare it with "
+            "the installed version. Use --version for an offline installed-version check."
+        ),
+        epilog="Exit status: 0 when PyPI was checked successfully; 1 when the check was unavailable.",
+    )
+    version_parser.add_argument("--json", action="store_true", dest="json_output", help="emit structured JSON")
+
     config_parser = add_command_parser(
         "config",
         help="show or change configuration",
@@ -526,8 +553,11 @@ def main(argv: list[str] | None = None, *, hub=None) -> int:
         return 0
     if args.command == "help":
         return handle_help(parser, args.topic)
+    if args.command == "version":
+        return handle_version(json_output=args.json_output)
     config_path = Path(args.config).expanduser() if args.config else None
     config = load_config(config_path)
+    apply_configured_repo_type(args, config)
 
     if should_supervise_mirror(args, config, hub):
         return run_supervised_mirror(raw_argv, args, config)
@@ -581,6 +611,67 @@ def main(argv: list[str] | None = None, *, hub=None) -> int:
 
     parser.error(f"Unhandled command: {args.command}")
     return 2
+
+
+def apply_configured_repo_type(args, config: Config) -> None:
+    if args.command in {"list", "status"}:
+        return
+    if hasattr(args, "repo_type") and args.repo_type is None:
+        args.repo_type = config.repo_type
+
+
+def handle_version(*, json_output: bool) -> int:
+    result = check_version(__version__)
+    update_command = UPDATE_COMMAND if result.status == "out-of-date" else None
+    release_url = (
+        RELEASE_URL_TEMPLATE.format(version=result.latest_version)
+        if result.status == "out-of-date"
+        else None
+    )
+    if json_output:
+        print(
+            json.dumps(
+                {
+                    "schema": "model-mirror-version",
+                    "version": 1,
+                    "installed_version": result.installed_version,
+                    "latest_version": result.latest_version,
+                    "status": result.status,
+                    "update_command": update_command,
+                    "error": result.error,
+                    "release_url": release_url,
+                    "releases": [
+                        {
+                            "version": release.version,
+                            "url": release.url,
+                            "notes": release.notes,
+                        }
+                        for release in result.releases
+                    ],
+                    "release_notes_error": result.release_notes_error,
+                },
+                sort_keys=True,
+            )
+        )
+    else:
+        print(f"installed: {result.installed_version}")
+        print(f"latest: {result.latest_version or 'unavailable'}")
+        print(f"status: {result.status}")
+        if update_command:
+            print(f"update: {update_command}")
+        if result.releases:
+            print("changes:")
+            for release in result.releases:
+                print(f"\n{release.version}: {release.url}")
+                if release.notes:
+                    print(release.notes)
+        elif release_url:
+            print(f"changes: {release_url}")
+        if result.release_notes_error:
+            print(f"changes_error: {result.release_notes_error}")
+        if result.error:
+            print(f"error: {result.error}")
+    return 1 if result.status == "unavailable" else 0
 
 
 def should_supervise_mirror(args, config: Config, hub) -> bool:
