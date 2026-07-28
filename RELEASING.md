@@ -30,22 +30,26 @@ While the project is pre-1.0, substantial CLI or metadata compatibility changes
 normally warrant a minor release.
 
 ```bash
-uv version 0.2.0
+RELEASE_VERSION=0.2.1
+uv version "$RELEASE_VERSION"
 uv run coverage run -m pytest -q
 uv run coverage report -m
 uv build --no-sources
 uv run --isolated --no-project --with dist/*.whl tests/smoke_test.py
 uv run --isolated --no-project --with dist/*.tar.gz tests/smoke_test.py
 git add pyproject.toml uv.lock
-git commit -m "Release 0.2.0"
-git tag -a v0.2.0 -m v0.2.0
+git commit -m "Release $RELEASE_VERSION"
 git push origin main
-git push origin v0.2.0
+# Wait for main CI to pass, then:
+git tag -a "v$RELEASE_VERSION" -m "v$RELEASE_VERSION"
+git push origin "v$RELEASE_VERSION"
 ```
 
-The tag must exactly equal `v` plus the version in `pyproject.toml`. The GitHub
-workflow repeats the full test, build, and smoke-test sequence before publishing
-the wheel and source distribution.
+The tag must exactly equal `v` plus the version in `pyproject.toml`, must be
+annotated, and must point to a commit already on `main`. Release tags are
+protected from rewriting or deletion after publication. The GitHub workflow
+repeats the full test, build, and smoke-test sequence before publishing the
+wheel and source distribution through PyPI trusted publishing.
 
 ## User installation and updates
 

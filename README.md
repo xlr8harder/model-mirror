@@ -17,13 +17,11 @@ change without modifying local files.
 
 ## Quick Start
 
-`model-mirror` is not currently published on PyPI. Install it from a source
-checkout with [uv](https://docs.astral.sh/uv/) (Python 3.11 or newer):
+Install the `model-mirror-cli` distribution from PyPI with
+[uv](https://docs.astral.sh/uv/) (Python 3.11 or newer):
 
 ```bash
-git clone https://github.com/xlr8harder/model-mirror.git
-cd model-mirror
-uv tool install .
+uv tool install model-mirror-cli
 
 model-mirror config directory /mnt/big-drive/huggingface
 model-mirror config set hf-xet-reconstruct-write-sequentially true  # useful for HDDs
@@ -36,16 +34,22 @@ model-mirror verify org/model
 model-mirror repair org/model  # if verify reports repair paths
 ```
 
-Once the first PyPI release is published, the normal installation will be
-`uv tool install model-mirror-cli`, or
-`uv tool install 'model-mirror-cli[torrent]'` with experimental torrent support.
 The PyPI distribution is named `model-mirror-cli` to distinguish it from an
-unrelated package; the installed command remains `model-mirror`. Installed
-releases can be updated with `uv tool upgrade model-mirror-cli` and
-inspected with `model-mirror --version`.
+unrelated package; the installed command remains `model-mirror`. To include
+experimental torrent support from the start, install
+`uv tool install 'model-mirror-cli[torrent]'`.
 
-For development inside the checkout, use `uv sync` and prefix commands with
-`uv run`. The rest of this README assumes the tool installation above.
+Update and inspect an installed release with:
+
+```bash
+uv tool upgrade model-mirror-cli
+model-mirror --version
+```
+
+For development, clone the
+[source repository](https://github.com/xlr8harder/model-mirror), run
+`uv sync --all-extras --dev`, and prefix commands with `uv run`. The rest of
+this README assumes the tool installation above.
 
 For periodic maintenance of the whole archive:
 
@@ -208,8 +212,8 @@ before stabilization. Ordinary mirror, verify, and repair workflows remain
 stable and do not require the torrent extra:
 
 ```bash
-# Reinstall the source checkout as a uv tool with torrent support:
-uv tool install --force '.[torrent]'
+# Install or replace the PyPI tool with torrent support:
+uv tool install --force 'model-mirror-cli[torrent]'
 
 # Or add the extra to the checkout's development environment:
 uv sync --extra torrent
