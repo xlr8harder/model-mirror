@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "model-mirror"
+name = "model-mirror-cli"
 version = "0.2.0"
 description = "Mirror and validate Hugging Face archives without leaving payloads in the default cache."
 readme = "README.md"
@@ -48,6 +48,9 @@ model-mirror = "model_mirror.cli:main"
 [project.urls]
 Repository = "https://github.com/xlr8harder/model-mirror"
 Issues = "https://github.com/xlr8harder/model-mirror/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["model_mirror"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

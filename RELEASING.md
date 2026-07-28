@@ -5,8 +5,9 @@ version plus the matching annotated Git tag.
 
 ## One-time PyPI setup
 
-1. Create the `model-mirror` project on PyPI, or configure a pending publisher
-   for the first release.
+1. Create the `model-mirror-cli` project on PyPI, or configure a pending
+   publisher for the first release. The repository and installed command remain
+   `model-mirror`.
 2. Add a PyPI trusted publisher for:
    - owner: `xlr8harder`
    - repository: `model-mirror`
@@ -49,8 +50,8 @@ the wheel and source distribution.
 ## User installation and updates
 
 ```bash
-uv tool install model-mirror
-uv tool install 'model-mirror[torrent]'
+uv tool install model-mirror-cli
+uv tool install 'model-mirror-cli[torrent]'
 model-mirror --version
-uv tool upgrade model-mirror
+uv tool upgrade model-mirror-cli
 ```

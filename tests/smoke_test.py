@@ -6,7 +6,7 @@ import sys
 
 
 def main() -> None:
-    expected = importlib.metadata.version("model-mirror")
+    expected = importlib.metadata.version("model-mirror-cli")
     completed = subprocess.run(
         ["model-mirror", "--version"],
         check=True,

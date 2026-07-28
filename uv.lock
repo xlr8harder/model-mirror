@@ -320,7 +320,7 @@ wheels = [
 ]
 
 [[package]]
-name = "model-mirror"
+name = "model-mirror-cli"
 version = "0.2.0"
 source = { editable = "." }
 dependencies = [

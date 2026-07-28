@@ -37,9 +37,11 @@ model-mirror repair org/model  # if verify reports repair paths
 ```
 
 Once the first PyPI release is published, the normal installation will be
-`uv tool install model-mirror`, or
-`uv tool install 'model-mirror[torrent]'` with experimental torrent support.
-Installed releases can be updated with `uv tool upgrade model-mirror` and
+`uv tool install model-mirror-cli`, or
+`uv tool install 'model-mirror-cli[torrent]'` with experimental torrent support.
+The PyPI distribution is named `model-mirror-cli` to distinguish it from an
+unrelated package; the installed command remains `model-mirror`. Installed
+releases can be updated with `uv tool upgrade model-mirror-cli` and
 inspected with `model-mirror --version`.
 
 For development inside the checkout, use `uv sync` and prefix commands with

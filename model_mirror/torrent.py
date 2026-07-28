@@ -448,6 +448,6 @@ def load_libtorrent():
     except ModuleNotFoundError as exc:
         raise TorrentBackendUnavailable(
             "libtorrent is required for managed torrent support; "
-            "install model-mirror with the 'torrent' extra"
+            "install the model-mirror-cli distribution with the 'torrent' extra"
         ) from exc
     return libtorrent

@@ -16,7 +16,7 @@ torrent-specific metadata formats remain experimental.
 The Python binding is an optional runtime extra:
 
 ```bash
-pip install 'model-mirror[torrent]'
+pip install 'model-mirror-cli[torrent]'
 ```
 
 It is also a development dependency so the deterministic metainfo and
