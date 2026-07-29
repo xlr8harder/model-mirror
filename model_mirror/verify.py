@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from .checksums import file_hashes, iter_payload_entries, load_manifest, record_is_current
 from .payload import (
@@ -15,7 +16,9 @@ from .payload import (
 @dataclass(slots=True)
 class RemoteVerifyResult:
     files_checked: int = 0
+    bytes_checked: int = 0
     hashes_checked: int = 0
+    bytes_hashed: int = 0
     missing: list[str] = field(default_factory=list)
     size_mismatches: list[str] = field(default_factory=list)
     hash_mismatches: list[str] = field(default_factory=list)
@@ -68,6 +71,7 @@ def verify_remote(
     from_manifest: bool = False,
     check_hashes: bool = True,
     strict: bool = False,
+    on_progress: Callable[[str, int, int], None] | None = None,
 ) -> RemoteVerifyResult:
     result = RemoteVerifyResult()
     manifest: dict[str, dict] = {}
@@ -96,6 +100,7 @@ def verify_remote(
         stat = path.stat()
         expected_size = metadata_size(item)
         actual_size = stat.st_size
+        result.bytes_checked += actual_size
         if expected_size is not None and actual_size != expected_size:
             result.size_mismatches.append(rel)
             continue
@@ -112,7 +117,15 @@ def verify_remote(
                 result.cached_hash_missing.append(rel)
                 continue
             else:
-                actual_hash = file_hashes(path).sha256
+                actual_hash = file_hashes(
+                    path,
+                    on_progress=(
+                        (lambda done: on_progress(rel, done, actual_size))
+                        if on_progress is not None
+                        else None
+                    ),
+                ).sha256
+                result.bytes_hashed += actual_size
             result.hashes_checked += 1
             if actual_hash != expected_lfs_hash:
                 result.hash_mismatches.append(rel)
@@ -129,7 +142,15 @@ def verify_remote(
             result.cached_hash_missing.append(rel)
             continue
         else:
-            actual_hash = file_hashes(path).git_blob_sha1
+            actual_hash = file_hashes(
+                path,
+                on_progress=(
+                    (lambda done: on_progress(rel, done, actual_size))
+                    if on_progress is not None
+                    else None
+                ),
+            ).git_blob_sha1
+            result.bytes_hashed += actual_size
         result.hashes_checked += 1
         if actual_hash != expected_blob_id:
             result.hash_mismatches.append(rel)

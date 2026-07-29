@@ -16,6 +16,7 @@ import model_mirror.cli as cli_module
 from model_mirror.checksums import write_checksums
 from model_mirror.cli import (
     format_age_seconds,
+    format_duration,
     main,
     list_model_ids,
     parse_age,
@@ -39,6 +40,7 @@ class FakeFile:
     path: str
     size: int
     lfs_sha256: str | None = None
+    blob_id: str | None = None
 
 
 class FakeHub:
@@ -606,7 +608,30 @@ def test_verify_cached_command_succeeds_with_injected_hub(tmp_path, capsys):
     rc = main(["--config", str(config_path), "verify", "--cached", "org/model"], hub=hub)
 
     assert rc == 0
-    assert "verified (cached)" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "verified (cached)" in output
+    assert "files=1 size=3 B hashed=0 B duration=" in output
+
+
+def test_verify_progress_can_be_forced_for_redirected_output(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    (archive / "file.bin").write_bytes(b"abc")
+    hub = FakeHub(
+        [FakeFile("file.bin", 3, lfs_sha256=hashlib.sha256(b"abc").hexdigest())]
+    )
+
+    rc = main(
+        ["--config", str(config_path), "verify", "--progress", "org/model"],
+        hub=hub,
+    )
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "verified (full): org/model files=1 size=3 B hashed=3 B duration=" in captured.out
+    assert "verify progress: org/model files=1/1 hashed=3 B/3 B" in captured.err
 
 
 def test_verify_uses_stored_commit_and_reports_changed_upstream(tmp_path, capsys):
@@ -632,7 +657,8 @@ def test_verify_uses_stored_commit_and_reports_changed_upstream(tmp_path, capsys
     assert rc == 0
     output = capsys.readouterr().out
     assert "upstream=changed" in output
-    assert "update changed upstream: model-mirror repair --update org/model" in output
+    assert "preview upstream update: model-mirror repair --update --dry-run org/model" in output
+    assert "apply upstream update: model-mirror repair --update org/model" in output
     state = read_verification_state(archive)
     assert state.resolved_commit == "oldcommit"
     assert state.upstream_commit == "newcommit"
@@ -661,7 +687,8 @@ def test_verify_failure_reports_changed_upstream(tmp_path, capsys):
     assert rc == 1
     assert "verification failed: org/model upstream=changed" in output
     assert "next: model-mirror repair org/model" in output
-    assert "update changed upstream: model-mirror repair --update org/model" in output
+    assert "preview upstream update: model-mirror repair --update --dry-run org/model" in output
+    assert "apply upstream update: model-mirror repair --update org/model" in output
 
 
 def test_print_verification_next_steps_can_show_only_update_hint(capsys):
@@ -672,7 +699,8 @@ def test_print_verification_next_steps_can_show_only_update_hint(capsys):
 
     output = capsys.readouterr().out
     assert "next: model-mirror repair org/model" not in output
-    assert "update changed upstream: model-mirror repair --update org/model" in output
+    assert "preview upstream update: model-mirror repair --update --dry-run org/model" in output
+    assert "apply upstream update: model-mirror repair --update org/model" in output
 
 
 def test_verify_command_reports_failure(tmp_path, capsys):
@@ -764,7 +792,8 @@ def test_verify_cached_incomplete_reports_changed_upstream_hint(tmp_path, capsys
     output = capsys.readouterr().out
     assert rc == 1
     assert "cached verification incomplete: org/model upstream=changed" in output
-    assert "update changed upstream: model-mirror repair --update org/model" in output
+    assert "preview upstream update: model-mirror repair --update --dry-run org/model" in output
+    assert "apply upstream update: model-mirror repair --update org/model" in output
 
 
 def test_verify_dataset_uses_same_opaque_payload_contract(tmp_path, capsys):
@@ -862,7 +891,8 @@ def test_verify_all_reports_changed_upstream_update_hint(tmp_path, capsys):
     output = capsys.readouterr().out
     assert rc == 0
     assert "verified (cached): org/model upstream=changed" in output
-    assert "update changed upstreams: model-mirror repair --all --update" in output
+    assert "preview changed upstreams: model-mirror repair --all --update --dry-run" in output
+    assert "apply changed upstreams: model-mirror repair --all --update" in output
 
 
 def test_verify_all_skips_busy_model_and_continues(tmp_path, capsys):
@@ -2500,6 +2530,219 @@ def test_repair_update_applies_changed_upstream_from_verification_state(tmp_path
     assert hub.downloads == ["org/model"]
     assert hub.download_revisions == ["newcommit"]
     assert "updated: org/model" in capsys.readouterr().out
+
+
+def test_repair_update_dry_run_prints_diff_without_downloading(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    write_snapshot_plan(
+        archive,
+        HubSnapshot(
+            "org/model",
+            "model",
+            "main",
+            "oldcommit",
+            [
+                FakeFile("old.bin", 3, blob_id="old"),
+                FakeFile("same.bin", 4, lfs_sha256="same"),
+            ],
+        ),
+    )
+    write_verification_state(
+        archive,
+        VerificationState(
+            status="clean",
+            repo_id="org/model",
+            requested_revision="main",
+            resolved_commit="oldcommit",
+            upstream_commit="newcommit",
+            upstream_status="changed",
+        ),
+    )
+    hub = FakeHub(
+        [],
+        metadata_by_revision={
+            "newcommit": [
+                FakeFile("new.bin", 5, blob_id="new"),
+                FakeFile("same.bin", 4, lfs_sha256="same"),
+            ]
+        },
+    )
+
+    rc = main(
+        [
+            "--config",
+            str(config_path),
+            "repair",
+            "--update",
+            "--dry-run",
+            "org/model",
+        ],
+        hub=hub,
+    )
+
+    output = capsys.readouterr().out
+    assert rc == 0
+    assert "update preview: org/model" in output
+    assert "commit: oldcommit -> newcommit" in output
+    assert "files: 2 -> 2 (add=1 change=0 remove=1 reuse=1)" in output
+    assert "removal impact: 1/2 files (50.0%), 3 B/7 B (42.9%)" in output
+    assert "add (1):\n  new.bin (5 B)" in output
+    assert "remove (1):\n  old.bin (3 B)" in output
+    assert "apply: model-mirror repair --update org/model" in output
+    assert hub.downloads == []
+    assert read_verification_state(archive).resolved_commit == "oldcommit"
+
+
+def test_repair_update_dry_run_reports_no_change_and_unavailable_state(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    archive = tmp_path / "models" / "org" / "current"
+    archive.mkdir(parents=True)
+    write_verification_state(
+        archive,
+        VerificationState(
+            status="clean",
+            repo_id="org/current",
+            resolved_commit="same",
+            upstream_commit="same",
+            upstream_status="current",
+        ),
+    )
+
+    current_rc = main(
+        [
+            "--config",
+            str(config_path),
+            "repair",
+            "--update",
+            "--dry-run",
+            "org/current",
+        ],
+        hub=FakeHub([]),
+    )
+    missing_rc = main(
+        [
+            "--config",
+            str(config_path),
+            "repair",
+            "--update",
+            "--dry-run",
+            "org/missing",
+        ],
+        hub=FakeHub([]),
+    )
+
+    output = capsys.readouterr().out
+    assert current_rc == 0
+    assert missing_rc == 1
+    assert "no recorded upstream update: org/current" in output
+    assert "update preview unavailable: org/missing" in output
+
+
+def test_repair_dry_run_option_validation(tmp_path):
+    config_path = tmp_path / "config.yaml"
+
+    with pytest.raises(SystemExit, match="requires --update"):
+        main(["--config", str(config_path), "repair", "--dry-run", "org/model"])
+    with pytest.raises(SystemExit, match="cannot be combined"):
+        main(
+            [
+                "--config",
+                str(config_path),
+                "repair",
+                "--update",
+                "--dry-run",
+                "--force-partial",
+                "org/model",
+            ]
+        )
+    with pytest.raises(SystemExit, match="requires --update --dry-run"):
+        main(["--config", str(config_path), "repair", "--verbose", "org/model"])
+
+
+def test_update_plan_group_caps_long_output(capsys):
+    cli_module.print_update_plan_group(
+        "add",
+        [(f"file-{index}", "1 B") for index in range(21)],
+        complete_command="model-mirror repair --update --dry-run --verbose org/model",
+    )
+
+    output = capsys.readouterr().out
+    assert "file-19" in output
+    assert "file-20" not in output
+    assert "... 1 more" in output
+    assert "complete list: model-mirror repair --update --dry-run --verbose org/model" in output
+
+    cli_module.print_update_plan_group(
+        "change",
+        [(f"file-{index}", "1 B -> 2 B") for index in range(21)],
+        limit=None,
+    )
+    assert "file-20" in capsys.readouterr().out
+
+
+def test_update_plan_without_removals_omits_removal_impact(capsys):
+    plan = cli_module.UpdatePlan(
+        repo_id="org/model",
+        repo_type="model",
+        current_commit="old",
+        target_commit="new",
+        unchanged=[HubFile("same.bin", 1, blob_id="same")],
+    )
+
+    cli_module.print_update_plan(plan)
+
+    output = capsys.readouterr().out
+    assert "remove: 0 files 0 B" in output
+    assert "removal impact:" not in output
+
+
+def test_verification_progress_covers_throttling_resets_and_tty_output(
+    monkeypatch,
+    capsys,
+):
+    clock = [0.0]
+    monkeypatch.setattr(cli_module.time, "monotonic", lambda: clock[0])
+    progress = cli_module.VerificationProgress(
+        "org/model",
+        [FakeFile("file.bin", 2)],
+        enabled=True,
+    )
+    progress.tty = True
+
+    progress._emit(0.5)
+    clock[0] = 0.5
+    progress.update("one", "file.bin", 1, 2)
+    clock[0] = 2.0
+    progress.update("one", "file.bin", 0, 2)
+    progress.update("one", "file.bin", 2, 2)
+    progress.finish()
+
+    assert "verify progress: org/model" in capsys.readouterr().err
+
+    disabled = cli_module.VerificationProgress("org/off", [], enabled=False)
+    disabled.update("one", "file.bin", 1, 1)
+    disabled.finish()
+
+    zero_elapsed = cli_module.VerificationProgress("org/zero", [], enabled=True)
+    zero_elapsed._emit(zero_elapsed.started, force=True)
+    assert "rate=0 B/s" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("seconds", "expected"),
+    [
+        (0.05, "<0.1s"),
+        (1.25, "1.2s"),
+        (65, "1m05s"),
+        (3661, "1h01m"),
+    ],
+)
+def test_format_duration(seconds, expected):
+    assert format_duration(seconds) == expected
 
 
 def test_update_command_is_removed(tmp_path):

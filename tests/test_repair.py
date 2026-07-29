@@ -11,7 +11,13 @@ from model_mirror.hub import (
 import model_mirror.repair as repair_module
 from model_mirror.config import Config
 from model_mirror.checksums import checksum_row_from_hashes, file_hashes, load_manifest, write_checksums
-from model_mirror.repair import missing_manifest_paths, repair
+from model_mirror.repair import (
+    missing_manifest_paths,
+    partition_blocking_removals,
+    preview_update,
+    remove_obsolete_snapshot_files,
+    repair,
+)
 from model_mirror.payload import UnsafePayloadError
 from model_mirror.state import VerificationState, read_verification_state, write_verification_state
 
@@ -461,6 +467,200 @@ def test_repair_update_applies_changed_upstream_commit(tmp_path):
     assert snapshot.resolved_commit == "newcommit"
     assert snapshot.requested_revision == "main"
     assert [item.path for item in snapshot.files] == ["config.json", "file.bin"]
+
+
+def test_preview_update_reports_add_change_remove_and_reuse_without_writes(tmp_path):
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    current = HubSnapshot(
+        "org/model",
+        "model",
+        "main",
+        "oldcommit",
+        [
+            FakeFile("changed.bin", 3, lfs_sha256="old"),
+            FakeFile("removed.bin", 4, blob_id="removed"),
+            FakeFile("same.bin", 5, lfs_sha256="same"),
+        ],
+    )
+    write_snapshot_plan(archive, current)
+    write_verification_state(
+        archive,
+        VerificationState(
+            status="clean",
+            repo_id="org/model",
+            requested_revision="main",
+            resolved_commit="oldcommit",
+            upstream_commit="newcommit",
+            upstream_status="changed",
+        ),
+    )
+    before = (archive / ".model-mirror" / "snapshot.json").read_bytes()
+    hub = FakeHub(
+        [],
+        metadata_by_revision={
+            "newcommit": [
+                FakeFile("added.bin", 2, blob_id="added"),
+                FakeFile("changed.bin", 6, lfs_sha256="new"),
+                FakeFile("same.bin", 5, lfs_sha256="same"),
+            ]
+        },
+    )
+
+    plan = preview_update(Config(directory=tmp_path), "org/model", hub=hub)
+
+    assert [item.path for item in plan.added] == ["added.bin"]
+    assert [item.new.path for item in plan.changed] == ["changed.bin"]
+    assert [item.path for item in plan.removed] == ["removed.bin"]
+    assert [item.path for item in plan.unchanged] == ["same.bin"]
+    assert plan.current_bytes == 12
+    assert plan.target_bytes == 13
+    assert plan.candidate_download_bytes == 8
+    assert (archive / ".model-mirror" / "snapshot.json").read_bytes() == before
+    assert hub.downloads == []
+
+
+def test_preview_update_requires_usable_changed_upstream_state(tmp_path):
+    config = Config(directory=tmp_path)
+
+    with pytest.raises(ValueError, match="verification state unavailable"):
+        preview_update(config, "org/missing", hub=FakeHub([]))
+
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    write_verification_state(
+        archive,
+        VerificationState(status="clean", repo_id="org/model", offline_only=True),
+    )
+    with pytest.raises(ValueError, match="offline-only"):
+        preview_update(config, "org/model", hub=FakeHub([]))
+
+    write_verification_state(
+        archive,
+        VerificationState(status="clean", repo_id="org/model", resolved_commit="old"),
+    )
+    with pytest.raises(ValueError, match="no changed upstream commit"):
+        preview_update(config, "org/model", hub=FakeHub([]))
+
+
+def test_preview_update_fetches_old_commit_when_snapshot_plan_is_missing(tmp_path):
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    write_verification_state(
+        archive,
+        VerificationState(
+            status="clean",
+            repo_id="org/model",
+            requested_revision="main",
+            resolved_commit="old",
+            upstream_commit="new",
+            upstream_status="changed",
+        ),
+    )
+    hub = FakeHub(
+        [],
+        metadata_by_revision={
+            "old": [FakeFile("old.bin", 1, blob_id="old")],
+            "new": [FakeFile("new.bin", 2, blob_id="new")],
+        },
+    )
+
+    plan = preview_update(Config(directory=tmp_path), "org/model", hub=hub)
+
+    assert [item.path for item in plan.removed] == ["old.bin"]
+    assert [item.path for item in plan.added] == ["new.bin"]
+
+
+def test_obsolete_snapshot_removal_handles_symlink_missing_parent_and_directory(tmp_path):
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"keep")
+    (tmp_path / "link.bin").symlink_to(outside)
+    empty_parent = tmp_path / "empty"
+    empty_parent.mkdir()
+
+    remove_obsolete_snapshot_files(
+        tmp_path,
+        [FakeFile("link.bin", 1), FakeFile("empty/missing.bin", 1)],
+    )
+
+    assert outside.read_bytes() == b"keep"
+    assert not (tmp_path / "link.bin").exists()
+    assert not empty_parent.exists()
+
+    nonempty_parent = tmp_path / "nonempty"
+    nonempty_parent.mkdir()
+    (nonempty_parent / "remove.bin").write_bytes(b"x")
+    (nonempty_parent / "keep.bin").write_bytes(b"x")
+    remove_obsolete_snapshot_files(
+        tmp_path,
+        [FakeFile("nonempty/remove.bin", 1)],
+    )
+    assert (nonempty_parent / "keep.bin").exists()
+
+    (tmp_path / "directory.bin").mkdir()
+    with pytest.raises(ValueError, match="not a regular file"):
+        remove_obsolete_snapshot_files(
+            tmp_path,
+            [FakeFile("directory.bin", 1)],
+        )
+
+
+def test_partition_blocking_removals_detects_file_directory_shape_changes():
+    removed = [
+        FakeFile("old.bin", 1),
+        FakeFile("parent", 1),
+        FakeFile("nested/file.bin", 1),
+    ]
+    target = [
+        FakeFile("parent/file.bin", 1),
+        FakeFile("nested", 1),
+        FakeFile("new.bin", 1),
+    ]
+
+    blocking, deferred = partition_blocking_removals(removed, target)
+
+    assert [item.path for item in blocking] == ["parent", "nested/file.bin"]
+    assert [item.path for item in deferred] == ["old.bin"]
+
+
+def test_repair_update_removes_only_paths_obsolete_in_pinned_snapshot(tmp_path):
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    (archive / "removed.bin").write_bytes(b"old")
+    (archive / "untracked.bin").write_bytes(b"keep")
+    write_snapshot_plan(
+        archive,
+        HubSnapshot(
+            "org/model",
+            "model",
+            "main",
+            "oldcommit",
+            [FakeFile("removed.bin", 3), FakeFile("kept.bin", 3)],
+        ),
+    )
+    write_verification_state(
+        archive,
+        VerificationState(
+            status="clean",
+            repo_id="org/model",
+            requested_revision="main",
+            resolved_commit="oldcommit",
+            upstream_commit="newcommit",
+            upstream_status="changed",
+        ),
+    )
+    hub = FakeHub([], metadata_by_revision={"newcommit": [FakeFile("kept.bin", 3)]})
+
+    result = repair(
+        Config(directory=tmp_path, checksum=False),
+        "org/model",
+        hub=hub,
+        update=True,
+    )
+
+    assert result.status == "updated"
+    assert not (archive / "removed.bin").exists()
+    assert (archive / "untracked.bin").read_bytes() == b"keep"
 
 
 def test_repair_update_does_not_publish_clean_state_before_snapshot_plan(tmp_path, monkeypatch):

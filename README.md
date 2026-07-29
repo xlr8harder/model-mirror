@@ -156,6 +156,7 @@ model-mirror verify org/model
 model-mirror verify --cached org/model
 model-mirror verify --offline org/model
 model-mirror verify --strict org/model
+model-mirror verify --progress org/model
 model-mirror verify --all
 model-mirror verify --all --max-age 7d
 ```
@@ -168,6 +169,13 @@ whether the upstream repo has moved to a newer commit. Full offline verification
 requires an existing `.manifest`; `--offline --cached` only reports the current
 `.verification` state. `--max-age` is useful for periodic jobs that should skip
 recently verified clean mirrors.
+
+Every completed verification reports the number and total size of files checked,
+the payload bytes actually hashed, and elapsed time. Live aggregate hash
+progress is shown once per second on an interactive terminal. Use `--progress`
+to force it when output is redirected, or `--no-progress` to suppress it.
+Progress is written to stderr so the final result on stdout remains easy to
+capture.
 
 Failed verification prints categorized paths for missing files, size
 mismatches, hash mismatches, unavailable cached hashes, unexpected files, and
@@ -381,12 +389,24 @@ Repair and update are deliberately separate operations:
 - `repair --update` explicitly moves the mirror to the changed upstream commit
   recorded by `verify`.
 
-Updating one or all changed mirrors is therefore explicit:
+Previewing and applying an update are therefore explicit:
 
 ```bash
+model-mirror repair --update --dry-run org/model
+model-mirror repair --update --dry-run --verbose org/model
 model-mirror repair --update org/model
+model-mirror repair --all --update --dry-run
 model-mirror repair --all --update
 ```
+
+The dry-run is advisory and does not download files or change local mirror
+metadata. It compares the pinned and recorded target commits and reports added,
+changed, removed, and byte-identical reusable paths, payload-size change, and
+candidate download bytes. It also reports removed-file and removed-byte
+percentages. A normal preview caps very long path groups and prints the exact
+`--verbose` command for the complete inventory. Applying the update removes
+only obsolete paths from the old pinned snapshot; unrelated local extras are
+left alone.
 
 Use `model-mirror mirror --commit abc123 org/model` when you want a reproducible
 archive pinned to an exact Hub revision.
@@ -397,9 +417,12 @@ archive pinned to an exact Hub revision.
 model-mirror mirror org/model              # download and verify
 model-mirror mirror --no-verify org/model  # download without final verification
 model-mirror verify org/model              # full verification
+model-mirror verify --progress org/model   # force live hash progress
 model-mirror verify --cached org/model     # use current .manifest hashes
 model-mirror repair org/model              # redownload paths from .verification
 model-mirror repair --all                  # repair all mirrors with recorded repair paths
+model-mirror repair --update --dry-run org/model  # preview a recorded upstream change
+model-mirror repair --update --dry-run --verbose org/model  # show every affected path
 model-mirror repair --update org/model     # apply a changed upstream commit recorded by verify
 model-mirror offline org/model             # local verification only; no Hub checks
 model-mirror online org/model              # re-enable Hub checks

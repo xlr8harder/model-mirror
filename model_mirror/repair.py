@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from .checksums import load_manifest, update_checksums, write_checksums
+from .checksums import load_manifest, remove_checksum_paths, update_checksums, write_checksums
 from .config import Config, archive_path
 from .hub import (
+    HubFile,
     HuggingFaceHub,
     HubSnapshot,
     cached_manifest_verifies,
@@ -27,6 +28,130 @@ class RepairResult:
     upstream_status: str = "unknown"
     resolved_commit: str = ""
     upstream_commit: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class UpdateChange:
+    old: HubFile
+    new: HubFile
+
+
+@dataclass(slots=True)
+class UpdatePlan:
+    repo_id: str
+    repo_type: str
+    current_commit: str
+    target_commit: str
+    added: list[HubFile] = field(default_factory=list)
+    changed: list[UpdateChange] = field(default_factory=list)
+    removed: list[HubFile] = field(default_factory=list)
+    unchanged: list[HubFile] = field(default_factory=list)
+
+    @property
+    def current_files(self) -> int:
+        return len(self.removed) + len(self.changed) + len(self.unchanged)
+
+    @property
+    def target_files(self) -> int:
+        return len(self.added) + len(self.changed) + len(self.unchanged)
+
+    @property
+    def current_bytes(self) -> int:
+        return sum_known_sizes(
+            [*self.removed, *(item.old for item in self.changed), *self.unchanged]
+        )
+
+    @property
+    def target_bytes(self) -> int:
+        return sum_known_sizes(
+            [*self.added, *(item.new for item in self.changed), *self.unchanged]
+        )
+
+    @property
+    def candidate_download_bytes(self) -> int:
+        return sum_known_sizes([*self.added, *(item.new for item in self.changed)])
+
+    @property
+    def removed_bytes(self) -> int:
+        return sum_known_sizes(self.removed)
+
+
+def preview_update(
+    config: Config,
+    repo_id: str,
+    *,
+    hub=None,
+    repo_type: str | None = None,
+    revision: str | None = None,
+) -> UpdatePlan:
+    selected_type = repo_type or config.repo_type
+    selected_revision = revision or config.revision
+    selected_hub = hub or HuggingFaceHub(config)
+    root = archive_path(config, repo_id, selected_type)
+    state = read_audit_state(root)
+    if state is None:
+        raise ValueError(f"verification state unavailable; run: model-mirror verify {repo_id}")
+    if state.offline_only:
+        raise ValueError("mirror is offline-only; an upstream update cannot be previewed")
+    if (
+        state.upstream_status != "changed"
+        or not state.resolved_commit
+        or not state.upstream_commit
+    ):
+        raise ValueError(
+            f"no changed upstream commit is recorded; run: model-mirror verify {repo_id}"
+        )
+
+    current = read_snapshot_plan(root)
+    if current is None or current.resolved_commit != state.resolved_commit:
+        current = snapshot_for_requested_revision(
+            get_snapshot(selected_hub, repo_id, selected_type, state.resolved_commit),
+            state.requested_revision or selected_revision,
+        )
+    target = snapshot_for_requested_revision(
+        get_snapshot(selected_hub, repo_id, selected_type, state.upstream_commit),
+        state.requested_revision or selected_revision,
+    )
+    return build_update_plan(current, target)
+
+
+def build_update_plan(current: HubSnapshot, target: HubSnapshot) -> UpdatePlan:
+    current_files = {metadata_path(item): item for item in current.files}
+    target_files = {metadata_path(item): item for item in target.files}
+    plan = UpdatePlan(
+        repo_id=target.repo_id,
+        repo_type=target.repo_type,
+        current_commit=current.resolved_commit,
+        target_commit=target.resolved_commit,
+    )
+    for rel in sorted(current_files.keys() | target_files.keys()):
+        old = current_files.get(rel)
+        new = target_files.get(rel)
+        if old is None:
+            plan.added.append(new)
+        elif new is None:
+            plan.removed.append(old)
+        elif reusable_file_identity(old, new):
+            plan.unchanged.append(new)
+        else:
+            plan.changed.append(UpdateChange(old=old, new=new))
+    return plan
+
+
+def reusable_file_identity(old: HubFile, new: HubFile) -> bool:
+    if metadata_size(old) != metadata_size(new):
+        return False
+    old_lfs = metadata_lfs_sha256(old)
+    new_lfs = metadata_lfs_sha256(new)
+    if old_lfs is not None or new_lfs is not None:
+        return old_lfs is not None and old_lfs == new_lfs
+    old_blob = metadata_blob_id(old)
+    new_blob = metadata_blob_id(new)
+    return old_blob is not None and old_blob == new_blob
+
+
+def sum_known_sizes(files) -> int:
+    return sum(size for item in files if (size := metadata_size(item)) is not None)
 
 
 def repair(
@@ -238,11 +363,23 @@ def update_to_upstream(
     requested_revision = state.requested_revision or selected_revision
     target_revision = state.upstream_commit
     root.mkdir(parents=True, exist_ok=True)
+    current_snapshot = read_snapshot_plan(root)
     snapshot = snapshot_for_requested_revision(
         get_snapshot(selected_hub, repo_id, selected_type, target_revision),
         requested_revision,
     )
+    removed_files = []
+    if current_snapshot is not None and current_snapshot.resolved_commit == state.resolved_commit:
+        removed_files = build_update_plan(current_snapshot, snapshot).removed
+    blocking_removed, deferred_removed = partition_blocking_removals(
+        removed_files,
+        snapshot.files,
+    )
+    remove_obsolete_snapshot_files(root, blocking_removed)
+    remove_checksum_paths(root, [metadata_path(item) for item in blocking_removed])
     download_snapshot(selected_hub, snapshot, root)
+    remove_obsolete_snapshot_files(root, deferred_removed)
+    remove_checksum_paths(root, [metadata_path(item) for item in deferred_removed])
     checksums_available = cached_manifest_verifies(root, snapshot.files)
     if config.checksum and not checksums_available:
         write_checksums(root, max_workers=config.checksum_workers)
@@ -264,6 +401,48 @@ def update_to_upstream(
     persist_repair_state(root, snapshot, final_state)
     status = repair_status(final_state, success="updated")
     return repair_result(status, root, [], final_state)
+
+
+def remove_obsolete_snapshot_files(root: Path, files: list[HubFile]) -> None:
+    for item in files:
+        rel = metadata_path(item)
+        target = root / rel
+        validate_payload_parent(root, target, rel)
+        if target.is_symlink():
+            target.unlink()
+        elif target.exists():
+            if not target.is_file():
+                raise ValueError(f"obsolete payload path is not a regular file: {rel}")
+            target.unlink()
+        prune_empty_payload_parents(target.parent, root)
+
+
+def partition_blocking_removals(
+    removed: list[HubFile],
+    target: list[HubFile],
+) -> tuple[list[HubFile], list[HubFile]]:
+    target_paths = [metadata_path(item) for item in target]
+    blocking = []
+    deferred = []
+    for item in removed:
+        rel = metadata_path(item)
+        if any(
+            candidate.startswith(f"{rel}/") or rel.startswith(f"{candidate}/")
+            for candidate in target_paths
+        ):
+            blocking.append(item)
+        else:
+            deferred.append(item)
+    return blocking, deferred
+
+
+def prune_empty_payload_parents(path: Path, root: Path) -> None:
+    while path != root:
+        try:
+            path.rmdir()
+        except OSError:
+            return
+        path = path.parent
 
 
 def reconcile_snapshot_plan(

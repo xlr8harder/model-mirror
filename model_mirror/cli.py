@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -31,7 +32,7 @@ from .hub import HuggingFaceHub, get_snapshot, read_snapshot_plan
 from .lock import ModelBusyError, ModelLock, lock_label, read_active_lock
 from .mirror import mirror
 from .progress import ProgressEntry, ProgressSnapshot, progress_snapshot
-from .repair import repair
+from .repair import UpdatePlan, preview_update, repair
 from .removal import (
     REMOVALS_DIR,
     RemovalRecord,
@@ -262,6 +263,12 @@ def build_parser() -> argparse.ArgumentParser:
     verify_parser.add_argument("--strict", action="store_true", help="fail on extra local files")
     verify_parser.add_argument("--max-age", help="with --all, skip clean archives verified within this age, e.g. 7d")
     verify_parser.add_argument("--offline", action="store_true", help="verify only against local checksum state")
+    verify_parser.add_argument(
+        "--progress",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="show live hash progress on stderr; defaults to enabled in an interactive terminal",
+    )
 
     repair_parser = add_command_parser(
         "repair",
@@ -282,6 +289,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--update",
         action="store_true",
         help="apply upstream commit changes recorded by verify before repairing",
+    )
+    repair_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="with --update, show commits and added, changed, removed, and reusable files without changing the mirror",
+    )
+    repair_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="with --update --dry-run, print every affected path instead of capping long groups",
     )
     repair_parser.add_argument(
         "--force-partial",
@@ -1861,6 +1878,30 @@ def format_bytes(size: int) -> str:
         value /= 1024
 
 
+def format_duration(seconds: float) -> str:
+    if seconds < 0.1:
+        return "<0.1s"
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, whole_seconds = divmod(int(seconds), 60)
+    if minutes < 60:
+        return f"{minutes}m{whole_seconds:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
+
+
+def verification_metrics(
+    result: RemoteVerifyResult,
+    *,
+    bytes_hashed: int,
+    duration: float,
+) -> str:
+    return (
+        f"files={result.files_checked} size={format_bytes(result.bytes_checked)} "
+        f"hashed={format_bytes(bytes_hashed)} duration={format_duration(duration)}"
+    )
+
+
 def format_optional_bytes(size: int | None) -> str:
     return format_bytes(size) if size is not None else "unknown"
 
@@ -2012,7 +2053,8 @@ def handle_verify(args, config: Config, *, hub=None) -> int:
         if cache_incomplete:
             print("cached verification incomplete: run full verification with model-mirror verify --all")
         if changed:
-            print("update changed upstreams: model-mirror repair --all --update")
+            print("preview changed upstreams: model-mirror repair --all --update --dry-run")
+            print("apply changed upstreams: model-mirror repair --all --update")
         return 1 if failures else 0
 
     if not args.model:
@@ -2023,6 +2065,12 @@ def handle_verify(args, config: Config, *, hub=None) -> int:
 def handle_repair(args, config: Config, *, hub=None) -> int:
     if args.all and args.model:
         raise SystemExit("repair accepts a model id or --all, not both")
+    if args.dry_run and not args.update:
+        raise SystemExit("repair --dry-run requires --update")
+    if args.dry_run and args.force_partial:
+        raise SystemExit("repair --update --dry-run cannot be combined with --force-partial")
+    if args.verbose and not args.dry_run:
+        raise SystemExit("repair --verbose requires --update --dry-run")
     if args.all:
         failures = 0
         for repo_id in list_model_ids(config):
@@ -2297,6 +2345,23 @@ def state_has_upstream_unavailable(state) -> bool:
 
 def repair_one(config: Config, repo_id: str, args, *, hub=None) -> int:
     selected_hub = hub or HuggingFaceHub(config)
+    if args.dry_run:
+        state = read_verification_state(archive_path(config, repo_id, args.repo_type))
+        if state is not None and state.upstream_status != "changed":
+            print(f"no recorded upstream update: {repo_id}")
+            return 0
+        try:
+            plan = preview_update(
+                config,
+                repo_id,
+                hub=selected_hub,
+                repo_type=args.repo_type,
+            )
+        except (OSError, ValueError, RuntimeError) as exc:
+            print(f"update preview unavailable: {repo_id} -> {exc}")
+            return 1
+        print_update_plan(plan, verbose=args.verbose)
+        return 0
     print_verification_age(config, repo_id, args.repo_type)
     if args.force_partial:
         print(
@@ -2327,11 +2392,166 @@ def repair_one(config: Config, repo_id: str, args, *, hub=None) -> int:
     return 0 if result.status in {"complete", "repaired", "updated"} else 1
 
 
+def print_update_plan(plan: UpdatePlan, *, verbose: bool = False) -> None:
+    print(f"update preview: {plan.repo_id}")
+    print(f"commit: {plan.current_commit} -> {plan.target_commit}")
+    print(
+        f"files: {plan.current_files} -> {plan.target_files} "
+        f"(add={len(plan.added)} change={len(plan.changed)} "
+        f"remove={len(plan.removed)} reuse={len(plan.unchanged)})"
+    )
+    delta = plan.target_bytes - plan.current_bytes
+    sign = "+" if delta >= 0 else "-"
+    print(
+        f"payload: {format_bytes(plan.current_bytes)} -> {format_bytes(plan.target_bytes)} "
+        f"({sign}{format_bytes(abs(delta))})"
+    )
+    print(
+        f"download candidates: {len(plan.added) + len(plan.changed)} files "
+        f"{format_bytes(plan.candidate_download_bytes)}; "
+        f"remove: {len(plan.removed)} files {format_bytes(plan.removed_bytes)}"
+    )
+    if plan.removed:
+        file_percent = 100 * len(plan.removed) / plan.current_files
+        byte_percent = (
+            100 * plan.removed_bytes / plan.current_bytes
+            if plan.current_bytes
+            else 0.0
+        )
+        print(
+            f"removal impact: {len(plan.removed)}/{plan.current_files} files "
+            f"({file_percent:.1f}%), {format_bytes(plan.removed_bytes)}/"
+            f"{format_bytes(plan.current_bytes)} ({byte_percent:.1f}%)"
+        )
+    complete_command = (
+        f"model-mirror repair --update --dry-run --verbose {plan.repo_id}"
+    )
+    limit = None if verbose else 20
+    print_update_plan_group(
+        "add",
+        [(item.path, format_optional_bytes(item.size)) for item in plan.added],
+        limit=limit,
+        complete_command=complete_command,
+    )
+    print_update_plan_group(
+        "change",
+        [
+            (
+                item.new.path,
+                f"{format_optional_bytes(item.old.size)} -> {format_optional_bytes(item.new.size)}",
+            )
+            for item in plan.changed
+        ],
+        limit=limit,
+        complete_command=complete_command,
+    )
+    print_update_plan_group(
+        "remove",
+        [(item.path, format_optional_bytes(item.size)) for item in plan.removed],
+        limit=limit,
+        complete_command=complete_command,
+    )
+    print(f"apply: model-mirror repair --update {plan.repo_id}")
+
+
+def print_update_plan_group(
+    label: str,
+    values: list[tuple[str, str]],
+    *,
+    limit: int | None = 20,
+    complete_command: str | None = None,
+) -> None:
+    if not values:
+        return
+    print(f"{label} ({len(values)}):")
+    visible = values if limit is None else values[:limit]
+    for path, detail in visible:
+        print(f"  {path} ({detail})")
+    if limit is not None and len(values) > limit:
+        suffix = f"; complete list: {complete_command}" if complete_command else ""
+        print(f"  ... {len(values) - limit} more{suffix}")
+
+
 def verify_one(config: Config, repo_id: str, args, *, hub=None) -> int:
     selected_hub = hub or HuggingFaceHub(config)
     root = archive_path(config, repo_id, args.repo_type)
     with ModelLock(root, "verify", repo_id, args.repo_type):
         return verify_one_locked(config, repo_id, args, selected_hub, root)
+
+
+class VerificationProgress:
+    def __init__(self, repo_id: str, metadata, *, enabled: bool):
+        self.repo_id = repo_id
+        self.enabled = enabled
+        self.total_files = len(metadata)
+        self.total_bytes = sum(
+            item.size for item in metadata if getattr(item, "size", None) is not None
+        )
+        self.started = time.monotonic()
+        self.last_emit = self.started
+        self.bytes_hashed = 0
+        self.file_bytes: dict[str, int] = {}
+        self.completed_paths: set[str] = set()
+        self.current_path = ""
+        self.tty = sys.stderr.isatty()
+        self.line_open = False
+        self.lock = threading.Lock()
+
+    def callback(self, phase: str):
+        if not self.enabled:
+            return None
+        return lambda rel, done, total: self.update(phase, rel, done, total)
+
+    def update(self, phase: str, rel: str, done: int, total: int) -> None:
+        if not self.enabled:
+            return
+        with self.lock:
+            key = f"{phase}:{rel}"
+            previous = self.file_bytes.get(key, 0)
+            if done < previous:
+                previous = 0
+            self.file_bytes[key] = done
+            self.bytes_hashed += max(0, done - previous)
+            self.current_path = rel
+            if done >= total:
+                self.completed_paths.add(rel)
+            now = time.monotonic()
+            if now - self.last_emit >= 1.0:
+                self._emit(now)
+
+    def finish(self) -> None:
+        if not self.enabled:
+            return
+        with self.lock:
+            self._emit(time.monotonic(), force=True)
+            if self.tty and self.line_open:
+                print(file=sys.stderr)
+                self.line_open = False
+
+    def _emit(self, now: float, *, force: bool = False) -> None:
+        if not force and now - self.last_emit < 1.0:
+            return
+        elapsed = max(0.0, now - self.started)
+        rate = int(self.bytes_hashed / elapsed) if elapsed > 0 else 0
+        current = f" current={self.current_path}" if self.current_path else ""
+        message = (
+            f"verify progress: {self.repo_id} "
+            f"files={len(self.completed_paths)}/{self.total_files} "
+            f"hashed={format_bytes(self.bytes_hashed)}/{format_bytes(self.total_bytes)} "
+            f"elapsed={format_duration(elapsed)} rate={format_bytes(rate)}/s{current}"
+        )
+        if self.tty:
+            print(f"\r{message}", end="", file=sys.stderr, flush=True)
+            self.line_open = True
+        else:
+            print(message, file=sys.stderr, flush=True)
+        self.last_emit = now
+
+
+def verification_progress_enabled(args) -> bool:
+    if args.progress is not None:
+        return args.progress
+    return sys.stderr.isatty()
 
 
 def verify_one_locked(config: Config, repo_id: str, args, selected_hub, root: Path) -> int:
@@ -2357,25 +2577,55 @@ def verify_one_locked(config: Config, repo_id: str, args, selected_hub, root: Pa
     except Exception as exc:
         return handle_upstream_unavailable(root, repo_id, args, existing_state, requested_revision, exc)
     metadata = snapshot.files
+    progress = VerificationProgress(
+        repo_id,
+        metadata,
+        enabled=verification_progress_enabled(args),
+    )
+    started = time.monotonic()
+    bytes_hashed = 0
     checksum_result = None
     manifest_verified = False
-    if not args.cached and config.checksum:
-        if (root / MANIFEST).exists():
-            checksum_result = verify_checksums(root, strict=args.strict)
-            if checksum_result.ok:
-                write_checksums(root, max_workers=config.checksum_workers)
+    try:
+        if not args.cached and config.checksum:
+            if (root / MANIFEST).exists():
+                checksum_result = verify_checksums(
+                    root,
+                    strict=args.strict,
+                    on_progress=progress.callback("manifest"),
+                )
+                bytes_hashed += checksum_result.bytes_checked
+                if checksum_result.ok:
+                    write_result = write_checksums(
+                        root,
+                        max_workers=config.checksum_workers,
+                        on_progress=progress.callback("manifest-refresh"),
+                    )
+                    bytes_hashed += write_result.bytes_hashed
+                    manifest_verified = True
+            else:
+                write_result = write_checksums(
+                    root,
+                    max_workers=config.checksum_workers,
+                    on_progress=progress.callback("manifest-create"),
+                )
+                bytes_hashed += write_result.bytes_hashed
                 manifest_verified = True
-        else:
-            write_checksums(root, max_workers=config.checksum_workers)
-            manifest_verified = True
-    from_manifest = args.cached or manifest_verified
-    result = verify_remote(
-        root,
-        metadata,
-        cached=args.cached,
-        from_manifest=from_manifest,
-        strict=args.strict,
-    )
+        from_manifest = args.cached or manifest_verified or (
+            checksum_result is not None and (root / MANIFEST).exists()
+        )
+        result = verify_remote(
+            root,
+            metadata,
+            cached=args.cached,
+            from_manifest=from_manifest,
+            strict=args.strict,
+            on_progress=progress.callback("upstream"),
+        )
+        bytes_hashed += result.bytes_hashed
+    finally:
+        progress.finish()
+    duration = time.monotonic() - started
     if checksum_result is not None:
         merge_checksum_result(result, checksum_result)
     state = state_from_results(
@@ -2390,19 +2640,32 @@ def verify_one_locked(config: Config, repo_id: str, args, selected_hub, root: Pa
 
     if state.status == "incomplete":
         print(f"cached verification incomplete: {repo_id}{upstream_change_suffix(state)}")
-        print_verification_details(repo_id, result)
+        print_verification_details(
+            repo_id,
+            result,
+            bytes_hashed=bytes_hashed,
+            duration=duration,
+        )
         print(f"run full verification: model-mirror verify {repo_id}")
         if state.upstream_status == "changed":
             print_update_next_step(repo_id)
         return 1
     if result.ok:
         mode = "cached" if args.cached else "full"
-        print(f"verified ({mode}): {repo_id}{upstream_change_suffix(state)}")
+        print(
+            f"verified ({mode}): {repo_id}{upstream_change_suffix(state)} "
+            f"{verification_metrics(result, bytes_hashed=bytes_hashed, duration=duration)}"
+        )
         if state.upstream_status == "changed":
             print_update_next_step(repo_id)
         return 0
     print(f"verification failed: {repo_id}{upstream_change_suffix(state)}")
-    print_verification_details(repo_id, result)
+    print_verification_details(
+        repo_id,
+        result,
+        bytes_hashed=bytes_hashed,
+        duration=duration,
+    )
     print_verification_next_steps(repo_id, state)
     return 1
 
@@ -2418,9 +2681,21 @@ def print_verification_next_steps(repo_id: str, state) -> None:
         print_update_next_step(repo_id)
 
 
-def print_verification_details(repo_id: str, result: RemoteVerifyResult) -> None:
+def print_verification_details(
+    repo_id: str,
+    result: RemoteVerifyResult,
+    *,
+    bytes_hashed: int = 0,
+    duration: float | None = None,
+) -> None:
+    metrics = (
+        f" size={format_bytes(result.bytes_checked)} hashed={format_bytes(bytes_hashed)}"
+        if duration is not None
+        else ""
+    )
+    elapsed = f" duration={format_duration(duration)}" if duration is not None else ""
     print(
-        f"checked: files={result.files_checked} hashes={result.hashes_checked}"
+        f"checked: files={result.files_checked} hashes={result.hashes_checked}{metrics}{elapsed}"
     )
     groups = [
         ("missing", result.missing),
@@ -2449,7 +2724,8 @@ def print_verification_issue_group(repo_id: str, label: str, values: list[str], 
 
 
 def print_update_next_step(repo_id: str) -> None:
-    print(f"update changed upstream: model-mirror repair --update {repo_id}")
+    print(f"preview upstream update: model-mirror repair --update --dry-run {repo_id}")
+    print(f"apply upstream update: model-mirror repair --update {repo_id}")
 
 
 def print_repair_commit_notice(repo_id: str, result) -> None:
@@ -2472,8 +2748,27 @@ def verify_one_offline(config: Config, root: Path, repo_id: str, args, existing_
         write_verification_state(root, state)
         print(f"{mode} verification incomplete: {repo_id} missing {MANIFEST}")
         return 1
-    result = verify_checksums(root, strict=args.strict)
+    snapshot = read_snapshot_plan(root)
+    progress = VerificationProgress(
+        repo_id,
+        snapshot.files if snapshot is not None else [],
+        enabled=verification_progress_enabled(args),
+    )
+    started = time.monotonic()
+    try:
+        result = verify_checksums(
+            root,
+            strict=args.strict,
+            on_progress=progress.callback("offline"),
+        )
+    finally:
+        progress.finish()
+    duration = time.monotonic() - started
     remote_result = RemoteVerifyResult(
+        files_checked=result.checked,
+        bytes_checked=result.bytes_checked,
+        hashes_checked=result.checked,
+        bytes_hashed=result.bytes_checked,
         missing=result.missing,
         hash_mismatches=result.failures,
         unsafe_paths=result.unsafe,
@@ -2490,9 +2785,18 @@ def verify_one_offline(config: Config, root: Path, repo_id: str, args, existing_
     )
     write_verification_state(root, state)
     if result.ok:
-        print(f"verified ({mode} full): {repo_id}")
+        print(
+            f"verified ({mode} full): {repo_id} "
+            f"{verification_metrics(remote_result, bytes_hashed=result.bytes_checked, duration=duration)}"
+        )
         return 0
     print(f"{mode} verification failed: {repo_id}")
+    print_verification_details(
+        repo_id,
+        remote_result,
+        bytes_hashed=result.bytes_checked,
+        duration=duration,
+    )
     if existing_state.offline_only:
         print(f"repair unavailable for offline-only model: {repo_id}")
     else:

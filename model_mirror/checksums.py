@@ -34,6 +34,7 @@ SKIP_FILES = {
 @dataclass(slots=True)
 class ChecksumResult:
     checked: int = 0
+    bytes_checked: int = 0
     missing: list[str] = field(default_factory=list)
     failures: list[str] = field(default_factory=list)
     unsafe: list[str] = field(default_factory=list)
@@ -48,6 +49,7 @@ class ChecksumResult:
 class ChecksumWriteResult:
     total: int = 0
     hashed: int = 0
+    bytes_hashed: int = 0
     skipped: int = 0
     removed: int = 0
 
@@ -208,7 +210,12 @@ def file_hashes(
     return FileHashes(sha256=digest.hexdigest(), git_blob_sha1=blob_digest.hexdigest())
 
 
-def write_checksums(root: Path, *, max_workers: int = 1) -> ChecksumWriteResult:
+def write_checksums(
+    root: Path,
+    *,
+    max_workers: int = 1,
+    on_progress: Callable[[str, int, int], None] | None = None,
+) -> ChecksumWriteResult:
     manifest = load_manifest(root)
     payload_files = list(iter_payload_files(root))
     current_paths = {path.relative_to(root).as_posix() for path in payload_files}
@@ -235,18 +242,23 @@ def write_checksums(root: Path, *, max_workers: int = 1) -> ChecksumWriteResult:
     workers = max(1, max_workers)
     if workers == 1:
         for path in work:
-            row = checksum_row(root, path)
+            row = checksum_row(root, path, on_progress=on_progress)
             manifest[row["path"]] = row
             result.hashed += 1
+            result.bytes_hashed += row["size"]
             write_manifest(root, manifest)
         return result
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = [executor.submit(checksum_row, root, path) for path in work]
+        futures = [
+            executor.submit(checksum_row, root, path, on_progress=on_progress)
+            for path in work
+        ]
         for future in as_completed(futures):
             row = future.result()
             manifest[row["path"]] = row
             result.hashed += 1
+            result.bytes_hashed += row["size"]
             write_manifest(root, manifest)
     return result
 
@@ -262,9 +274,20 @@ def record_is_current(row: dict | None, size: int, mtime_ns: int) -> bool:
     )
 
 
-def checksum_row(root: Path, path: Path) -> dict:
-    validate_payload_file(root, path, path.relative_to(root).as_posix())
-    hashes = file_hashes(path)
+def checksum_row(
+    root: Path,
+    path: Path,
+    *,
+    on_progress: Callable[[str, int, int], None] | None = None,
+) -> dict:
+    rel = path.relative_to(root).as_posix()
+    validate_payload_file(root, path, rel)
+    total = path.stat().st_size
+    hashes = (
+        file_hashes(path, on_progress=lambda done: on_progress(rel, done, total))
+        if on_progress is not None
+        else file_hashes(path)
+    )
     return checksum_row_from_hashes(root, path, hashes)
 
 
@@ -333,6 +356,18 @@ def update_checksums(root: Path, paths: list[str], *, max_workers: int = 1) -> C
     return result
 
 
+def remove_checksum_paths(root: Path, paths: list[str]) -> int:
+    manifest = load_manifest(root)
+    removed = 0
+    for rel in paths:
+        rel = validate_payload_path(rel)
+        if manifest.pop(rel, None) is not None:
+            removed += 1
+    if removed:
+        write_manifest(root, manifest)
+    return removed
+
+
 def load_manifest(root: Path) -> dict[str, dict]:
     manifest: dict[str, dict] = {}
     manifest_path = root / MANIFEST
@@ -370,7 +405,12 @@ def validate_manifest_header(row: dict, path: Path) -> None:
         raise ValueError(f"Unsupported manifest version in {path}: {row.get('version')}")
 
 
-def verify_checksums(root: Path, strict: bool = False) -> ChecksumResult:
+def verify_checksums(
+    root: Path,
+    strict: bool = False,
+    *,
+    on_progress: Callable[[str, int, int], None] | None = None,
+) -> ChecksumResult:
     manifest = load_manifest(root)
     if not manifest:
         return ChecksumResult()
@@ -387,7 +427,13 @@ def verify_checksums(root: Path, strict: bool = False) -> ChecksumResult:
             result.unsafe.append(rel)
             continue
         result.checked += 1
-        hashes = file_hashes(path)
+        total = path.stat().st_size
+        result.bytes_checked += total
+        hashes = (
+            file_hashes(path, on_progress=lambda done: on_progress(rel, done, total))
+            if on_progress is not None
+            else file_hashes(path)
+        )
         if hashes.sha256 != row.get("sha256") or hashes.git_blob_sha1 != row.get("git_blob_sha1"):
             result.failures.append(rel)
 

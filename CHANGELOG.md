@@ -5,10 +5,26 @@ matching version section into the corresponding GitHub Release.
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-07-29
+
+### Added
+
+- `repair --update --dry-run` previews the recorded commit transition, file and
+  payload-size deltas, candidate downloads, removals, and reusable files without
+  mutating the mirror. `--verbose` shows every affected path, and removal impact
+  is reported as both file and byte percentages.
+- Verification now reports file count, payload size, bytes hashed, and duration,
+  with automatic interactive progress plus explicit `--progress` and
+  `--no-progress` controls.
+
 ### Changed
 
 - `model-mirror list` is now a deprecated compatibility alias shown with
   `status` instead of appearing as a separate top-level command.
+- Verification output links changed upstreams to both preview and apply
+  commands.
+- Applying an upstream update removes paths made obsolete by the prior pinned
+  snapshot while preserving unrelated local extras.
 
 ## [0.2.2] - 2026-07-28
 

@@ -13,6 +13,7 @@ from model_mirror.checksums import (
     hash_file_prefix,
     load_manifest,
     record_is_current,
+    remove_checksum_paths,
     update_checksums,
     verify_checksums,
     write_checksums,
@@ -415,3 +416,14 @@ def test_load_manifest_ignores_blank_lines(tmp_path):
     manifest = load_manifest(tmp_path)
 
     assert manifest == {"a.txt": row}
+
+
+def test_remove_checksum_paths_rewrites_only_when_a_record_is_removed(tmp_path):
+    (tmp_path / "a.txt").write_text("a", encoding="utf-8")
+    write_checksums(tmp_path)
+    original = (tmp_path / ".manifest").read_bytes()
+
+    assert remove_checksum_paths(tmp_path, ["missing.txt"]) == 0
+    assert (tmp_path / ".manifest").read_bytes() == original
+    assert remove_checksum_paths(tmp_path, ["a.txt"]) == 1
+    assert load_manifest(tmp_path) == {}
