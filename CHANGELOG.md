@@ -5,6 +5,12 @@ matching version section into the corresponding GitHub Release.
 
 ## [Unreleased]
 
+### Changed
+
+- The README is now a concise installation and everyday-workflow entry point;
+  detailed archive operations, configuration/storage, and experimental torrent
+  guidance moved into focused documents under `docs/`.
+
 ## [0.2.3] - 2026-07-29
 
 ### Added

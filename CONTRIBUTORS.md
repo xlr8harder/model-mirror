@@ -1,7 +1,7 @@
 # Contributors
 
 This document holds implementation notes and development details. User-facing
-usage belongs in `README.md`.
+usage belongs in `README.md` and the guides under `docs/`.
 
 ## Development
 
