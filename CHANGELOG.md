@@ -10,6 +10,8 @@ matching version section into the corresponding GitHub Release.
 - The README is now a concise installation and everyday-workflow entry point;
   detailed archive operations, configuration/storage, and experimental torrent
   guidance moved into focused documents under `docs/`.
+- Added a repository-wide agent contract and consolidated detailed development
+  guidance in the conventional `CONTRIBUTING.md`.
 
 ## [0.2.3] - 2026-07-29
 

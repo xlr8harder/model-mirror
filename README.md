@@ -213,11 +213,11 @@ For development:
 ```bash
 git clone https://github.com/xlr8harder/model-mirror.git
 cd model-mirror
-uv sync --all-extras --dev
+uv sync --locked --all-extras --dev
 uv run coverage run -m pytest -q
 uv run coverage report -m
 ```
 
 Contributor and implementation details are in
-[CONTRIBUTORS.md](https://github.com/xlr8harder/model-mirror/blob/main/CONTRIBUTORS.md).
+[CONTRIBUTING.md](https://github.com/xlr8harder/model-mirror/blob/main/CONTRIBUTING.md).
 Model-mirror is licensed under the MIT License.
