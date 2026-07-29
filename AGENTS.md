@@ -117,8 +117,10 @@ Prefer one authoritative explanation with links over duplicated documentation.
 
 Do not silently change a versioned archive schema, JSON schema, publication
 profile, or torrent identity algorithm. Introduce and document a new version.
-Ordinary commits and pushes are not releases: do not bump the package version,
-create tags, or publish unless a release is explicitly requested.
+Commit every completed change so the repository remains the authoritative
+record of the work. A commit or push is not inherently a release: do not bump
+the package version, create tags, or publish unless a release is explicitly
+requested.
 
 ## Definition Of Done
 

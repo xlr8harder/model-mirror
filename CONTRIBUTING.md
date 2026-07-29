@@ -279,5 +279,7 @@ requires absolute GitHub URLs.
 - Update `uv.lock` whenever dependency metadata changes.
 - Record user-visible work under `[Unreleased]` in `CHANGELOG.md`.
 - Do not change versioned schemas or torrent identity behavior in place.
-- Ordinary pushes are not releases. Only bump versions, create tags, or publish
-  when a release is explicitly requested.
+- Commit every completed change; do not leave intended work only in the working
+  tree.
+- Commits and pushes are not inherently releases. Only bump versions, create
+  tags, or publish when a release is explicitly requested.
