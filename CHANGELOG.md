@@ -5,6 +5,8 @@ matching version section into the corresponding GitHub Release.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-04
+
 ### Added
 
 - Added a top-level, non-mutating `diff` command for inspecting a recorded
