@@ -185,9 +185,10 @@ download payload files or alter local mirror metadata. It reports:
 Normal output caps very long path groups and prints the exact `--verbose`
 command for the complete inventory. `--json` emits the versioned
 `model-mirror-diff` schema with complete added, changed, removed, and reusable
-path groups. The older `repair --update --dry-run` spelling remains available
-for compatibility. Applying the update removes only paths made obsolete by the
-prior pinned snapshot; unrelated local extras remain.
+path groups. The apply command is printed on its own indented line for direct
+copying. The older `repair --update --dry-run` spelling remains available for
+compatibility. Applying the update removes only paths made obsolete by the prior
+pinned snapshot; unrelated local extras remain.
 
 Use an exact commit when creating a reproducible fixed archive:
 

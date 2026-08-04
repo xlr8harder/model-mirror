@@ -680,6 +680,36 @@ def test_stream_snapshot_redownloads_corrupt_existing_file(tmp_path, monkeypatch
     assert load_manifest(local_dir)["file.bin"]["sha256"] == sha256(payload)
 
 
+def test_stream_snapshot_replaces_larger_existing_file_without_hashing_it_as_target(
+    tmp_path,
+    monkeypatch,
+):
+    payload = b"new"
+    snapshot = HubSnapshot(
+        "org/model",
+        "model",
+        "main",
+        "commit123",
+        [HubFile("README.md", len(payload), blob_id=git_blob_sha1(payload))],
+    )
+    local_dir = tmp_path / "models" / "org" / "model"
+    local_dir.mkdir(parents=True)
+    destination = local_dir / "README.md"
+    destination.write_bytes(b"old-content-is-larger")
+
+    def fake_stream_file_to_path(snapshot, item, destination, **kwargs):
+        assert not destination.exists()
+        destination.write_bytes(payload)
+        return file_hashes(destination)
+
+    monkeypatch.setattr(hub_module, "stream_file_to_path", fake_stream_file_to_path)
+
+    hub_module.stream_snapshot(snapshot, local_dir, tmp_path / ".tmp", allow_patterns=None)
+
+    assert destination.read_bytes() == payload
+    assert load_manifest(local_dir)["README.md"]["git_blob_sha1"] == git_blob_sha1(payload)
+
+
 def test_stream_snapshot_filters_allow_patterns(tmp_path, monkeypatch):
     payload = b"abc"
     skipped = HubFile("skip.bin", len(payload), lfs_sha256=sha256(payload), blob_id="pointer")

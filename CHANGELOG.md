@@ -5,6 +5,17 @@ matching version section into the corresponding GitHub Release.
 
 ## [Unreleased]
 
+### Changed
+
+- Update previews now print the apply command on its own indented line for
+  easier copying.
+
+### Fixed
+
+- Commit updates now replace an existing payload file whose old version is
+  larger than the target without feeding the old bytes into target-sized
+  torrent hashing state.
+
 ## [0.3.0] - 2026-08-04
 
 ### Added

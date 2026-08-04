@@ -2656,7 +2656,8 @@ def print_update_plan(
         complete_command=complete_command,
     )
     apply_command = apply_command or f"model-mirror repair --update {plan.repo_id}"
-    print(f"apply: {apply_command}")
+    print("apply:")
+    print(f"  {apply_command}")
 
 
 def print_update_plan_group(

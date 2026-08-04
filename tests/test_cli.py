@@ -2672,7 +2672,7 @@ def test_repair_update_dry_run_prints_diff_without_downloading(tmp_path, capsys)
     assert "removal impact: 1/2 files (50.0%), 3 B/7 B (42.9%)" in output
     assert "add (1):\n  new.bin (5 B)" in output
     assert "remove (1):\n  old.bin (3 B)" in output
-    assert "apply: model-mirror repair --update org/model" in output
+    assert "apply:\n  model-mirror repair --update org/model" in output
     assert hub.downloads == []
     assert read_verification_state(archive).resolved_commit == "oldcommit"
 
@@ -2726,7 +2726,7 @@ def test_diff_command_prints_recorded_update_without_mutating(tmp_path, capsys):
     assert "add (1):\n  new.bin (5 B)" in output
     assert "remove (1):\n  old.bin (3 B)" in output
     assert "complete list: model-mirror diff --verbose org/data" not in output
-    assert "apply: model-mirror repair --repo-type dataset --update org/data" in output
+    assert "apply:\n  model-mirror repair --repo-type dataset --update org/data" in output
     assert (archive / ".model-mirror" / "snapshot.json").read_bytes() == before
     assert hub.downloads == []
 

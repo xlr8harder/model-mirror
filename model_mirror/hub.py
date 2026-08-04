@@ -400,19 +400,20 @@ def stream_snapshot_file(
     completed = False
     try:
         if destination.exists() and destination.is_file():
-            accumulator = coverage_recorder.accumulator(item) if coverage_recorder is not None else None
-            existing = hash_existing_file(
-                local_dir,
-                destination,
-                item,
-                progress=progress,
-                torrent_accumulator=accumulator,
-            )
-            if existing is not None:
-                row, hashes = existing
-                record_torrent_coverage(coverage_recorder, item, destination, hashes, accumulator)
-                completed = True
-                return row
+            if destination.stat().st_size == require_expected_size(item):
+                accumulator = coverage_recorder.accumulator(item) if coverage_recorder is not None else None
+                existing = hash_existing_file(
+                    local_dir,
+                    destination,
+                    item,
+                    progress=progress,
+                    torrent_accumulator=accumulator,
+                )
+                if existing is not None:
+                    row, hashes = existing
+                    record_torrent_coverage(coverage_recorder, item, destination, hashes, accumulator)
+                    completed = True
+                    return row
             destination.unlink()
 
         accumulator = coverage_recorder.accumulator(item) if coverage_recorder is not None else None
