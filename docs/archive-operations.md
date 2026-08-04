@@ -165,15 +165,16 @@ Repair and update are deliberately separate:
 Preview the complete transition before applying it:
 
 ```bash
-model-mirror repair --update --dry-run org/model
-model-mirror repair --update --dry-run --verbose org/model
-model-mirror repair --all --update --dry-run
+model-mirror diff org/model
+model-mirror diff --verbose org/model
+model-mirror diff --json org/model
 model-mirror repair --update org/model
 model-mirror repair --all --update
 ```
 
-The dry-run is advisory. It does not download files or alter local mirror
-metadata. It reports:
+`diff` is advisory. It uses the current and upstream commits recorded by the
+last verification, contacts the Hub for their file metadata, and does not
+download payload files or alter local mirror metadata. It reports:
 
 - current and target commits
 - added, changed, removed, and byte-identical reusable paths
@@ -182,8 +183,11 @@ metadata. It reports:
 - removed-file and removed-byte percentages
 
 Normal output caps very long path groups and prints the exact `--verbose`
-command for the complete inventory. Applying the update removes only paths made
-obsolete by the prior pinned snapshot; unrelated local extras remain.
+command for the complete inventory. `--json` emits the versioned
+`model-mirror-diff` schema with complete added, changed, removed, and reusable
+path groups. The older `repair --update --dry-run` spelling remains available
+for compatibility. Applying the update removes only paths made obsolete by the
+prior pinned snapshot; unrelated local extras remain.
 
 Use an exact commit when creating a reproducible fixed archive:
 

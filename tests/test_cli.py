@@ -123,6 +123,11 @@ class ModernDownloadHub(FakeHub):
         return local_dir
 
 
+class FailingDownloadHub(ModernDownloadHub):
+    def download_snapshot(self, snapshot, local_dir, allow_patterns=None, stall_timeout_seconds=None):
+        raise OSError("connection dropped")
+
+
 def test_config_directory_command_writes_config(tmp_path, capsys):
     config_path = tmp_path / "config.yaml"
     archive = tmp_path / "archive"
@@ -245,6 +250,81 @@ def test_mirror_command_reports_busy_model_lock(tmp_path, capsys):
 
     assert rc == 1
     assert "model mirror is busy" in capsys.readouterr().out
+
+
+def test_mirror_command_reports_resolution_failure_without_garbage_entry(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+
+    rc = main(
+        ["--config", str(config_path), "mirror", "misspelled/model"],
+        hub=UnavailableHub(),
+    )
+
+    output = capsys.readouterr().out
+    assert rc == 1
+    assert "mirror failed: model:misspelled/model -> repository not found" in output
+    assert "no archive entry was created" in output
+    assert "model-mirror mirror --repo-type model --revision main misspelled/model" in output
+    assert not (tmp_path / "models" / "misspelled" / "model").exists()
+
+
+def test_mirror_command_preserves_existing_directory_on_resolution_failure(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    local_file = archive / "local-note.txt"
+    local_file.write_text("keep", encoding="utf-8")
+
+    rc = main(
+        ["--config", str(config_path), "mirror", "org/model"],
+        hub=UnavailableHub(),
+    )
+
+    output = capsys.readouterr().out
+    assert rc == 1
+    assert "mirror failed: model:org/model -> repository not found" in output
+    assert "no archive entry was created" not in output
+    assert local_file.read_text(encoding="utf-8") == "keep"
+    assert read_verification_state(archive) is None
+
+
+def test_mirror_command_reports_invalid_repository_id_without_traceback(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+
+    rc = main(
+        ["--config", str(config_path), "mirror", "org/../model"],
+        hub=FakeHub([]),
+    )
+
+    output = capsys.readouterr().out
+    assert rc == 1
+    assert "mirror failed: model:org/../model -> Invalid repository id" in output
+    assert "no archive entry was created" in output
+    assert "check the repository ID syntax and access, then retry" in output
+    assert not (tmp_path / "models").exists()
+
+
+def test_mirror_command_keeps_resumable_state_after_download_failure(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+
+    rc = main(
+        ["--config", str(config_path), "mirror", "org/model"],
+        hub=FailingDownloadHub([FakeFile("file.bin", 3)]),
+    )
+
+    archive = tmp_path / "models" / "org" / "model"
+    state = read_verification_state(archive)
+    output = capsys.readouterr().out
+    assert rc == 1
+    assert state is not None
+    assert state.status == "in_progress"
+    assert state.resolved_commit == "main"
+    assert "mirror interrupted: model:org/model -> connection dropped" in output
+    assert "resume: model-mirror mirror --repo-type model --revision main org/model" in output
 
 
 def test_revision_and_commit_options_are_mutually_exclusive(tmp_path):
@@ -657,8 +737,8 @@ def test_verify_uses_stored_commit_and_reports_changed_upstream(tmp_path, capsys
     assert rc == 0
     output = capsys.readouterr().out
     assert "upstream=changed" in output
-    assert "preview upstream update: model-mirror repair --update --dry-run org/model" in output
-    assert "apply upstream update: model-mirror repair --update org/model" in output
+    assert "inspect upstream update: model-mirror diff --repo-type model org/model" in output
+    assert "apply upstream update: model-mirror repair --repo-type model --update org/model" in output
     state = read_verification_state(archive)
     assert state.resolved_commit == "oldcommit"
     assert state.upstream_commit == "newcommit"
@@ -687,8 +767,8 @@ def test_verify_failure_reports_changed_upstream(tmp_path, capsys):
     assert rc == 1
     assert "verification failed: org/model upstream=changed" in output
     assert "next: model-mirror repair org/model" in output
-    assert "preview upstream update: model-mirror repair --update --dry-run org/model" in output
-    assert "apply upstream update: model-mirror repair --update org/model" in output
+    assert "inspect upstream update: model-mirror diff --repo-type model org/model" in output
+    assert "apply upstream update: model-mirror repair --repo-type model --update org/model" in output
 
 
 def test_print_verification_next_steps_can_show_only_update_hint(capsys):
@@ -699,8 +779,8 @@ def test_print_verification_next_steps_can_show_only_update_hint(capsys):
 
     output = capsys.readouterr().out
     assert "next: model-mirror repair org/model" not in output
-    assert "preview upstream update: model-mirror repair --update --dry-run org/model" in output
-    assert "apply upstream update: model-mirror repair --update org/model" in output
+    assert "inspect upstream update: model-mirror diff --repo-type model org/model" in output
+    assert "apply upstream update: model-mirror repair --repo-type model --update org/model" in output
 
 
 def test_verify_command_reports_failure(tmp_path, capsys):
@@ -792,8 +872,8 @@ def test_verify_cached_incomplete_reports_changed_upstream_hint(tmp_path, capsys
     output = capsys.readouterr().out
     assert rc == 1
     assert "cached verification incomplete: org/model upstream=changed" in output
-    assert "preview upstream update: model-mirror repair --update --dry-run org/model" in output
-    assert "apply upstream update: model-mirror repair --update org/model" in output
+    assert "inspect upstream update: model-mirror diff --repo-type model org/model" in output
+    assert "apply upstream update: model-mirror repair --repo-type model --update org/model" in output
 
 
 def test_verify_dataset_uses_same_opaque_payload_contract(tmp_path, capsys):
@@ -891,7 +971,7 @@ def test_verify_all_reports_changed_upstream_update_hint(tmp_path, capsys):
     output = capsys.readouterr().out
     assert rc == 0
     assert "verified (cached): org/model upstream=changed" in output
-    assert "preview changed upstreams: model-mirror repair --all --update --dry-run" in output
+    assert "inspect changed upstream: model-mirror diff --repo-type model org/model" in output
     assert "apply changed upstreams: model-mirror repair --all --update" in output
 
 
@@ -1454,7 +1534,8 @@ def test_status_recommends_update_or_verify_from_recorded_state(tmp_path, capsys
 
     assert main(["--config", str(config_path), "status", "org/model"]) == 0
     output = capsys.readouterr().out
-    assert "model-mirror repair --update org/model" in output
+    assert "model-mirror diff --repo-type model org/model" in output
+    assert "model-mirror repair --repo-type model --update org/model" in output
 
     write_verification_state(
         root,
@@ -2594,6 +2675,216 @@ def test_repair_update_dry_run_prints_diff_without_downloading(tmp_path, capsys)
     assert "apply: model-mirror repair --update org/model" in output
     assert hub.downloads == []
     assert read_verification_state(archive).resolved_commit == "oldcommit"
+
+
+def test_diff_command_prints_recorded_update_without_mutating(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    archive = tmp_path / "datasets" / "org" / "data"
+    archive.mkdir(parents=True)
+    write_snapshot_plan(
+        archive,
+        HubSnapshot(
+            "org/data",
+            "dataset",
+            "main",
+            "oldcommit",
+            [FakeFile("old.bin", 3, blob_id="old"), FakeFile("same.bin", 4, blob_id="same")],
+        ),
+    )
+    write_verification_state(
+        archive,
+        VerificationState(
+            status="clean",
+            repo_id="org/data",
+            repo_type="dataset",
+            resolved_commit="oldcommit",
+            upstream_commit="newcommit",
+            upstream_status="changed",
+        ),
+    )
+    hub = FakeHub(
+        [],
+        metadata_by_revision={
+            "newcommit": [
+                FakeFile("new.bin", 5, blob_id="new"),
+                FakeFile("same.bin", 4, blob_id="same"),
+            ]
+        },
+    )
+    before = (archive / ".model-mirror" / "snapshot.json").read_bytes()
+
+    rc = main(
+        ["--config", str(config_path), "diff", "--repo-type", "dataset", "org/data"],
+        hub=hub,
+    )
+
+    output = capsys.readouterr().out
+    assert rc == 0
+    assert "update diff: org/data" in output
+    assert "commit: oldcommit -> newcommit" in output
+    assert "add (1):\n  new.bin (5 B)" in output
+    assert "remove (1):\n  old.bin (3 B)" in output
+    assert "complete list: model-mirror diff --verbose org/data" not in output
+    assert "apply: model-mirror repair --repo-type dataset --update org/data" in output
+    assert (archive / ".model-mirror" / "snapshot.json").read_bytes() == before
+    assert hub.downloads == []
+
+
+def test_diff_command_emits_stable_json(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    write_snapshot_plan(
+        archive,
+        HubSnapshot(
+            "org/model",
+            "model",
+            "main",
+            "oldcommit",
+            [
+                FakeFile("changed.bin", 3, blob_id="old"),
+                FakeFile("removed.bin", 4, blob_id="removed"),
+                FakeFile("same.bin", 5, blob_id="same"),
+            ],
+        ),
+    )
+    write_verification_state(
+        archive,
+        VerificationState(
+            status="clean",
+            repo_id="org/model",
+            resolved_commit="oldcommit",
+            upstream_commit="newcommit",
+            upstream_status="changed",
+        ),
+    )
+    hub = FakeHub(
+        [],
+        metadata_by_revision={
+            "newcommit": [
+                FakeFile("added.bin", 2, blob_id="added"),
+                FakeFile("changed.bin", 6, blob_id="new"),
+                FakeFile("same.bin", 5, blob_id="same"),
+            ]
+        },
+    )
+
+    rc = main(["--config", str(config_path), "diff", "--json", "org/model"], hub=hub)
+
+    document = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert document == {
+        "schema": "model-mirror-diff",
+        "version": 1,
+        "repo_id": "org/model",
+        "repo_type": "model",
+        "status": "changed",
+        "current_commit": "oldcommit",
+        "target_commit": "newcommit",
+        "summary": {
+            "current_files": 3,
+            "target_files": 3,
+            "current_bytes": 12,
+            "target_bytes": 13,
+            "added_files": 1,
+            "changed_files": 1,
+            "removed_files": 1,
+            "reused_files": 1,
+            "candidate_download_files": 2,
+            "candidate_download_bytes": 8,
+            "removed_bytes": 4,
+        },
+        "added": [{"path": "added.bin", "bytes": 2}],
+        "changed": [{"path": "changed.bin", "current_bytes": 3, "target_bytes": 6}],
+        "removed": [{"path": "removed.bin", "bytes": 4}],
+        "reused": [{"path": "same.bin", "bytes": 5}],
+    }
+
+
+def test_diff_reports_no_recorded_update_in_human_and_json_modes(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+    archive = tmp_path / "models" / "org" / "model"
+    archive.mkdir(parents=True)
+    write_verification_state(
+        archive,
+        VerificationState(
+            status="clean",
+            repo_id="org/model",
+            resolved_commit="same",
+            upstream_commit="same",
+            upstream_status="current",
+        ),
+    )
+
+    human_rc = main(["--config", str(config_path), "diff", "org/model"], hub=FakeHub([]))
+    assert human_rc == 0
+    assert "no recorded upstream update: org/model" in capsys.readouterr().out
+
+    json_rc = main(
+        ["--config", str(config_path), "diff", "--json", "org/model"],
+        hub=FakeHub([]),
+    )
+    document = json.loads(capsys.readouterr().out)
+    assert json_rc == 0
+    assert document == {
+        "schema": "model-mirror-diff",
+        "version": 1,
+        "repo_id": "org/model",
+        "repo_type": "model",
+        "status": "current",
+        "current_commit": "same",
+        "target_commit": "same",
+        "summary": None,
+        "added": [],
+        "changed": [],
+        "removed": [],
+        "reused": [],
+    }
+
+
+def test_diff_json_reports_unavailable_preview(tmp_path, capsys):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"directory": str(tmp_path)}), encoding="utf-8")
+
+    rc = main(
+        ["--config", str(config_path), "diff", "--json", "org/missing"],
+        hub=FakeHub([]),
+    )
+
+    document = json.loads(capsys.readouterr().out)
+    assert rc == 1
+    assert document["schema"] == "model-mirror-diff"
+    assert document["version"] == 1
+    assert document["repo_id"] == "org/missing"
+    assert document["repo_type"] == "model"
+    assert document["status"] == "unavailable"
+    assert "verification state unavailable" in document["error"]
+
+    human_rc = main(
+        ["--config", str(config_path), "diff", "org/missing"],
+        hub=FakeHub([]),
+    )
+    assert human_rc == 1
+    assert "update diff unavailable: org/missing" in capsys.readouterr().out
+
+    invalid_rc = main(
+        ["--config", str(config_path), "diff", "org/../model"],
+        hub=FakeHub([]),
+    )
+    assert invalid_rc == 1
+    assert "update diff unavailable: org/../model -> Invalid repository id" in capsys.readouterr().out
+
+    invalid_json_rc = main(
+        ["--config", str(config_path), "diff", "--json", "org/../model"],
+        hub=FakeHub([]),
+    )
+    invalid_document = json.loads(capsys.readouterr().out)
+    assert invalid_json_rc == 1
+    assert invalid_document["status"] == "unavailable"
+    assert "Invalid repository id" in invalid_document["error"]
 
 
 def test_repair_update_dry_run_reports_no_change_and_unavailable_state(tmp_path, capsys):

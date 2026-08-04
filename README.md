@@ -88,8 +88,9 @@ When verification detects that upstream moved, preview the exact transition
 before applying it:
 
 ```bash
-model-mirror repair --update --dry-run org/model
-model-mirror repair --update --dry-run --verbose org/model
+model-mirror diff org/model
+model-mirror diff --verbose org/model
+model-mirror diff --json org/model
 model-mirror repair --update org/model
 ```
 
@@ -167,7 +168,7 @@ model-mirror mirror org/model
 model-mirror verify org/model
 model-mirror verify --cached org/model
 model-mirror repair org/model
-model-mirror repair --update --dry-run org/model
+model-mirror diff org/model
 model-mirror status
 model-mirror status --json
 model-mirror offline org/model

@@ -103,6 +103,11 @@ class InspectingFakeHub(FakeHub):
         return super().snapshot_download(repo_id, repo_type, revision, local_dir, allow_patterns)
 
 
+class UnavailableHub:
+    def snapshot(self, repo_id, repo_type, revision):
+        raise OSError("repository not found")
+
+
 def test_mirror_noops_without_verification_when_cached_verify_says_archive_is_complete(tmp_path):
     archive = tmp_path / "models" / "org" / "model"
     archive.mkdir(parents=True)
@@ -216,6 +221,20 @@ def test_mirror_writes_in_progress_verification_before_download(tmp_path):
     assert hub.state_during_download is not None
     assert hub.state_during_download.status == "in_progress"
     assert hub.state_during_download.resolved_commit == "main"
+
+
+def test_mirror_resolution_failure_does_not_create_archive_entry(tmp_path):
+    archive = tmp_path / "models" / "misspelled" / "model"
+
+    try:
+        mirror(Config(directory=tmp_path), "misspelled/model", hub=UnavailableHub())
+    except OSError as exc:
+        assert str(exc) == "repository not found"
+    else:
+        raise AssertionError("mirror should propagate the upstream failure")
+
+    assert not archive.exists()
+    assert not archive.parent.exists()
 
 
 def test_mirror_reuses_frozen_snapshot_plan_for_interrupted_resume(tmp_path):

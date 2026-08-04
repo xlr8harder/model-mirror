@@ -270,6 +270,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="show live hash progress on stderr; defaults to enabled in an interactive terminal",
     )
 
+    diff_parser = add_command_parser(
+        "diff",
+        help="show a recorded upstream update without changing the mirror",
+        description=(
+            "Compare the mirror's pinned snapshot with the changed upstream commit recorded by verify. "
+            "This command contacts the Hub but does not download payload files or mutate archive state."
+        ),
+        epilog=(
+            "Exit status: 0 when a diff is shown or no update is recorded; "
+            "1 when the preview is unavailable."
+        ),
+    )
+    diff_parser.add_argument("model", metavar="repo", help="repo id to compare, e.g. org/model")
+    diff_parser.add_argument(
+        "--repo-type",
+        choices=["model", "dataset", "space"],
+        help="repo kind to compare; defaults to configured repo_type",
+    )
+    diff_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="print every affected path instead of capping long groups",
+    )
+    diff_parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="emit stable structured JSON with complete path groups",
+    )
+
     repair_parser = add_command_parser(
         "repair",
         help="repair a mirrored archive",
@@ -606,18 +636,25 @@ def main(argv: list[str] | None = None, *, hub=None) -> int:
             return handle_clean_cache(config, force=args.force)
         if args.command == "mirror":
             selected_hub = hub or HuggingFaceHub(config)
-            result = mirror(
-                config,
-                args.model,
-                hub=selected_hub,
-                repo_type=args.repo_type,
-                revision=selected_revision_arg(args),
-                force=args.force,
-                verify_after=config.verify_after_mirror and not args.no_verify,
-                stall_timeout_seconds=args.stall_timeout,
-            )
+            try:
+                result = mirror(
+                    config,
+                    args.model,
+                    hub=selected_hub,
+                    repo_type=args.repo_type,
+                    revision=selected_revision_arg(args),
+                    force=args.force,
+                    verify_after=config.verify_after_mirror and not args.no_verify,
+                    stall_timeout_seconds=args.stall_timeout,
+                )
+            except ModelBusyError:
+                raise
+            except (OSError, ValueError, RuntimeError) as exc:
+                return report_mirror_failure(args, config, exc)
             print(f"{result.status}: {args.model} -> {result.path}")
             return mirror_exit_code(result.status)
+        if args.command == "diff":
+            return handle_diff(args, config, hub=hub)
         if args.command == "remove":
             return handle_remove(args, config)
         if args.command == "verify":
@@ -645,6 +682,31 @@ def apply_configured_repo_type(args, config: Config) -> None:
         return
     if hasattr(args, "repo_type") and args.repo_type is None:
         args.repo_type = config.repo_type
+
+
+def report_mirror_failure(args, config: Config, exc: Exception) -> int:
+    revision = selected_revision_arg(args) or config.revision
+    retry = (
+        f"model-mirror mirror --repo-type {args.repo_type} "
+        f"--revision {revision} {args.model}"
+    )
+    try:
+        root = archive_path(config, args.model, args.repo_type)
+    except ValueError:
+        print(f"mirror failed: {args.repo_type}:{args.model} -> {exc}")
+        print("no archive entry was created")
+        print("check the repository ID syntax and access, then retry")
+        return 1
+    state = read_verification_state(root)
+    if state is not None and state.status == "in_progress" and state.resolved_commit:
+        print(f"mirror interrupted: {args.repo_type}:{args.model} -> {exc}")
+        print(f"resume: {retry}")
+        return 1
+    print(f"mirror failed: {args.repo_type}:{args.model} -> {exc}")
+    if not root.exists() and not root.is_symlink():
+        print("no archive entry was created")
+    print(f"check the repository ID and access, then retry: {retry}")
+    return 1
 
 
 def handle_version(*, json_output: bool) -> int:
@@ -1470,7 +1532,10 @@ def status_next_steps(entry: MirrorStatusEntry) -> list[str]:
     if state.repair_paths:
         steps.append(f"model-mirror repair {entry.repo_id}")
     if state.upstream_status == "changed":
-        steps.append(f"model-mirror repair --update {entry.repo_id}")
+        steps.append(f"model-mirror diff --repo-type {entry.repo_type} {entry.repo_id}")
+        steps.append(
+            f"model-mirror repair --repo-type {entry.repo_type} --update {entry.repo_id}"
+        )
     return steps
 
 
@@ -2026,7 +2091,7 @@ def state_has_manifest_incomplete(state) -> bool:
 def handle_verify(args, config: Config, *, hub=None) -> int:
     if args.all:
         failures = 0
-        changed = 0
+        changed: list[str] = []
         repair_needed = 0
         cache_incomplete = 0
         for repo_id in list_model_ids(config):
@@ -2041,7 +2106,7 @@ def handle_verify(args, config: Config, *, hub=None) -> int:
                 continue
             state = read_verification_state(archive_path(config, repo_id, args.repo_type))
             if state is not None and state.upstream_status == "changed":
-                changed += 1
+                changed.append(repo_id)
             if rc != 0:
                 failures += 1
                 if state is not None and state.repair_paths:
@@ -2053,13 +2118,145 @@ def handle_verify(args, config: Config, *, hub=None) -> int:
         if cache_incomplete:
             print("cached verification incomplete: run full verification with model-mirror verify --all")
         if changed:
-            print("preview changed upstreams: model-mirror repair --all --update --dry-run")
+            for repo_id in changed:
+                print(
+                    f"inspect changed upstream: model-mirror diff "
+                    f"--repo-type {args.repo_type} {repo_id}"
+                )
             print("apply changed upstreams: model-mirror repair --all --update")
         return 1 if failures else 0
 
     if not args.model:
         raise SystemExit("verify requires a model id unless --all is used")
     return verify_one(config, args.model, args, hub=hub)
+
+
+def handle_diff(args, config: Config, *, hub=None) -> int:
+    try:
+        root = archive_path(config, args.model, args.repo_type)
+    except ValueError as exc:
+        if args.json_output:
+            print_diff_json(
+                args.model,
+                args.repo_type,
+                status="unavailable",
+                error=str(exc),
+            )
+        else:
+            print(f"update diff unavailable: {args.model} -> {exc}")
+        return 1
+    state = read_verification_state(root)
+    if state is not None and state.upstream_status != "changed":
+        if args.json_output:
+            print_diff_json(
+                args.model,
+                args.repo_type,
+                status=state.upstream_status or "current",
+                state=state,
+            )
+        else:
+            print(f"no recorded upstream update: {args.model}")
+        return 0
+
+    selected_hub = hub or HuggingFaceHub(config)
+    try:
+        plan = preview_update(
+            config,
+            args.model,
+            hub=selected_hub,
+            repo_type=args.repo_type,
+        )
+    except (OSError, ValueError, RuntimeError) as exc:
+        if args.json_output:
+            print_diff_json(
+                args.model,
+                args.repo_type,
+                status="unavailable",
+                state=state,
+                error=str(exc),
+            )
+        else:
+            print(f"update diff unavailable: {args.model} -> {exc}")
+        return 1
+
+    if args.json_output:
+        print_diff_json(args.model, args.repo_type, status="changed", plan=plan)
+    else:
+        print_update_plan(
+            plan,
+            verbose=args.verbose,
+            heading="update diff",
+            complete_command=(
+                f"model-mirror diff --repo-type {plan.repo_type} "
+                f"--verbose {plan.repo_id}"
+            ),
+            apply_command=(
+                f"model-mirror repair --repo-type {plan.repo_type} "
+                f"--update {plan.repo_id}"
+            ),
+        )
+    return 0
+
+
+def print_diff_json(
+    repo_id: str,
+    repo_type: str,
+    *,
+    status: str,
+    state: VerificationState | None = None,
+    plan: UpdatePlan | None = None,
+    error: str | None = None,
+) -> None:
+    current_commit = plan.current_commit if plan is not None else state.resolved_commit if state else None
+    target_commit = plan.target_commit if plan is not None else state.upstream_commit if state else None
+    document = {
+        "schema": "model-mirror-diff",
+        "version": 1,
+        "repo_id": repo_id,
+        "repo_type": repo_type,
+        "status": status,
+        "current_commit": current_commit,
+        "target_commit": target_commit,
+        "summary": None,
+        "added": [],
+        "changed": [],
+        "removed": [],
+        "reused": [],
+    }
+    if plan is not None:
+        document["summary"] = {
+            "current_files": plan.current_files,
+            "target_files": plan.target_files,
+            "current_bytes": plan.current_bytes,
+            "target_bytes": plan.target_bytes,
+            "added_files": len(plan.added),
+            "changed_files": len(plan.changed),
+            "removed_files": len(plan.removed),
+            "reused_files": len(plan.unchanged),
+            "candidate_download_files": len(plan.added) + len(plan.changed),
+            "candidate_download_bytes": plan.candidate_download_bytes,
+            "removed_bytes": plan.removed_bytes,
+        }
+        document["added"] = [
+            {"path": item.path, "bytes": item.size} for item in plan.added
+        ]
+        document["changed"] = [
+            {
+                "path": item.new.path,
+                "current_bytes": item.old.size,
+                "target_bytes": item.new.size,
+            }
+            for item in plan.changed
+        ]
+        document["removed"] = [
+            {"path": item.path, "bytes": item.size} for item in plan.removed
+        ]
+        document["reused"] = [
+            {"path": item.path, "bytes": item.size} for item in plan.unchanged
+        ]
+    if error is not None:
+        document["error"] = error
+    print(json.dumps(document, indent=2, sort_keys=True))
 
 
 def handle_repair(args, config: Config, *, hub=None) -> int:
@@ -2392,8 +2589,15 @@ def repair_one(config: Config, repo_id: str, args, *, hub=None) -> int:
     return 0 if result.status in {"complete", "repaired", "updated"} else 1
 
 
-def print_update_plan(plan: UpdatePlan, *, verbose: bool = False) -> None:
-    print(f"update preview: {plan.repo_id}")
+def print_update_plan(
+    plan: UpdatePlan,
+    *,
+    verbose: bool = False,
+    heading: str = "update preview",
+    complete_command: str | None = None,
+    apply_command: str | None = None,
+) -> None:
+    print(f"{heading}: {plan.repo_id}")
     print(f"commit: {plan.current_commit} -> {plan.target_commit}")
     print(
         f"files: {plan.current_files} -> {plan.target_files} "
@@ -2423,7 +2627,7 @@ def print_update_plan(plan: UpdatePlan, *, verbose: bool = False) -> None:
             f"({file_percent:.1f}%), {format_bytes(plan.removed_bytes)}/"
             f"{format_bytes(plan.current_bytes)} ({byte_percent:.1f}%)"
         )
-    complete_command = (
+    complete_command = complete_command or (
         f"model-mirror repair --update --dry-run --verbose {plan.repo_id}"
     )
     limit = None if verbose else 20
@@ -2451,7 +2655,8 @@ def print_update_plan(plan: UpdatePlan, *, verbose: bool = False) -> None:
         limit=limit,
         complete_command=complete_command,
     )
-    print(f"apply: model-mirror repair --update {plan.repo_id}")
+    apply_command = apply_command or f"model-mirror repair --update {plan.repo_id}"
+    print(f"apply: {apply_command}")
 
 
 def print_update_plan_group(
@@ -2648,7 +2853,7 @@ def verify_one_locked(config: Config, repo_id: str, args, selected_hub, root: Pa
         )
         print(f"run full verification: model-mirror verify {repo_id}")
         if state.upstream_status == "changed":
-            print_update_next_step(repo_id)
+            print_update_next_step(repo_id, args.repo_type)
         return 1
     if result.ok:
         mode = "cached" if args.cached else "full"
@@ -2657,7 +2862,7 @@ def verify_one_locked(config: Config, repo_id: str, args, selected_hub, root: Pa
             f"{verification_metrics(result, bytes_hashed=bytes_hashed, duration=duration)}"
         )
         if state.upstream_status == "changed":
-            print_update_next_step(repo_id)
+            print_update_next_step(repo_id, args.repo_type)
         return 0
     print(f"verification failed: {repo_id}{upstream_change_suffix(state)}")
     print_verification_details(
@@ -2666,7 +2871,7 @@ def verify_one_locked(config: Config, repo_id: str, args, selected_hub, root: Pa
         bytes_hashed=bytes_hashed,
         duration=duration,
     )
-    print_verification_next_steps(repo_id, state)
+    print_verification_next_steps(repo_id, state, args.repo_type)
     return 1
 
 
@@ -2674,11 +2879,11 @@ def upstream_change_suffix(state) -> str:
     return " upstream=changed" if state.upstream_status == "changed" else ""
 
 
-def print_verification_next_steps(repo_id: str, state) -> None:
+def print_verification_next_steps(repo_id: str, state, repo_type: str = "model") -> None:
     if state.repair_paths:
         print(f"next: model-mirror repair {repo_id}")
     if state.upstream_status == "changed":
-        print_update_next_step(repo_id)
+        print_update_next_step(repo_id, repo_type)
 
 
 def print_verification_details(
@@ -2723,9 +2928,12 @@ def print_verification_issue_group(repo_id: str, label: str, values: list[str], 
         )
 
 
-def print_update_next_step(repo_id: str) -> None:
-    print(f"preview upstream update: model-mirror repair --update --dry-run {repo_id}")
-    print(f"apply upstream update: model-mirror repair --update {repo_id}")
+def print_update_next_step(repo_id: str, repo_type: str = "model") -> None:
+    print(f"inspect upstream update: model-mirror diff --repo-type {repo_type} {repo_id}")
+    print(
+        f"apply upstream update: model-mirror repair --repo-type {repo_type} "
+        f"--update {repo_id}"
+    )
 
 
 def print_repair_commit_notice(repo_id: str, result) -> None:
@@ -2800,7 +3008,7 @@ def verify_one_offline(config: Config, root: Path, repo_id: str, args, existing_
     if existing_state.offline_only:
         print(f"repair unavailable for offline-only model: {repo_id}")
     else:
-        print_verification_next_steps(repo_id, state)
+        print_verification_next_steps(repo_id, state, args.repo_type)
     return 1
 
 

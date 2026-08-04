@@ -34,18 +34,30 @@ def mirror(
     selected_revision = revision or config.revision
     selected_hub = hub or HuggingFaceHub(config)
     destination = archive_path(config, repo_id, selected_type)
+
+    # Resolve and validate a brand-new snapshot before ModelLock creates the
+    # repository directory. Upstream lookup failures are not interrupted
+    # mirrors and must not become archive entries.
+    prefetched_snapshot = None
+    if not destination.exists() and not destination.is_symlink():
+        prefetched_snapshot = get_snapshot(
+            selected_hub,
+            repo_id,
+            selected_type,
+            selected_revision,
+        )
     with ModelLock(destination, "mirror", repo_id, selected_type):
         existing_state = read_verification_state(destination)
-        if existing_state is None:
-            write_verification_state(
+        snapshot = prefetched_snapshot
+        if snapshot is None or existing_state is not None:
+            snapshot = select_mirror_snapshot(
+                selected_hub,
+                repo_id,
+                selected_type,
+                selected_revision,
                 destination,
-                VerificationState(
-                    status="in_progress",
-                    repo_id=repo_id,
-                    repo_type=selected_type,
-                    requested_revision=selected_revision,
-                    issues=["mirror started"],
-                ),
+                existing_state=existing_state,
+                force=force,
             )
         return mirror_locked(
             config,
@@ -54,6 +66,7 @@ def mirror(
             selected_type,
             selected_revision,
             destination,
+            snapshot=snapshot,
             existing_state=existing_state,
             force=force,
             verify_after=verify_after,
@@ -69,20 +82,12 @@ def mirror_locked(
     selected_revision: str,
     destination: Path,
     *,
+    snapshot,
     existing_state: VerificationState | None,
     force: bool,
     verify_after: bool,
     stall_timeout_seconds: int | None,
 ) -> MirrorResult:
-    snapshot = select_mirror_snapshot(
-        selected_hub,
-        repo_id,
-        selected_type,
-        selected_revision,
-        destination,
-        existing_state=existing_state,
-        force=force,
-    )
     from .torrent_publication import assert_commit_update_allowed, load_fenced_publication
 
     assert_commit_update_allowed(destination, snapshot.resolved_commit)

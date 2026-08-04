@@ -5,6 +5,12 @@ matching version section into the corresponding GitHub Release.
 
 ## [Unreleased]
 
+### Added
+
+- Added a top-level, non-mutating `diff` command for inspecting a recorded
+  upstream commit change, with capped human output, `--verbose`, and a stable
+  `--json` schema containing complete path groups.
+
 ### Changed
 
 - The README is now a concise installation and everyday-workflow entry point;
@@ -12,6 +18,16 @@ matching version section into the corresponding GitHub Release.
   guidance moved into focused documents under `docs/`.
 - Added a repository-wide agent contract and consolidated detailed development
   guidance in the conventional `CONTRIBUTING.md`.
+
+### Fixed
+
+- Failed first-time mirrors now resolve and validate the upstream snapshot
+  before creating an archive entry. Misspelled, inaccessible, and invalid
+  repositories no longer leave an empty `in_progress` mirror behind, while
+  failures after a commit-pinned download begins remain explicitly resumable.
+- Mirror failures now print a concise categorized result and exact retry or
+  resume command instead of exposing an uncaught traceback for expected Hub and
+  transport errors.
 
 ## [0.2.3] - 2026-07-29
 
