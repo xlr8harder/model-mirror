@@ -5,6 +5,8 @@ matching version section into the corresponding GitHub Release.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-08-04
+
 ### Changed
 
 - Update previews now print the apply command on its own indented line for
